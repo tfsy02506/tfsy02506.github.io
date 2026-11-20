@@ -1,0 +1,1585 @@
+/* 天府师大一中·校园论坛 — 管理后台（admin.js）
+ * 后台 12 个分区：数据总览 / 帖子 / 评论 / 用户 / 版块 / 举报 / 公告 / 消息 / 站点设置 / 操作日志 / 学生认证 / 我的账号
+ * 权限（R5）：版主（mod）管内容（总览、帖子、评论、举报、公告、我的账号）；超级管理员（admin）另有用户、版块、推送、设置、日志。
+ * 外壳（.sidebar + .admin-top）由 app.js 渲染，本文件只画内容区：紧凑标题行 + 筛选条 + 密集表格 + 弹窗。
+ * 交互走 data-action + TF.app.on；筛选与分页通过 hash query 真实传给 TF.store（真分页、真筛选）。
+ */
+(function () {
+  'use strict';
+
+  var TF = (window.TF = window.TF || {});
+  TF.extend = TF.extend || function (n, o) { TF[n] = Object.assign(TF[n] || {}, o); return TF[n]; };
+
+  /* ---------------------------------------------------------------- 工具 */
+  function E(v) { return TF.util.esc(v); }
+  function AT(v) { return TF.util.attr(v); }
+  function NUM(v, d) { return TF.util.num(v || 0, d); }
+  function REL(ts) { return TF.util.relTime(ts); }
+  function FMT(ts) { return TF.util.fmtTime(ts); }
+  function EXC(s, n) { return TF.util.excerpt(s, n); }
+  function IC(n, s) { return TF.ui.icon(n, s); }
+  function P(o) { return AT(JSON.stringify(o || {})); }
+  function ACT(a, o) { return ' data-action="' + AT(a) + '" data-param="' + P(o) + '"'; }
+
+  /* ------------------------------------------------------------- 权限 */
+  function canManage() { return !!(TF.store.canManage && TF.store.canManage()); }
+  function isSuper() { return !!(TF.store.isAdmin && TF.store.isAdmin()); }
+  var SUPER_ONLY = { users: 0, boards: 0, messages: 0, settings: 0, logs: 0, verify: 0 };
+  function SEC_ALLOWED(sec) {
+    var s = sec || ((TF.route && TF.route.param && TF.route.param.section) || 'dashboard');
+    return !SUPER_ONLY[String(s).toLowerCase()] || isSuper();
+  }
+  function deny(msg) {
+    return '<div class="page" data-page="admin"><div class="card card--pad mt-4">' +
+      TF.ui.empty({
+        icon: 'lock', title: '进不去这个页面',
+        desc: msg || '版主能管帖子、评论、举报；用户、版块、推送、设置只有超管能动。',
+        action: { text: '回数据总览', variant: 'primary', href: '#/admin/dashboard' }
+      }) + '</div></div>';
+  }
+
+  /* 弹窗/敏感词编辑的临时状态 */
+  var tmp = { modal: null, words: null };
+
+  /* ------------------------------------------------------------ 元数据 */
+  var SEC = {
+    dashboard: { label: '数据总览', title: '数据总览', acts: '人数、帖子、举报、近 14 天走势' },
+    posts: { label: '帖子管理', title: '帖子管理', acts: '置顶、加精、下架、发布、删掉' },
+    comments: { label: '评论管理', title: '评论管理', acts: '隐藏、放出来、删掉；点标题跳原帖' },
+    users: { label: '用户管理', title: '用户管理', acts: '封禁、解封、改角色、重置密码、删号' },
+    boards: { label: '版块管理', title: '版块管理', acts: '新建、改简介图标、上下移、锁定、删除' },
+    reports: { label: '举报处理', title: '举报处理', acts: '看被举报内容，标已处理或驳回' },
+    notices: { label: '公告管理', title: '公告管理', acts: '发公告、改级别、置顶、删掉' },
+    messages: { label: '消息推送', title: '消息推送', acts: '发给全体 / 某个角色 / 某个人；发出后撤不回' },
+    settings: { label: '站点设置', title: '站点设置', acts: '站名、注册开关、发帖规则、敏感词' },
+    logs: { label: '操作日志', title: '操作日志', acts: '谁在什么时候改了什么' },
+    /* 学生认证审核：看校卡照片，通过或驳回（只有超管能进，照片是隐私） */
+    verify: { label: '学生认证', title: '学生认证审核', acts: '看校卡照片，通过或驳回；通过后解锁论坛' },
+    profile: { label: '我的账号', title: '我的账号', acts: '改昵称签名、改登录密码' }
+  };
+  var POST_STATUS = { published: ['已发布', 'success'], pending: ['待审核', 'warn'], hidden: ['已下架', 'danger'], deleted: ['已删除', 'default'] };
+  var COMMENT_STATUS = { published: ['已发布', 'success'], hidden: ['已隐藏', 'warn'], deleted: ['已删除', 'default'] };
+  var REPORT_STATUS = { pending: ['待处理', 'warn'], resolved: ['已处理', 'success'], rejected: ['已驳回', 'default'] };
+  var ROLE = { student: ['学生', 'default'], mod: ['版主', 'mod'], admin: ['超管', 'danger'] };
+  var LEVEL = { info: ['普通', 'info'], warn: ['提醒', 'warn'], important: ['重要', 'danger'] };
+  var BOARD_ICONS = ['forum', 'book', 'sport', 'megaphone', 'tag', 'question', 'users', 'fire', 'star', 'list', 'heart', 'calendar'];
+  var GRADE_OPTIONS = [{ value: '', label: '未设置' }].concat(['初一', '初二', '初三', '高一', '高二', '高三'].map(function (g) { return { value: g, label: g }; }));
+  var LOG_ACTIONS = [
+    { value: '', label: '全部动作' }, { value: 'auth.', label: '登录' }, { value: 'post.', label: '帖子' },
+    { value: 'comment.', label: '评论' }, { value: 'user.', label: '用户' }, { value: 'report.', label: '举报' },
+    { value: 'notice.', label: '公告' }, { value: 'board.', label: '版块' }, { value: 'message.', label: '消息' }, { value: 'settings.', label: '设置' },
+    { value: 'student.', label: '学生认证' }
+  ];
+
+  function stBadge(map, key) { var m = map[key] || ['未知', 'default']; return TF.ui.badge(m[0], m[1]); }
+  function roleBadge(role) { var m = ROLE[role] || ['学生', 'default']; return TF.ui.badge(m[0], m[1]); }
+
+  /* ------------------------------------------------------- 查询 / 链接 */
+  function Q(ctx, k, d) {
+    var rq = (TF.route && TF.route.query) || {};
+    var v = (ctx && ctx.query) ? ctx.query[k] : null;
+    if (v == null || v === '') v = rq[k];
+    return (v == null || v === '') ? d : v;
+  }
+  function QN(ctx, k, d) { var n = parseInt(Q(ctx, k, ''), 10); return (isFinite(n) && n > 0) ? n : d; }
+  function merge(a, b) {
+    var o = {}, k;
+    for (k in a) if (Object.prototype.hasOwnProperty.call(a, k)) o[k] = a[k];
+    for (k in b) if (Object.prototype.hasOwnProperty.call(b, k)) o[k] = b[k];
+    return o;
+  }
+  function href(section, params) {
+    var parts = [];
+    Object.keys(params || {}).forEach(function (k) {
+      var v = params[k];
+      if (v === '' || v === null || v === undefined || v === false) return;
+      parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+    });
+    return '#/admin/' + section + (parts.length ? '?' + parts.join('&') : '');
+  }
+
+  /* --------------------------------------------------------- 通用片段 */
+  /* 信息流区块：.block--box（有边框）+ block--flush（内容贴边，给列表用） */
+  function block(title, body, o) {
+    o = o || {};
+    return '<div class="block block--box' + (o.flush ? ' block--flush' : '') + '">' +
+      '<div class="block__head"><h2 class="block__title">' + E(title) + '</h2>' +
+      (o.more ? '<a class="block__more" href="' + AT(o.more.href) + '">' + E(o.more.text) + ' →</a>' : (o.head || '')) +
+      '</div><div class="block__body">' + body + '</div></div>';
+  }
+  function emptyLine(text) { return '<p class="text-sm text-muted">' + E(text) + '</p>'; }
+  function table(heads, rows, emptyText, scope) {
+    var th = heads.map(function (h) { return '<th' + (h.cls ? ' class="' + h.cls + '"' : '') + '>' + h.t + '</th>'; }).join('');
+    var body = rows.length
+      ? rows.map(function (r) { return '<tr>' + r.join('') + '</tr>'; }).join('')
+      : '<tr><td class="tbody-empty" colspan="' + heads.length + '">' + E(emptyText) + '</td></tr>';
+    return '<div class="table-wrap"' + (scope ? ' data-check-scope' : '') + '><table class="table table--hover">' +
+      '<thead><tr>' + th + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+  }
+  function td(html, cls) { return '<td' + (cls ? ' class="' + cls + '"' : '') + '>' + html + '</td>'; }
+  function checkTd(id, type) {
+    return td('<input class="check__box" type="checkbox" data-check-item value="' + AT(id) + '" data-action-change="admin.bulk" data-param="' + P({ type: type }) + '" aria-label="选这一行">', 'is-check');
+  }
+  function checkHead() { return { t: '<input class="check__box" type="checkbox" data-check-all aria-label="全选本页">', cls: 'is-check' }; }
+  function userLink(u, fallback) {
+    if (!u) return '<span class="text-muted">' + E(fallback || '已注销') + '</span>';
+    return '<a href="#/u/' + AT(u.id) + '">' + E(u.nickname || u.username) + '</a>';
+  }
+  function pager(section, filters, res) {
+    if (!res || !res.pages || res.pages <= 1) return '';
+    return '<div class="mt-3">' + TF.ui.pagination({
+      page: res.page, pages: res.pages, total: res.total,
+      makeHref: function (p) { return href(section, merge(filters, { page: p })); }
+    }) + '</div>';
+  }
+  function filterbar(section, items, extra) {
+    /* 手机上：一列满宽表单（输入框 16px 防 iOS 放大、按钮整行），不用横向滚动 */
+    if (isPhone()) {
+      var fields = items.map(function (it) {
+        if (it.type === 'select') return TF.ui.selectField({ label: it.label, name: it.name, value: it.value, options: it.options });
+        return TF.ui.field({ label: it.label, name: it.name, value: it.value, placeholder: it.placeholder, type: 'search' });
+      }).join('');
+      return '<form class="card card--pad mt-3" data-action="admin.filter" data-param="' + P({ section: section }) + '">' +
+        '<div class="formgrid">' + fields + '</div>' +
+        '<div class="cluster mt-3"><button type="submit" class="btn btn--primary btn--block">' + IC('filter', 14) + '<span>筛选</span></button>' +
+        '<button type="button" class="btn btn--ghost btn--block"' + ACT('admin.filter.reset', { section: section }) + '>重置</button></div></form>';
+    }
+    var html = items.map(function (it) {
+      var ctl;
+      if (it.type === 'select') {
+        ctl = '<select class="select" name="' + AT(it.name) + '">' + (it.options || []).map(function (op) {
+          var on = String(op.value) === String(it.value);
+          return '<option value="' + AT(op.value) + '"' + (on ? ' selected' : '') + '>' + E(op.label) + '</option>';
+        }).join('') + '</select>';
+      } else {
+        ctl = '<input class="input" type="search" name="' + AT(it.name) + '" value="' + AT(it.value || '') + '" placeholder="' + AT(it.placeholder || '') + '">';
+      }
+      return '<label class="filterbar__item"><span>' + E(it.label) + '</span>' + ctl + '</label>';
+    }).join('');
+    return '<form class="filterbar" data-action="admin.filter" data-param="' + P({ section: section }) + '">' + html +
+      '<span class="spacer"></span>' + (extra || '') +
+      '<button type="submit" class="btn btn--primary btn--sm">' + IC('filter', 13) + '<span>筛选</span></button>' +
+      '<button type="button" class="btn btn--ghost btn--sm"' + ACT('admin.filter.reset', { section: section }) + '>重置</button></form>';
+  }
+  function bulkbar(type, ops) {
+    /* 手机上贴底固定（样式在 mobile.css 的 ≤620px 段里），显隐用 .is-hidden 类控制：
+       选中才出现，免得浮层一直压着卡片内容；列表尾部留一段占位，最后一张卡不被盖住。 */
+    var phone = isPhone();
+    return '<div class="bulkbar' + (phone ? ' is-hidden' : '') + '"><span class="bulkbar__count">选中 <b data-bulk-count>0</b> 项</span>' +
+      ops.map(function (o) {
+        return '<button type="button" class="btn btn--' + (o.variant || 'outline') + ' btn--sm" disabled data-bulk-btn' +
+          ACT('admin.batch', { type: type, op: o.op }) + '>' + (o.icon ? IC(o.icon, 13) : '') + '<span>' + E(o.text) + '</span></button>';
+      }).join('') +
+      '<button type="button" class="btn btn--text btn--sm" data-action="admin.bulk.clear">取消选择</button></div>' +
+      (phone ? '<div class="p-6" aria-hidden="true"></div>' : '');
+  }
+  /* 紧凑页头：面包屑 + 一行标题（标题 · 能干什么 · 计数 · 操作），不写介绍段落 */
+  function head(section, actions) {
+    var s = SEC[section];
+    return '<div class="page__head mt-4">' +
+      TF.ui.breadcrumb([{ text: '管理后台', href: '#/admin/dashboard' }, { text: s.label }]) +
+      '<div class="cluster mt-2"><h1 class="page__title">' + E(s.title) + '</h1>' +
+      '<span class="text-xs text-muted">' + E(s.acts) + '</span>' +
+      '<span class="spacer"></span>' + (actions || '') + '</div></div>';
+  }
+  function settingRow(title, desc, ctl) {
+    return '<div class="cluster"><div><b class="text-sm">' + E(title) + '</b>' +
+      (desc ? '<div class="text-xs text-muted">' + E(desc) + '</div>' : '') + '</div>' +
+      '<span class="spacer"></span>' + ctl + '</div><hr class="divider">';
+  }
+  function finish(res, msg) {
+    if (res && res.ok) {
+      var n = (res.count != null && res.count > 1) ? ' ' + res.count + ' 项' : '';
+      TF.ui.toast((msg || '好了') + n, 'success');
+      TF.app.refresh();
+      return true;
+    }
+    TF.ui.toast((res && res.error) || '没成功，再试一次', 'error');
+    return false;
+  }
+  function confirmBox(o) {
+    if (TF.ui.modal && TF.ui.modal.confirm) return TF.ui.modal.confirm(o);
+    return Promise.resolve(window.confirm(o.title + '\n' + (o.body || '')));
+  }
+  function openModal(id) { if (TF.ui.modal && TF.ui.modal.open) TF.ui.modal.open(id); }
+  function closeModal(id) { if (TF.ui.modal && TF.ui.modal.close) { try { TF.ui.modal.close(id); } catch (e) { /* 忽略 */ } } }
+  function askModal(kind, extra, section) {
+    tmp.modal = merge({ kind: kind, section: section }, extra || {});
+    TF.app.refresh();
+    openModal('admin-modal');
+  }
+  function selectedIds() {
+    var out = [], list = document.querySelectorAll('[data-check-item]');
+    for (var i = 0; i < list.length; i++) if (list[i].checked) out.push(list[i].value);
+    return out;
+  }
+
+  /* ============================================================ 手机端（≤620px）
+     手机上表格换成卡片：一行一张卡，操作按钮单独一行（mobile.css 保证 .btn--sm ≥40px）。
+     桌面端一行都不受影响：isPhone() 为假时全部走原来的表格分支。 */
+  var PHONE_MAX = 620;
+  function isPhone() { return typeof window !== 'undefined' && !!window.innerWidth && window.innerWidth <= PHONE_MAX; }
+  var lastPhone = null, resizeBound = false;
+
+  function drawerClose() {
+    var sb = document.querySelector('.sidebar');
+    if (sb && sb.classList) sb.classList.remove('is-open');
+    if (document.body && document.body.classList) document.body.classList.remove('nav-open');
+  }
+  /* mobile.css 需要 .sidebar__backdrop 才有点击遮罩；app.js 不插这个元素，这里幂等补上。
+     每次渲染后收起抽屉，手机上点完菜单不会卡在抽屉里。 */
+  function drawerSync() {
+    if (!isPhone()) { drawerClose(); return; }
+    if (!document.querySelector('.sidebar__backdrop') && document.createElement) {
+      var wrap = document.querySelector('.app__adminwrap') || document.body;
+      if (wrap && wrap.appendChild) {
+        var back = document.createElement('div');
+        back.className = 'sidebar__backdrop';
+        back.setAttribute('aria-hidden', 'true');
+        wrap.appendChild(back);
+      }
+    }
+    drawerClose();
+  }
+  var drawerClickBound = false;
+  function drawerBindOnce() {
+    if (drawerClickBound || !document.addEventListener) return;
+    drawerClickBound = true;
+    document.addEventListener('click', function (ev) {
+      if (!isPhone()) return;
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      if (t.closest('.sidebar__link') || t.closest('.sidebar__backdrop')) drawerClose();
+    }, false);
+  }
+  function onViewportChange() {
+    var now = isPhone();
+    if (lastPhone === null) { lastPhone = now; return; }
+    if (now === lastPhone) return;
+    lastPhone = now;
+    if (!now) drawerClose();
+    TF.app.refresh();
+  }
+  function watchViewport() {
+    drawerBindOnce();
+    drawerSync();
+    lastPhone = isPhone();
+    if (resizeBound || !window.addEventListener) return;
+    resizeBound = true;
+    var fire = function () { onViewportChange(); };
+    var deb = TF.util.debounce ? TF.util.debounce(fire, 220) : fire;
+    window.addEventListener('resize', deb, false);
+    window.addEventListener('orientationchange', deb, false);
+  }
+
+  /* 卡片零件 */
+  function mMeta(items) {
+    return '<div class="cluster mt-2 text-xs text-muted">' + items.filter(Boolean).join('<span class="text-muted">·</span>') + '</div>';
+  }
+  function mCheck(id, type) {
+    return '<label class="check"><input class="check__box" type="checkbox" data-check-item value="' + AT(id) + '" data-action-change="admin.bulk" data-param="' + P({ type: type }) + '" aria-label="选中这一条"><span class="text-xs text-muted">选中</span></label>';
+  }
+  function mBtn(text, action, param, variant) {
+    return '<button type="button" class="btn btn--' + (variant || 'outline') + ' btn--sm"' + ACT(action, param) + '>' + E(text) + '</button>';
+  }
+  function mCard(headHTML, titleHTML, metaHTML, actions) {
+    return '<div class="tile">' + headHTML + '<div class="mt-1">' + titleHTML + '</div>' + metaHTML +
+      '<div class="cluster mt-3">' + actions.join('') + '</div></div>';
+  }
+  function mList(cards, emptyText) {
+    if (!cards.length) return '<div class="card card--pad mt-3 center text-sm text-muted">' + E(emptyText) + '</div>';
+    return '<div data-check-scope><div class="cluster mt-3 mb-2">' +
+      '<label class="check"><input class="check__box" type="checkbox" data-check-all aria-label="全选本页"><span class="text-xs text-muted">全选本页</span></label>' +
+      '</div><div class="stack">' + cards.join('') + '</div></div>';
+  }
+
+  /* 筛选条件与批量动作只定义一份，桌面/手机共用，避免两边不一致 */
+  function filtersFor(section, f) {
+    if (section === 'posts') return [
+      { label: '关键词', name: 'keyword', value: f.keyword, placeholder: '标题或正文' },
+      { label: '版块', name: 'boardId', type: 'select', value: f.boardId, options: [{ value: '', label: '全部' }].concat(TF.store.listBoards().map(function (b) { return { value: b.id, label: b.name }; })) },
+      { label: '状态', name: 'status', type: 'select', value: f.status, options: [{ value: '', label: '全部' }, { value: 'published', label: '已发布' }, { value: 'pending', label: '待审核' }, { value: 'hidden', label: '已下架' }, { value: 'deleted', label: '已删除' }] },
+      { label: '排序', name: 'sort', type: 'select', value: f.sort, options: [{ value: 'new', label: '最新' }, { value: 'hot', label: '最热' }, { value: 'views', label: '浏览最多' }, { value: 'comments', label: '评论最多' }] }
+    ];
+    if (section === 'comments') return [
+      { label: '关键词', name: 'keyword', value: f.keyword, placeholder: '评论内容' },
+      { label: '状态', name: 'status', type: 'select', value: f.status, options: [{ value: '', label: '全部' }, { value: 'published', label: '已发布' }, { value: 'hidden', label: '已隐藏' }, { value: 'deleted', label: '已删除' }] }
+    ];
+    if (section === 'users') return [
+      { label: '关键词', name: 'keyword', value: f.keyword, placeholder: '昵称 / 用户名 / 班级' },
+      { label: '角色', name: 'role', type: 'select', value: f.role, options: [{ value: '', label: '全部' }, { value: 'student', label: '学生' }, { value: 'mod', label: '版主' }, { value: 'admin', label: '超管' }] },
+      { label: '状态', name: 'status', type: 'select', value: f.status, options: [{ value: '', label: '全部' }, { value: 'active', label: '正常' }, { value: 'banned', label: '已封禁' }] },
+      { label: '排序', name: 'sort', type: 'select', value: f.sort, options: [{ value: 'points', label: '积分' }, { value: 'posts', label: '发帖' }, { value: 'new', label: '最新注册' }, { value: 'active', label: '最近活跃' }, { value: 'name', label: '用户名' }] }
+    ];
+    if (section === 'boards') return [{ label: '关键词', name: 'keyword', value: f.keyword, placeholder: '版块名或分组' }];
+    if (section === 'notices') return [{ label: '关键词', name: 'keyword', value: f.keyword, placeholder: '标题或正文' }];
+    if (section === 'logs') return [
+      { label: '动作', name: 'action', type: 'select', value: f.action, options: LOG_ACTIONS },
+      { label: '谁干的', name: 'actorId', type: 'select', value: f.actorId, options: [{ value: '', label: '全部' }].concat(TF.store.adminList({ type: 'user', size: 500 }).list.map(function (u) { return { value: u.id, label: u.nickname || u.username }; })) }
+    ];
+    return [];
+  }
+  var BULK_OPS = {
+    post: [
+      { text: '置顶', op: 'pin' }, { text: '取消置顶', op: 'unpin' }, { text: '加精', op: 'feature' },
+      { text: '取消加精', op: 'unfeature' }, { text: '下架', op: 'hide' }, { text: '发布', op: 'publish' },
+      { text: '删掉', op: 'delete', variant: 'danger' }
+    ],
+    comment: [{ text: '隐藏', op: 'hide' }, { text: '放出来', op: 'publish' }, { text: '删掉', op: 'delete', variant: 'danger' }],
+    user: [{ text: '封禁', op: 'ban', variant: 'danger' }, { text: '解封', op: 'unban' }, { text: '删号', op: 'delete', variant: 'danger' }],
+    report: [{ text: '标记已处理', op: 'resolve' }, { text: '驳回', op: 'reject' }]
+  };
+
+  /* 卡片列表（每个列表页一份，字段与桌面表格一致） */
+  function postsCards(res) {
+    return mList((res.list || []).map(function (p) {
+      var u = TF.store.getUser(p.authorId), b = TF.store.getBoard(p.boardId);
+      var mark = (p.pinned ? TF.ui.badge('置顶', 'primary') : '') + (p.featured ? TF.ui.badge('精华', 'warn') : '') + (p.locked ? TF.ui.badge('锁帖', 'default') : '');
+      return mCard(
+        '<div class="cluster">' + mCheck(p.id, 'post') + stBadge(POST_STATUS, p.status) + mark + '</div>',
+        '<a href="#/post/' + AT(p.id) + '"><b>' + E(p.title) + '</b></a>',
+        mMeta([u ? E(u.nickname || u.username) : '已注销', b ? E(b.name) : '', '浏览 ' + NUM(p.views), '赞 ' + NUM(p.likes), '评论 ' + NUM(p.commentCount), E(REL(p.createdAt))]),
+        [
+          mBtn('编辑', 'admin.post.edit', { id: p.id }),
+          mBtn(p.pinned ? '取消置顶' : '置顶', 'admin.one', { type: 'post', id: p.id, op: p.pinned ? 'unpin' : 'pin', msg: p.pinned ? '取消置顶了' : '置顶了' }),
+          mBtn(p.featured ? '取消加精' : '加精', 'admin.one', { type: 'post', id: p.id, op: p.featured ? 'unfeature' : 'feature', msg: p.featured ? '取消加精了' : '加精了' }),
+          mBtn(p.status === 'published' ? '下架' : '发布', 'admin.post.status', { id: p.id, status: p.status === 'published' ? 'hidden' : 'published' }),
+          mBtn('删掉', 'admin.post.delete', { id: p.id }, 'danger')
+        ]);
+    }), '没找到，换个词或状态试试');
+  }
+  function commentsCards(res) {
+    return mList((res.list || []).map(function (c) {
+      var u = TF.store.getUser(c.authorId), p = TF.store.adminGet('post', c.postId);
+      return mCard(
+        '<div class="cluster">' + mCheck(c.id, 'comment') + stBadge(COMMENT_STATUS, c.status) +
+          (c.parentId ? '<span class="text-xs text-muted">回复 ' + E(c.replyToName || '楼上') + '</span>' : '') + '</div>',
+        E(EXC(c.content, 80)),
+        mMeta([u ? E(u.nickname || u.username) : '已注销', '赞 ' + NUM(c.likes), E(REL(c.createdAt)),
+          p ? '<a href="#/post/' + AT(p.id) + '">' + E(EXC(p.title, 16)) + '</a>' : '帖子没了']),
+        [
+          c.status === 'published'
+            ? mBtn('隐藏', 'admin.one', { type: 'comment', id: c.id, op: 'hide', msg: '隐藏了' })
+            : mBtn('放出来', 'admin.one', { type: 'comment', id: c.id, op: 'publish', msg: '放出来了' }),
+          mBtn('删掉', 'admin.comment.delete', { id: c.id }, 'danger')
+        ]);
+    }), '没找到评论');
+  }
+  /* 隐私字段（真实姓名 / 班级 / 学号）：超管能看到，版主和别人拿到的是空串。
+     服务端已经按角色过滤，这里只是把"看不到"显示成"—"，并给个说明。 */
+  function privateCell(u, which) {
+    var val = which === 'name' ? (u.realName || '') : (u.klass || '');
+    if (val) {
+      return '<span>' + E(val) + '</span>' +
+        (which === 'klass' && u.studentNo ? '<div class="text-xs text-muted">学号 ' + E(u.studentNo) + '</div>' : '');
+    }
+    /* 空串：要么没填，要么当前身份看不到 */
+    if (u.hasRealName || u.hasStudentNo) return '<span class="text-muted" title="只有超级管理员能看到">仅超管可见</span>';
+    return '<span class="text-muted">未填</span>';
+  }
+
+  function usersCards(res) {
+    var me = TF.store.currentUser() || {};
+    return mList((res.list || []).map(function (u) {
+      var acts = [];
+      /* nick 一起带上：万一前端快照里没这个人，至少提示语能显示"是谁"（动作本身服务端校验） */
+      var who = { id: u.id, nick: u.nickname || u.username || '' };
+      var withRole = function (role) { return { id: u.id, nick: who.nick, role: role }; };
+      if (u.banned) acts.push(mBtn('解封', 'admin.one', { type: 'user', id: u.id, op: 'unban', msg: '解封了' }));
+      else acts.push(mBtn('封禁', 'admin.user.ban.open', who, 'danger'));
+      if (u.role === 'student') acts.push(mBtn('设版主', 'admin.user.role', withRole('mod')));
+      if (u.role === 'mod') acts.push(mBtn('取消版主', 'admin.user.role', withRole('student')));
+      if (u.role !== 'admin') acts.push(mBtn('设超管', 'admin.user.role', withRole('admin')));
+      if (u.role === 'admin' && u.id !== me.id) acts.push(mBtn('降为学生', 'admin.user.role', withRole('student')));
+      if (u.role === 'mod' && me.role === 'admin') acts.push(mBtn('负责版块', 'admin.user.boards', { id: u.id, nick: who.nick }));
+      acts.push(mBtn('重置密码', 'admin.user.pwd', who));
+      acts.push(mBtn('删号', 'admin.user.delete', { id: u.id }, 'danger'));
+      return mCard(
+        '<div class="cluster">' + mCheck(u.id, 'user') + roleBadge(u.role) +
+          (u.banned ? TF.ui.badge('已封禁', 'danger') : TF.ui.badge('正常', 'success')) +
+          (u.id === me.id ? '<span class="text-xs text-muted">我</span>' : '') + '</div>',
+        '<a href="#/u/' + AT(u.id) + '"><b>' + E(u.nickname || u.username) + '</b></a> <span class="text-xs text-muted">@' + E(u.username) + '</span>',
+        mMeta([u.realName ? '真实姓名 ' + u.realName : (u.hasRealName ? '真实姓名仅超管可见' : ''),
+          u.klass ? '班级 ' + u.klass : '', u.studentNo ? '学号 ' + u.studentNo : '',
+          u.grade ? E(u.grade) : '', '积分 ' + NUM(u.points), '发帖 ' + NUM(u.stats && u.stats.posts),
+          u.lastLoginAt ? E(REL(u.lastLoginAt)) : '没登过', u.banned && u.banReason ? E(EXC(u.banReason, 14)) : '']),
+        acts);
+    }), '没有这个人');
+  }
+  function boardsCards(res) {
+    return mList((res.list || []).map(function (b) {
+      return mCard(
+        '<div class="cluster"><span class="board-card__icon">' + IC(b.icon, 15) + '</span>' + TF.ui.tag(b.group) +
+          (b.locked ? TF.ui.badge('已锁定', 'warn') : TF.ui.badge('开放', 'success')) + '</div>',
+        '<b>' + E(b.name) + '</b>',
+        mMeta([E(EXC(b.desc, 30)), '帖子 ' + NUM(b.stats && b.stats.posts), '今日 ' + NUM(b.stats && b.stats.today), '排序 ' + NUM(b.order)]),
+        [
+          mBtn('编辑', 'admin.board.edit', { id: b.id }),
+          mBtn('上移', 'admin.board.move', { id: b.id, dir: -1 }),
+          mBtn('下移', 'admin.board.move', { id: b.id, dir: 1 }),
+          mBtn(b.locked ? '解锁' : '锁定', 'admin.board.lock', { id: b.id }),
+          mBtn('删掉', 'admin.board.delete', { id: b.id }, 'danger')
+        ]);
+    }), '没有匹配的版块');
+  }
+  function reportsCards(res, raw) {
+    return mList((res.list || []).map(function (r) {
+      var reporter = TF.store.getUser(r.reporterId);
+      var summary = '', link = '';
+      if (r.targetType === 'post') {
+        var p = TF.store.adminGet('post', r.targetId);
+        summary = p ? EXC(p.title, 22) : '帖子已删除';
+        link = '#/post/' + r.targetId;
+      } else if (r.targetType === 'comment') {
+        var c = TF.store.adminGet('comment', r.targetId);
+        summary = c ? EXC(c.content, 22) : '评论已删除';
+        link = c ? '#/post/' + c.postId : '';
+      } else {
+        var u = TF.store.adminGet('user', r.targetId);
+        summary = u ? (u.nickname || u.username) : '用户已注销';
+        link = '#/u/' + r.targetId;
+      }
+      var tl = { post: ['帖子', 'primary'], comment: ['评论', 'info'], user: ['用户', 'warn'] }[r.targetType] || ['其他', 'default'];
+      return mCard(
+        '<div class="cluster">' + mCheck(r.id, 'report') + TF.ui.badge(tl[0], tl[1]) + stBadge(REPORT_STATUS, r.status) + '</div>',
+        link ? '<a href="' + AT(link) + '"><b>' + E(summary) + '</b></a>' : '<b>' + E(summary) + '</b>',
+        mMeta([reporter ? E(reporter.nickname || reporter.username) + ' 举报' : '', E(EXC(r.reason, 20)),
+          r.detail ? E(EXC(r.detail, 20)) : '', E(REL(r.createdAt)), r.handleNote ? E(EXC(r.handleNote, 12)) : '']),
+        r.status === 'pending'
+          ? [mBtn('标记已处理', 'admin.report.handle', { id: r.id, status: 'resolved' }), mBtn('驳回', 'admin.report.handle', { id: r.id, status: 'rejected' })]
+          : [mBtn('看记录', 'admin.report.handle', { id: r.id, status: r.status })]);
+    }), raw === 'pending' ? '没有待处理的举报' : '这里还空着');
+  }
+  function noticesCards(res) {
+    return mList((res.list || []).map(function (n) {
+      var u = TF.store.getUser(n.authorId);
+      return mCard(
+        '<div class="cluster">' + stBadge(LEVEL, n.level) + (n.top ? TF.ui.badge('置顶', 'primary') : '') +
+          '<span class="text-xs text-muted">' + E(FMT(n.createdAt)) + '</span></div>',
+        '<b>' + E(n.title) + '</b>',
+        mMeta([E(EXC(n.content, 44)), u ? E(u.nickname || u.username) : '']),
+        [
+          mBtn('预览', 'admin.notice.preview', { id: n.id }),
+          mBtn('编辑', 'admin.notice.edit', { id: n.id }),
+          mBtn('删掉', 'admin.notice.delete', { id: n.id }, 'danger')
+        ]);
+    }), '还没发过公告');
+  }
+  function logsCards(res) {
+    return mList((res.list || []).map(function (g) {
+      var u = TF.store.getUser(g.actorId);
+      return mCard(
+        '<div class="cluster"><span class="text-xs text-muted">' + E(FMT(g.createdAt)) + '</span>' +
+          '<span class="mono text-xs">' + E(g.action) + '</span></div>',
+        E(g.detail || '—'),
+        mMeta([u ? E(u.nickname || u.username) : '系统', g.target ? '<span class="mono">' + E(g.target) + '</span>' : '']),
+        []);
+    }), '没有符合条件的日志');
+  }
+
+  /* --------------------------------------------------------------- 弹窗 */
+  function buttonsRow(okText, danger) {
+    return '<div class="cluster mt-4"><button type="submit" class="btn btn--' + (danger ? 'danger' : 'primary') + '">' + E(okText) + '</button>' +
+      '<button type="button" class="btn btn--ghost" data-action="admin.modal.cancel" data-modal-close>取消</button></div>';
+  }
+  function editModal() {
+    var m = tmp.modal;
+    if (!m || !TF.ui.modal) return '';
+    var body = '', title = '';
+    if (m.kind === 'post') {
+      var p = TF.store.adminGet('post', m.id);
+      if (!p) return '';
+      body = '<form class="form" data-action="admin.post.save"><input type="hidden" name="id" value="' + AT(p.id) + '">' +
+        TF.ui.field({ label: '标题', name: 'title', value: p.title, required: true, block: true, maxlength: 60, hint: '至少 4 个字' }) +
+        '<div class="formgrid mt-3">' +
+        TF.ui.selectField({ label: '版块', name: 'boardId', value: p.boardId, options: TF.store.listBoards().map(function (b) { return { value: b.id, label: b.name }; }) }) +
+        TF.ui.selectField({ label: '状态', name: 'status', value: p.status, options: Object.keys(POST_STATUS).map(function (k) { return { value: k, label: POST_STATUS[k][0] }; }), hint: '改成已发布会通知作者' }) +
+        TF.ui.field({ label: '标签', name: 'tags', value: (p.tags || []).join('，'), hint: '逗号分隔，最多 5 个' }) +
+        TF.ui.checkField({ label: '置顶', name: 'pinned', checked: !!p.pinned, block: true }) +
+        TF.ui.checkField({ label: '加精', name: 'featured', checked: !!p.featured, block: true }) +
+        '</div>' + TF.ui.textarea({ label: '正文', name: 'content', value: p.content, rows: 10, block: true, required: true, hint: '支持 Markdown，至少 10 个字' }) +
+        buttonsRow('存起来') + '</form>';
+      return TF.ui.modal({ id: 'admin-modal', title: '编辑帖子 #' + p.id, body: body, size: 'lg' });
+    }
+    if (m.kind === 'board') {
+      var b = m.id ? TF.store.getBoard(m.id) : null;
+      if (m.id && !b) return '';
+      var bd = b || { name: '', desc: '', icon: 'forum', group: '校园生活', order: TF.store.listBoards().length + 1, minRole: 'student', locked: false, color: 0 };
+      body = '<form class="form" data-action="admin.board.save"><input type="hidden" name="id" value="' + AT(b ? b.id : '') + '">' +
+        '<div class="formgrid">' +
+        TF.ui.field({ label: '版块名', name: 'name', value: bd.name, required: true, maxlength: 12, hint: '2~12 个字，例如「社团活动」' }) +
+        TF.ui.selectField({ label: '图标', name: 'icon', value: bd.icon, options: BOARD_ICONS.map(function (n) { return { value: n, label: n }; }) }) +
+        TF.ui.field({ label: '分组', name: 'group', value: bd.group, hint: '例如「校园官方」「校园生活」' }) +
+        TF.ui.field({ label: '排序', name: 'order', type: 'number', value: bd.order, hint: '数字越小越靠前' }) +
+        TF.ui.selectField({ label: '谁能发帖', name: 'minRole', value: bd.minRole, options: [{ value: 'student', label: '所有同学' }, { value: 'mod', label: '仅版主' }, { value: 'admin', label: '仅超管' }] }) +
+        TF.ui.selectField({ label: '配色', name: 'color', value: bd.color, options: [0, 1, 2, 3, 4].map(function (i) { return { value: i, label: '配色 ' + (i + 1) }; }) }) +
+        TF.ui.checkField({ label: '锁定（锁后不能发新帖）', name: 'locked', checked: !!bd.locked, block: true }) +
+        '</div>' + TF.ui.textarea({ label: '简介', name: 'desc', value: bd.desc, rows: 3, block: true, maxlength: 60 }) +
+        buttonsRow(b ? '存起来' : '建好') + '</form>';
+      return TF.ui.modal({ id: 'admin-modal', title: b ? '编辑版块「' + b.name + '」' : '新建版块', body: body, size: 'lg' });
+    }
+    if (m.kind === 'notice') {
+      var n = m.id ? TF.store.getNotice(m.id) : null;
+      if (m.id && !n) return '';
+      var nd = n || { title: '', content: '', level: 'info', top: false };
+      body = '<form class="form" data-action="admin.notice.save"><input type="hidden" name="id" value="' + AT(n ? n.id : '') + '">' +
+        TF.ui.field({ label: '标题', name: 'title', value: nd.title, required: true, block: true, maxlength: 40, hint: '至少 4 个字' }) +
+        '<div class="formgrid mt-3">' +
+        TF.ui.selectField({ label: '级别', name: 'level', value: nd.level, options: [{ value: 'info', label: '普通' }, { value: 'warn', label: '提醒' }, { value: 'important', label: '重要' }] }) +
+        TF.ui.checkField({ label: '置顶', name: 'top', checked: !!nd.top, block: true }) +
+        '</div>' + TF.ui.textarea({ label: '正文', name: 'content', value: nd.content, rows: 8, block: true, required: true, hint: '支持 Markdown，至少 10 个字' }) +
+        buttonsRow(n ? '存起来' : '发出去') + '</form>';
+      return TF.ui.modal({ id: 'admin-modal', title: n ? '编辑公告' : '发公告', body: body, size: 'lg' });
+    }
+    if (m.kind === 'notice-view') {
+      var nv = TF.store.getNotice(m.id);
+      if (!nv) return '';
+      body = '<div class="cluster">' + stBadge(LEVEL, nv.level) + (nv.top ? TF.ui.badge('置顶', 'primary') : '') +
+        '<span class="metaitem">' + IC('clock', 13) + E(FMT(nv.createdAt)) + '</span></div>' +
+        '<h3 class="mt-3">' + E(nv.title) + '</h3><hr class="divider">' +
+        '<div class="markdown markdown--preview">' + TF.util.md(nv.content) + '</div>' +
+        '<div class="cluster mt-4"><button type="button" class="btn btn--primary" data-modal-close>关了</button></div>';
+      return TF.ui.modal({ id: 'admin-modal', title: '公告预览', body: body, size: 'lg' });
+    }
+    if (m.kind === 'ban') {
+      var u = TF.store.getUser(m.id);
+      if (!u) return '';
+      body = '<form class="form" data-action="admin.user.ban"><input type="hidden" name="id" value="' + AT(u.id) + '">' +
+        '<p class="text-sm text-2">封了 <b>' + E(u.nickname || u.username) + '</b>（@' + E(u.username) + '）之后，他登不上、发不了帖也评不了论。</p>' +
+        TF.ui.textarea({ label: '封禁原因', name: 'reason', rows: 3, required: true, placeholder: '例如：连着发了好几条广告', hint: '原因会发到他的消息中心，写清楚点' }) +
+        buttonsRow('封禁', true) + '</form>';
+      return TF.ui.modal({ id: 'admin-modal', title: '封禁账号', body: body });
+    }
+    if (m.kind === 'report') {
+      var r = TF.store.adminGet('report', m.id);
+      if (!r) return '';
+      var isResolve = m.status === 'resolved';
+      body = '<form class="form" data-action="admin.report.note"><input type="hidden" name="id" value="' + AT(r.id) + '">' +
+        '<input type="hidden" name="status" value="' + AT(m.status) + '">' +
+        '<p class="text-sm text-2">' + (isResolve ? '当成真的处理' : '当成误报驳回') + '：<b>' + E(EXC(r.reason, 40)) + '</b></p>' +
+        TF.ui.textarea({ label: '备注', name: 'note', rows: 3, placeholder: isResolve ? '例如：帖子已下架，也提醒了作者' : '例如：内容没问题，是误会', hint: '备注会一起发给举报人' }) +
+        buttonsRow(isResolve ? '标记已处理' : '驳回') + '</form>';
+      return TF.ui.modal({ id: 'admin-modal', title: isResolve ? '处理举报' : '驳回举报', body: body });
+    }
+    if (m.kind === 'modboards') {
+      /* 版主负责的版块：勾上哪些，他就只能管哪些（不勾 = 不限，能管全部内容） */
+      var ub = findUserForAction ? findUserForAction({ param: { id: m.id, nick: m.nick } }) : null;
+      body = '<form class="form" data-action="admin.user.boards.save">' +
+        '<input type="hidden" name="id" value="' + AT(m.id) + '">' +
+        '<p class="text-sm text-2">给 <b>' + E(m.nick || '这位版主') + '</b> 勾上他负责的版块：' +
+        '他只能删/改/置顶这些版块里的帖子和评论，用户管理和站点设置仍然只有超管能动。</p>' +
+        '<div class="mt-3">' + (m.boxes || '（还没有版块）') + '</div>' +
+        '<p class="text-xs text-muted mt-3">一个都不勾 = 不限制（他能管所有版块的内容）。</p>' +
+        buttonsRow('存起来') + '</form>';
+      return TF.ui.modal({ id: 'admin-modal', title: '版主负责哪些版块', body: body, size: 'lg' });
+    }
+    if (m.kind === 'pwd') {
+      body = '<p class="text-sm text-2"><b>' + E(m.name) + '</b> 的新密码，复制给他：</p>' +
+        '<div class="cluster mt-3"><code class="mono text-lg">' + E(m.pwd) + '</code>' +
+        '<button type="button" class="btn btn--outline btn--sm" data-copy="' + AT(m.pwd) + '">' + IC('key', 13) + '<span>复制</span></button></div>' +
+        '<p class="text-xs text-muted mt-3">只显示这一次，关了就得再重置一回。</p>' +
+        '<div class="cluster mt-4"><button type="button" class="btn btn--primary" data-modal-close>好</button></div>';
+      return TF.ui.modal({ id: 'admin-modal', title: '密码重置好了', body: body, size: 'sm' });
+    }
+    return '';
+  }
+
+  /* ------------------------------------------------------ 1 数据总览 */
+  function renderDashboard(ctx) {
+    var a = TF.store.adminStats();
+    var trend = a.trend || [];
+    var labels = trend.map(function (t) { return t.date; });
+    var pv = { labels: labels, series: [{ name: '浏览量', data: trend.map(function (t) { return t.pv; }) }, { name: '独立访客', data: trend.map(function (t) { return t.uv; }) }] };
+    var cp = { labels: labels, series: [{ name: '发帖', data: trend.map(function (t) { return t.posts; }) }, { name: '评论', data: trend.map(function (t) { return t.comments; }) }] };
+    var sv = a.studentVerify || { pending: 0, external: 0 };
+    var stats = '<div class="statgrid">' +
+      TF.ui.statCard({ label: '注册成员', value: NUM(a.users.total), delta: a.users.today, icon: 'users', tone: 'accent' }) +
+      TF.ui.statCard({ label: '帖子', value: NUM(a.posts.total), delta: a.posts.today, icon: 'edit' }) +
+      TF.ui.statCard({ label: '评论', value: NUM(a.comments.total), delta: a.comments.today, icon: 'comment', tone: 'success' }) +
+      TF.ui.statCard({ label: '待审核', value: NUM(a.posts.pending), icon: 'alert', tone: 'warn' }) +
+      TF.ui.statCard({ label: '待处理举报', value: NUM(a.reports.pending), icon: 'flag', tone: 'danger' }) +
+      (isSuper() ? TF.ui.statCard({ label: '待认证学生', value: NUM(sv.pending), icon: 'shield', tone: 'warn' }) : '') +
+      TF.ui.statCard({ label: '今日浏览', value: NUM(a.pvToday), icon: 'chart' }) +
+      '</div>';
+    var hot = TF.store.hotPosts(6).map(function (p, i) {
+      return '<a class="rankrow" href="#/post/' + AT(p.id) + '"><span class="rankrow__no">' + (i + 1) + '</span>' +
+        '<span class="rankrow__title">' + E(p.title) + '</span><span class="metaitem">' + IC('eye', 12) + NUM(p.views) + '</span></a>';
+    }).join('');
+    var newUsers = (a.latestUsers || []).map(function (u) {
+      return '<div class="logrow">' + TF.ui.avatar(u, 26) + '<span class="logrow__text">' + E(u.nickname || u.username) +
+        ' <span class="text-xs text-muted">@' + E(u.username) + ' · ' + E(REL(u.createdAt)) + '</span></span>' + roleBadge(u.role) + '</div>';
+    }).join('');
+    var logs = (a.latestLogs || []).map(function (g) {
+      var u = TF.store.getUser(g.actorId);
+      return '<div class="logrow"><span class="logrow__time">' + E(FMT(g.createdAt)) + '</span><span class="logrow__text">' +
+        (u ? '<b>' + E(u.nickname || u.username) + '</b> ' : '') + E(g.detail || g.action) + '</span></div>';
+    }).join('');
+    var tags = (a.hotTags || []).map(function (t) {
+      return '<a class="tagchip" href="#/search?q=' + encodeURIComponent(t.name) + '">' + E(t.name) + '<b>' + NUM(t.value) + '</b></a>';
+    }).join('');
+    var actions = '<span class="text-xs text-muted">' + NUM(a.users.total) + ' 人 · ' + NUM(a.posts.total) + ' 帖</span>' +
+      (sv.pending > 0 ? '<a class="btn btn--outline btn--sm" href="#/admin/verify">' + NUM(sv.pending) + ' 位同学待学生认证</a>' : '') +
+      (a.reports.pending > 0 ? '<a class="btn btn--danger btn--sm" href="#/admin/reports?status=pending">' + NUM(a.reports.pending) + ' 条举报待处理</a>' : '') +
+      (a.posts.pending > 0 ? '<a class="btn btn--outline btn--sm" href="#/admin/posts?status=pending">' + NUM(a.posts.pending) + ' 篇待审核</a>' : '');
+    /* 手机上图表压矮一档，少滚两屏 */
+    var ch = { line: isPhone() ? 168 : 232, bar: isPhone() ? 190 : 232 };
+    return head('dashboard', actions) + stats +
+      '<div class="grid grid--2 mt-3">' + block('近 14 天浏览', TF.ui.chart('line', pv, { aria: '近 14 天浏览量折线图', height: ch.line })) +
+      block('近 14 天发帖与评论', TF.ui.chart('line', cp, { aria: '近 14 天发帖与评论折线图', height: ch.line })) + '</div>' +
+      '<div class="grid grid--2 mt-3">' + block('角色分布', TF.ui.chart('donut', a.roleDist, { centerLabel: '成员', center: NUM(a.users.total) })) +
+      block('各版块帖子数', TF.ui.chart('bar', a.boardDist, { aria: '各版块帖子数柱状图', height: ch.bar })) + '</div>' +
+      '<div class="grid grid--3 mt-3">' +
+      block('热门标签', tags ? '<div class="tagcloud">' + tags + '</div>' : emptyLine('还没有标签')) +
+      block('热帖', hot || emptyLine('还没有热帖'), { flush: !!hot, more: { href: '#/admin/posts?sort=hot', text: '更多' } }) +
+      block('新注册', newUsers || emptyLine('还没有新注册'), { flush: !!newUsers }) +
+      '</div>' +
+      '<div class="mt-3">' + block('最近操作', logs || emptyLine('还没有操作'), { flush: !!logs, more: { href: '#/admin/logs', text: '全部' } }) + '</div>';
+  }
+
+  /* ------------------------------------------------------ 2 帖子管理 */
+  function renderPosts(ctx) {;
+    var f = { keyword: Q(ctx, 'keyword', ''), status: Q(ctx, 'status', ''), boardId: Q(ctx, 'boardId', ''), sort: Q(ctx, 'sort', 'new'), page: QN(ctx, 'page', 1) };
+    var res = TF.store.adminList({ type: 'post', keyword: f.keyword, status: f.status, boardId: f.boardId, sort: f.sort, page: f.page, size: 15 });
+    if (isPhone()) {
+      return head('posts', '<span class="text-xs text-muted">共 ' + NUM(TF.store.adminStats().posts.total) + ' 帖</span>') +
+        filterbar('posts', filtersFor('posts', f)) + postsCards(res) + bulkbar('post', BULK_OPS.post) + pager('posts', f, res);
+    }
+    var rows = (res.list || []).map(function (p) {
+      var u = TF.store.getUser(p.authorId), b = TF.store.getBoard(p.boardId);
+      var mark = (p.pinned ? TF.ui.badge('置顶', 'primary') : '') + (p.featured ? TF.ui.badge('精华', 'warn') : '') + (p.locked ? TF.ui.badge('锁帖', 'default') : '');
+      return [
+        checkTd(p.id, 'post'),
+        td('<span class="mono text-xs text-muted">#' + E(p.id) + '</span>'),
+        td('<a href="#/post/' + AT(p.id) + '"><b>' + E(p.title) + '</b></a>' + (mark ? ' ' + mark : '')),
+        td(userLink(u)),
+        td(b ? E(b.name) : '<span class="text-muted">—</span>'),
+        td(stBadge(POST_STATUS, p.status)),
+        td('<span class="mono">' + NUM(p.views) + '</span>', 'num'),
+        td('<span class="mono">' + NUM(p.likes) + '</span>', 'num'),
+        td('<span class="mono">' + NUM(p.commentCount) + '</span>', 'num'),
+        td('<span class="text-xs text-muted">' + E(REL(p.createdAt)) + '</span>'),
+        td('<div class="table__actions">' +
+          TF.ui.button({ icon: 'edit', variant: 'ghost', size: 'sm', title: '编辑', attrs: { 'aria-label': '编辑帖子' }, action: 'admin.post.edit', param: { id: p.id } }) +
+          TF.ui.button({ text: p.pinned ? '取消置顶' : '置顶', variant: 'ghost', size: 'sm', action: 'admin.one', param: { type: 'post', id: p.id, op: p.pinned ? 'unpin' : 'pin', msg: p.pinned ? '取消置顶了' : '置顶了' } }) +
+          TF.ui.button({ text: p.featured ? '取消加精' : '加精', variant: 'ghost', size: 'sm', action: 'admin.one', param: { type: 'post', id: p.id, op: p.featured ? 'unfeature' : 'feature', msg: p.featured ? '取消加精了' : '加精了' } }) +
+          TF.ui.button({ text: p.status === 'published' ? '下架' : '发布', variant: 'ghost', size: 'sm', action: 'admin.post.status', param: { id: p.id, status: p.status === 'published' ? 'hidden' : 'published' } }) +
+          TF.ui.button({ icon: 'trash', variant: 'danger', size: 'sm', title: '删掉', attrs: { 'aria-label': '删除帖子' }, action: 'admin.post.delete', param: { id: p.id } }) +
+          '</div>')
+      ];
+    });
+    return head('posts', '<span class="text-xs text-muted">共 ' + NUM(TF.store.adminStats().posts.total) + ' 帖</span>') +
+      filterbar('posts', filtersFor('posts', f)) +
+      table([checkHead(), { t: 'ID' }, { t: '标题' }, { t: '作者' }, { t: '版块' }, { t: '状态' }, { t: '浏览' }, { t: '赞' }, { t: '评论' }, { t: '时间' }, { t: '操作' }], rows, '没找到，换个词或状态试试', true) +
+      bulkbar('post', BULK_OPS.post) + pager('posts', f, res);
+  }
+
+  /* ------------------------------------------------------ 3 评论管理 */
+  function renderComments(ctx) {
+    var f = { keyword: Q(ctx, 'keyword', ''), status: Q(ctx, 'status', ''), page: QN(ctx, 'page', 1) };
+    var res = TF.store.adminList({ type: 'comment', keyword: f.keyword, status: f.status, page: f.page, size: 15 });
+    if (isPhone()) {
+      return head('comments') + filterbar('comments', filtersFor('comments', f)) + commentsCards(res) +
+        bulkbar('comment', BULK_OPS.comment) + pager('comments', f, res);
+    }
+    var rows = (res.list || []).map(function (c) {
+      var u = TF.store.getUser(c.authorId), p = TF.store.adminGet('post', c.postId);
+      return [
+        checkTd(c.id, 'comment'),
+        td('<span class="mono text-xs text-muted">#' + E(c.id) + '</span>'),
+        td(E(EXC(c.content, 46)) + (c.parentId ? ' <span class="text-xs text-muted">（回复 ' + E(c.replyToName || '楼上') + '）</span>' : '')),
+        td(userLink(u)),
+        td(p ? '<a href="#/post/' + AT(p.id) + '">' + E(EXC(p.title, 18)) + '</a>' : '<span class="text-muted">帖子没了</span>'),
+        td(stBadge(COMMENT_STATUS, c.status)),
+        td('<span class="mono">' + NUM(c.likes) + '</span>', 'num'),
+        td('<span class="text-xs text-muted">' + E(REL(c.createdAt)) + '</span>'),
+        td('<div class="table__actions">' +
+          (c.status === 'published'
+            ? TF.ui.button({ text: '隐藏', variant: 'ghost', size: 'sm', action: 'admin.one', param: { type: 'comment', id: c.id, op: 'hide', msg: '隐藏了' } })
+            : TF.ui.button({ text: '放出来', variant: 'ghost', size: 'sm', action: 'admin.one', param: { type: 'comment', id: c.id, op: 'publish', msg: '放出来了' } })) +
+          TF.ui.button({ icon: 'trash', variant: 'danger', size: 'sm', title: '删掉', attrs: { 'aria-label': '删除评论' }, action: 'admin.comment.delete', param: { id: c.id } }) +
+          '</div>')
+      ];
+    });
+    return head('comments') +
+      filterbar('comments', filtersFor('comments', f)) +
+      table([checkHead(), { t: 'ID' }, { t: '评论' }, { t: '作者' }, { t: '来自帖子' }, { t: '状态' }, { t: '赞' }, { t: '时间' }, { t: '操作' }], rows, '没找到评论', true) +
+      bulkbar('comment', BULK_OPS.comment) +
+      pager('comments', f, res);
+  }
+
+  /* ------------------------------------------------------ 4 用户管理 */
+  function renderUsers(ctx) {
+    var f = { keyword: Q(ctx, 'keyword', ''), role: Q(ctx, 'role', ''), status: Q(ctx, 'status', ''), sort: Q(ctx, 'sort', 'points'), page: QN(ctx, 'page', 1) };
+    var res = TF.store.adminList({ type: 'user', keyword: f.keyword, role: f.role, status: f.status, sort: f.sort, page: f.page, size: 15 });
+    if (isPhone()) {
+      return head('users', '<span class="text-xs text-muted">共 ' + NUM(TF.store.adminStats().users.total) + ' 人</span>') +
+        filterbar('users', filtersFor('users', f)) + usersCards(res) + bulkbar('user', BULK_OPS.user) + pager('users', f, res);
+    }
+    var me = TF.store.currentUser() || {};
+    var rows = (res.list || []).map(function (u) {
+      var acts = [];
+      var who = { id: u.id, nick: u.nickname || u.username || '' };
+      var withRole = function (role) { return { id: u.id, nick: who.nick, role: role }; };
+      if (u.banned) acts.push(TF.ui.button({ text: '解封', variant: 'ghost', size: 'sm', action: 'admin.one', param: { type: 'user', id: u.id, op: 'unban', msg: '解封了' } }));
+      else acts.push(TF.ui.button({ text: '封禁', variant: 'ghost', size: 'sm', action: 'admin.user.ban.open', param: who }));
+      if (u.role === 'student') acts.push(TF.ui.button({ text: '设版主', variant: 'ghost', size: 'sm', action: 'admin.user.role', param: withRole('mod') }));
+      if (u.role === 'mod') acts.push(TF.ui.button({ text: '取消版主', variant: 'ghost', size: 'sm', action: 'admin.user.role', param: withRole('student') }));
+      if (u.role !== 'admin') acts.push(TF.ui.button({ text: '设超管', variant: 'ghost', size: 'sm', action: 'admin.user.role', param: withRole('admin') }));
+      if (u.role === 'admin' && u.id !== me.id) acts.push(TF.ui.button({ text: '降为学生', variant: 'ghost', size: 'sm', action: 'admin.user.role', param: withRole('student') }));
+      /* 版主：指定他负责哪些版块（超管专属操作） */
+      if (u.role === 'mod' && me.role === 'admin') acts.push(TF.ui.button({ text: '负责版块', variant: 'ghost', size: 'sm', action: 'admin.user.boards', param: { id: u.id, nick: u.nickname || u.username || '' } }));
+      acts.push(TF.ui.button({ icon: 'key', variant: 'ghost', size: 'sm', title: '重置密码', attrs: { 'aria-label': '重置密码' }, action: 'admin.user.pwd', param: who }));
+      acts.push(TF.ui.button({ icon: 'trash', variant: 'danger', size: 'sm', title: '删号', attrs: { 'aria-label': '删除用户' }, action: 'admin.user.delete', param: { id: u.id } }));
+      return [
+        checkTd(u.id, 'user'),
+        td('<div class="authorline">' + TF.ui.avatar(u, 26) +
+          '<div><a href="#/u/' + AT(u.id) + '"><b>' + E(u.nickname || u.username) + '</b></a>' +
+          '<div class="text-xs text-muted">@' + E(u.username) + (u.id === me.id ? ' · 我' : '') + '</div></div></div>'),
+        /* 真实姓名 / 班级 / 学号：只有超管能看到（服务端只给超管和本人，其他人拿到的是空串） */
+        td(privateCell(u, 'name')),
+        td(privateCell(u, 'klass')),
+        td(roleBadge(u.role)),
+        td(u.grade || u.klass ? E(u.grade || '') : '<span class="text-muted">—</span>'),
+        td(u.banned ? TF.ui.badge('已封禁', 'danger') + (u.banReason ? ' <span class="text-xs text-muted">' + E(EXC(u.banReason, 12)) + '</span>' : '') : TF.ui.badge('正常', 'success')),
+        td('<span class="mono">' + NUM(u.points) + '</span>', 'num'),
+        td('<span class="mono">' + NUM(u.stats && u.stats.posts) + '</span>', 'num'),
+        td('<span class="text-xs text-muted">' + E(u.lastLoginAt ? REL(u.lastLoginAt) : '没登过') + '</span>'),
+        td('<div class="table__actions">' + acts.join('') + '</div>')
+      ];
+    });
+    return head('users', '<span class="text-xs text-muted">共 ' + NUM(TF.store.adminStats().users.total) + ' 人</span>') +
+      filterbar('users', filtersFor('users', f)) +
+      table([checkHead(), { t: '成员' }, { t: '真实姓名' }, { t: '班级' }, { t: '角色' }, { t: '年级' }, { t: '状态' }, { t: '积分' }, { t: '发帖' }, { t: '最后登录' }, { t: '操作' }], rows, '没有这个人', true) +
+      bulkbar('user', BULK_OPS.user) +
+      pager('users', f, res);
+  }
+
+  /* ------------------------------------------------------ 5 版块管理 */
+  function renderBoards(ctx) {
+    var kw = Q(ctx, 'keyword', '');
+    var res = TF.store.adminList({ type: 'board', keyword: kw, page: 1, size: 100 });
+    if (isPhone()) {
+      return head('boards', '<button type="button" class="btn btn--primary btn--sm"' + ACT('admin.board.edit', { id: '' }) + '>' + IC('plus', 13) + '<span>新建版块</span></button>') +
+        filterbar('boards', filtersFor('boards', { keyword: kw })) + boardsCards(res) +
+        '<p class="text-xs text-muted mt-3">上移下移改前台顺序；版块里还有帖子的话删不掉，得先搬走或删掉那些帖子。</p>';
+    }
+    var rows = (res.list || []).map(function (b) {
+      return [
+        td('<span class="mono text-xs text-muted">' + E(b.id) + '</span>'),
+        td('<span class="board-card__icon">' + IC(b.icon, 15) + '</span> <b>' + E(b.name) + '</b>'),
+        td(TF.ui.tag(b.group)),
+        td('<span class="text-sm">' + E(EXC(b.desc, 26)) + '</span>'),
+        td('<span class="mono">' + NUM(b.stats && b.stats.posts) + '</span>', 'num'),
+        td('<span class="mono">' + NUM(b.stats && b.stats.today) + '</span>', 'num'),
+        td('<span class="mono">' + NUM(b.order) + '</span>', 'num'),
+        td(b.locked ? TF.ui.badge('已锁定', 'warn') : TF.ui.badge('开放', 'success')),
+        td('<div class="table__actions">' +
+          TF.ui.button({ text: '编辑', variant: 'ghost', size: 'sm', action: 'admin.board.edit', param: { id: b.id } }) +
+          TF.ui.button({ icon: 'arrowLeft', variant: 'ghost', size: 'sm', title: '上移', attrs: { 'aria-label': '上移' }, action: 'admin.board.move', param: { id: b.id, dir: -1 } }) +
+          TF.ui.button({ icon: 'arrowRight', variant: 'ghost', size: 'sm', title: '下移', attrs: { 'aria-label': '下移' }, action: 'admin.board.move', param: { id: b.id, dir: 1 } }) +
+          TF.ui.button({ text: b.locked ? '解锁' : '锁定', variant: 'ghost', size: 'sm', action: 'admin.board.lock', param: { id: b.id } }) +
+          TF.ui.button({ icon: 'trash', variant: 'danger', size: 'sm', title: '删掉', attrs: { 'aria-label': '删除版块' }, action: 'admin.board.delete', param: { id: b.id } }) +
+          '</div>')
+      ];
+    });
+    return head('boards', '<button type="button" class="btn btn--primary btn--sm"' + ACT('admin.board.edit', { id: '' }) + '>' + IC('plus', 13) + '<span>新建版块</span></button>') +
+      filterbar('boards', filtersFor('boards', { keyword: kw })) +
+      table([{ t: 'ID' }, { t: '版块' }, { t: '分组' }, { t: '简介' }, { t: '帖子' }, { t: '今日' }, { t: '排序' }, { t: '状态' }, { t: '操作' }], rows, '没有匹配的版块') +
+      '<p class="text-xs text-muted mt-2">上移下移改前台顺序；版块里还有帖子的话删不掉，得先搬走或删掉那些帖子。</p>';
+  }
+
+  /* ------------------------------------------------------ 6 举报处理 */
+  function renderReports(ctx) {
+    var raw = Q(ctx, 'status', 'pending');
+    var st = raw === 'all' ? '' : raw;
+    var f = { status: raw, page: QN(ctx, 'page', 1) };
+    var res = TF.store.adminList({ type: 'report', status: st, page: f.page, size: 15 });
+    var a = TF.store.adminStats();
+    var counts = {
+      pending: a.reports.pending,
+      resolved: TF.store.adminList({ type: 'report', status: 'resolved', size: 1 }).total,
+      rejected: TF.store.adminList({ type: 'report', status: 'rejected', size: 1 }).total,
+      all: a.reports.total
+    };
+    var tabs = TF.ui.tabs({ active: raw, items: [
+      { key: 'pending', label: '待处理', count: counts.pending, href: href('reports', { status: 'pending' }) },
+      { key: 'resolved', label: '已处理', count: counts.resolved, href: href('reports', { status: 'resolved' }) },
+      { key: 'rejected', label: '已驳回', count: counts.rejected, href: href('reports', { status: 'rejected' }) },
+      { key: 'all', label: '全部', count: counts.all, href: href('reports', { status: 'all' }) }
+    ] });
+    if (isPhone()) {
+      return head('reports') + '<div class="mb-3">' + tabs + '</div>' + reportsCards(res, raw) +
+        (raw === 'pending' ? bulkbar('report', BULK_OPS.report) : '') + pager('reports', f, res);
+    }
+    var rows = (res.list || []).map(function (r) {
+      var reporter = TF.store.getUser(r.reporterId);
+      var summary = '', link = '';
+      if (r.targetType === 'post') {
+        var p = TF.store.adminGet('post', r.targetId);
+        summary = p ? EXC(p.title, 24) : '帖子已删除';
+        link = '#/post/' + r.targetId;
+      } else if (r.targetType === 'comment') {
+        var c = TF.store.adminGet('comment', r.targetId);
+        summary = c ? EXC(c.content, 24) : '评论已删除';
+        link = c ? '#/post/' + c.postId : '';
+      } else {
+        var u = TF.store.adminGet('user', r.targetId);
+        summary = u ? (u.nickname || u.username) : '用户已注销';
+        link = '#/u/' + r.targetId;
+      }
+      var tl = { post: ['帖子', 'primary'], comment: ['评论', 'info'], user: ['用户', 'warn'] }[r.targetType] || ['其他', 'default'];
+      return [
+        checkTd(r.id, 'report'),
+        td(TF.ui.badge(tl[0], tl[1]) + ' ' + (link ? '<a href="' + AT(link) + '">' + E(summary) + '</a>' : '<span class="text-muted">' + E(summary) + '</span>')),
+        td(userLink(reporter)),
+        td('<b>' + E(EXC(r.reason, 18)) + '</b>' + (r.detail ? ' <span class="text-xs text-muted">' + E(EXC(r.detail, 20)) + '</span>' : '')),
+        td('<span class="text-xs text-muted">' + E(REL(r.createdAt)) + '</span>'),
+        td(stBadge(REPORT_STATUS, r.status) + (r.handleNote ? ' <span class="text-xs text-muted">' + E(EXC(r.handleNote, 10)) + '</span>' : '')),
+        td('<div class="table__actions">' +
+          (r.status === 'pending'
+            ? TF.ui.button({ text: '标记已处理', variant: 'ghost', size: 'sm', action: 'admin.report.handle', param: { id: r.id, status: 'resolved' } }) +
+              TF.ui.button({ text: '驳回', variant: 'ghost', size: 'sm', action: 'admin.report.handle', param: { id: r.id, status: 'rejected' } })
+            : '<span class="text-xs text-muted">' + E(r.handledAt ? FMT(r.handledAt) : '处理过了') + '</span>') +
+          '</div>')
+      ];
+    });
+    return head('reports') + '<div class="mb-3">' + tabs + '</div>' +
+      table([checkHead(), { t: '被举报的' }, { t: '举报人' }, { t: '理由' }, { t: '时间' }, { t: '状态' }, { t: '操作' }], rows,
+        raw === 'pending' ? '没有待处理的举报' : '这里还空着', true) +
+      (raw === 'pending' ? bulkbar('report', BULK_OPS.report) : '') +
+      pager('reports', f, res);
+  }
+
+  /* ------------------------------------------------------ 7 公告管理 */
+  function renderNotices(ctx) {
+    var f = { keyword: Q(ctx, 'keyword', ''), page: QN(ctx, 'page', 1) };
+    var res = TF.store.adminList({ type: 'notice', keyword: f.keyword, page: f.page, size: 15 });
+    if (isPhone()) {
+      return head('notices', '<button type="button" class="btn btn--primary btn--sm"' + ACT('admin.notice.edit', { id: '' }) + '>' + IC('plus', 13) + '<span>发公告</span></button>') +
+        filterbar('notices', filtersFor('notices', f)) + noticesCards(res) + pager('notices', f, res);
+    }
+    var rows = (res.list || []).map(function (n) {
+      var u = TF.store.getUser(n.authorId);
+      return [
+        td('<span class="mono text-xs text-muted">' + E(n.id) + '</span>'),
+        td('<b>' + E(n.title) + '</b>' + (n.top ? ' ' + TF.ui.badge('置顶', 'primary') : '') +
+          '<div class="text-xs text-muted">' + E(EXC(n.content, 40)) + '</div>'),
+        td(stBadge(LEVEL, n.level)),
+        td(u ? E(u.nickname || u.username) : '<span class="text-muted">—</span>'),
+        td('<span class="text-xs text-muted">' + E(FMT(n.createdAt)) + '</span>'),
+        td('<div class="table__actions">' +
+          TF.ui.button({ text: '预览', variant: 'ghost', size: 'sm', action: 'admin.notice.preview', param: { id: n.id } }) +
+          TF.ui.button({ text: '编辑', variant: 'ghost', size: 'sm', action: 'admin.notice.edit', param: { id: n.id } }) +
+          TF.ui.button({ icon: 'trash', variant: 'danger', size: 'sm', title: '删掉', attrs: { 'aria-label': '删除公告' }, action: 'admin.notice.delete', param: { id: n.id } }) +
+          '</div>')
+      ];
+    });
+    return head('notices', '<button type="button" class="btn btn--primary btn--sm"' + ACT('admin.notice.edit', { id: '' }) + '>' + IC('plus', 13) + '<span>发公告</span></button>') +
+      filterbar('notices', filtersFor('notices', f)) +
+      table([{ t: 'ID' }, { t: '标题' }, { t: '级别' }, { t: '发布人' }, { t: '时间' }, { t: '操作' }], rows, '还没发过公告') +
+      pager('notices', f, res);
+  }
+
+  /* ------------------------------------------------------ 8 消息推送 */
+  function pushCount(target, role, username) {
+    try {
+      if (target === 'role') return TF.store.adminList({ type: 'user', role: role || 'student', status: 'active', size: 1 }).total;
+      if (target === 'user') return username && TF.store.findUserByUsername(username) ? 1 : 0;
+      return TF.store.adminList({ type: 'user', status: 'active', size: 1 }).total;
+    } catch (e) { return 0; }
+  }
+  function updateEstimate(form) {
+    if (!form) return;
+    var est = form.querySelector('[data-push-est]');
+    if (!est) return;
+    var picked = form.querySelector('input[name="target"]:checked');
+    var roleEl = form.querySelector('select[name="role"]');
+    var userEl = form.querySelector('input[name="userId"]');
+    est.textContent = String(pushCount(picked ? picked.value : 'all', roleEl ? roleEl.value : 'student', userEl ? userEl.value : ''));
+  }
+  function renderMessages(ctx) {
+    var target = Q(ctx, 'target', 'all');
+    if (['all', 'role', 'user'].indexOf(target) < 0) target = 'all';
+    var role = Q(ctx, 'role', 'student');
+    var users = TF.store.adminList({ type: 'user', size: 500 }).list;
+    var est = pushCount(target, role, '');
+    var radios = [
+      { value: 'all', label: '全体', desc: '所有没被封的成员', icon: 'users' },
+      { value: 'role', label: '按角色', desc: '只发学生或只发版主', icon: 'shield' },
+      { value: 'user', label: '某个人', desc: '只发给一个账号', icon: 'user' }
+    ].map(function (o) {
+      var on = o.value === target;
+      return '<label class="radiocard' + (on ? ' is-active' : '') + '"><input type="radio" name="target" value="' + AT(o.value) + '"' + (on ? ' checked' : '') + ' data-action-change="admin.push.target">' +
+        '<span class="radiocard__icon">' + IC(o.icon, 16) + '</span><span><b>' + E(o.label) + '</b><i>' + E(o.desc) + '</i></span></label>';
+    }).join('');
+    var form = '<form class="form" data-action="admin.push.send">' +
+      '<div class="radiocards">' + radios + '</div>' +
+      '<div class="formgrid mt-3">' +
+        '<div class="' + (target === 'role' ? '' : 'is-hidden') + '" data-push-role>' +
+          TF.ui.selectField({ label: '发给', name: 'role', value: role, options: [{ value: 'student', label: '学生' }, { value: 'mod', label: '版主' }, { value: 'admin', label: '超管' }] }) +
+        '</div>' +
+        '<div class="' + (target === 'user' ? '' : 'is-hidden') + '" data-push-user>' +
+          TF.ui.field({ label: '用户名', name: 'userId', placeholder: '填对方登录用的用户名', hint: '写错会发不出去' }) +
+        '</div>' +
+      '</div>' +
+      '<div class="mt-3">' + TF.ui.field({ label: '标题', name: 'title', required: true, maxlength: 30, block: true, placeholder: '例如：周六运动会照常办' }) + '</div>' +
+      TF.ui.textarea({ label: '内容', name: 'body', rows: 5, required: true, block: true, maxlength: 300, placeholder: '时间、地点、要带什么，说清楚' }) +
+      '<div class="cluster mt-3"><span class="text-sm text-2">会发给 <b class="mono" data-push-est>' + est + '</b> 个人</span>' +
+      '<span class="spacer"></span><button type="submit" class="btn btn--primary' + (isPhone() ? ' btn--block' : ' btn--sm') + '">' + IC('send', 13) + '<span>发出去</span></button>' +
+      '<button type="reset" class="btn btn--ghost' + (isPhone() ? ' btn--block' : ' btn--sm') + '">清空</button></div></form>';
+    var rec = TF.store.adminList({ type: 'message', status: 'system', page: 1, size: 10 });
+    var recRows = (rec.list || []).map(function (m) {
+      var u = TF.store.getUser(m.userId);
+      return [
+        td('<span class="text-xs text-muted">' + E(FMT(m.createdAt)) + '</span>'),
+        td('<b>' + E(m.title) + '</b> <span class="text-xs text-muted">' + E(EXC(m.body, 36)) + '</span>'),
+        td(userLink(u)),
+        td(m.read ? TF.ui.badge('已读', 'success') : TF.ui.badge('没读', 'warn'))
+      ];
+    });
+    return head('messages') +
+      block('发通知', form) +
+      '<div class="mt-3">' + block('最近发的', table([{ t: '时间' }, { t: '标题' }, { t: '发给' }, { t: '状态' }], recRows, '还没发过通知'), { more: { href: '#/admin/logs?action=message.', text: '推送日志' } }) + '</div>';
+  }
+
+  /* ------------------------------------------------------ 9 站点设置 */
+  function wordsHTML() {
+    var words = tmp.words || [];
+    if (!words.length) return '<span class="text-sm text-muted">词库是空的，加几个试试</span>';
+    return words.map(function (w) {
+      return '<span class="chip">' + E(w) + '<button type="button" class="iconbtn" title="删掉这个词" aria-label="删除敏感词"' + ACT('admin.settings.word.del', { w: w }) + '>' + IC('close', 11) + '</button></span>';
+    }).join('');
+  }
+  function renderSettings(ctx) {
+    var s = TF.store.getSettings();
+    if (!tmp.words) tmp.words = (s.sensitiveWords || []).slice();
+    var phone = isPhone();
+    /* 手机上开关用 .switch（mobile.css 放大点击区），桌面仍用带文字的复选框 */
+    function toggle(name, checked) {
+      if (!phone) return TF.ui.checkField({ label: name === 'registerOpen' ? '允许注册' : name === 'needAudit' ? '需要审核' : '允许访客', name: name, checked: !!checked });
+      return '<label class="switch' + (checked ? ' is-active' : '') + '"><input type="checkbox" name="' + AT(name) + '"' + (checked ? ' checked' : '') + '><span class="switch__dot"></span></label>';
+    }
+    var basic = '<div class="settinggroup"><div class="settinggroup__head">' + IC('settings', 16) + '<span>站名与页脚</span></div>' +
+      '<div class="settinggroup__body"><div class="formgrid">' +
+      TF.ui.field({ label: '站点名', name: 'siteName', value: s.siteName, required: true, maxlength: 24 }) +
+      TF.ui.field({ label: '标语', name: 'slogan', value: s.slogan, maxlength: 40 }) +
+      TF.ui.field({ label: '备案号', name: 'icp', value: s.icp, maxlength: 40 }) +
+      TF.ui.field({ label: '联系方式', name: 'contact', value: s.contact, maxlength: 60, hint: '显示在页脚，一般写站长邮箱' }) +
+      '</div><div class="mt-3">' + TF.ui.textarea({ label: '页脚说明', name: 'footerText', value: s.footerText, rows: 2, block: true, maxlength: 80 }) + '</div>' +
+      '<div class="mt-3">' + TF.ui.textarea({ label: '公告栏', name: 'announcement', value: s.announcement, rows: 2, block: true, maxlength: 120, hint: '首页顶上那条' }) + '</div></div></div>';
+    var rules = '<div class="settinggroup"><div class="settinggroup__head">' + IC('shield', 16) + '<span>注册与发帖</span></div>' +
+      '<div class="settinggroup__body">' +
+      settingRow('开放注册', '关掉之后新同学注册不了', toggle('registerOpen', s.registerOpen)) +
+      settingRow('发帖先审', '开了之后新帖要审过才公开', toggle('needAudit', s.needAudit)) +
+      settingRow('访客能看', '关掉之后没登录的看不了帖子', toggle('allowGuest', s.allowGuest)) +
+      '<div class="formgrid mt-4">' +
+      TF.ui.field({ label: '发帖间隔（秒）', name: 'postInterval', type: 'number', min: 0, max: 600, value: s.postInterval, hint: '两次发帖最少隔多久，0 是不限' }) +
+      TF.ui.selectField({ label: '默认主题', name: 'themeDefault', value: s.themeDefault, options: [{ value: 'light', label: '浅色' }, { value: 'dark', label: '深色' }] }) +
+      '</div></div></div>';
+    var safe = '<div class="settinggroup"><div class="settinggroup__head">' + IC('alert', 16) + '<span>敏感词</span></div>' +
+      '<div class="settinggroup__body"><div class="tagcloud mb-3" data-words>' + wordsHTML() + '</div>' +
+      '<div class="cluster"><input class="input" name="__word" data-words-input placeholder="打一个词，回车或点添加" maxlength="16" aria-label="新增敏感词">' +
+      '<button type="button" class="btn btn--outline btn--sm" data-action="admin.settings.word.add">' + IC('plus', 13) + '<span>添加</span></button>' +
+      '<span class="text-xs text-muted">最多 60 个；发帖不带标点，所以「代写」这种词就够用</span></div></div></div>';
+    return head('settings', '<button type="submit" form="settings-form" class="btn btn--primary btn--sm">' + IC('check', 13) + '<span>保存</span></button>') +
+      /* 手机上把保存做成整行按钮放在最上面，改完不用滚到底 */
+      (phone ? '<button type="submit" form="settings-form" class="btn btn--primary btn--block mt-3">' + IC('check', 15) + '<span>保存设置</span></button>' : '') +
+      '<form class="form" id="settings-form" data-action="admin.settings.save">' + basic + rules + safe +
+      '<div class="cluster mt-4"><button type="submit" class="btn btn--primary' + (phone ? ' btn--block' : '') + '">保存</button>' +
+      '<button type="button" class="btn btn--ghost' + (phone ? ' btn--block' : '') + '" data-action="admin.settings.reload">改回上次保存的</button></div></form>' +
+      '<div class="mt-4">' + '<div class="card card--danger"><div class="card__head"><h2 class="card__title">' + IC('alert', 16) + '<span>清空论坛数据</span></h2></div>' +
+      '<div class="card__body cluster"><span class="text-sm text-2">帖子、评论、点歌、公告、登录记录全部清空（账号保留）。这个操作在服务器上执行，找不回来。</span>' +
+      '<span class="spacer"></span><button type="button" class="btn btn--danger btn--sm"' + ACT('admin.settings.reset', {}) + '>清空数据</button></div></div>' + '</div>';
+  }
+
+  /* ------------------------------------------------------ 10 操作日志 */
+  function renderLogs(ctx) {
+    var f = { action: Q(ctx, 'action', ''), actorId: Q(ctx, 'actorId', ''), page: QN(ctx, 'page', 1) };
+    var res = TF.store.listLogs({ action: f.action, actorId: f.actorId, page: f.page, size: 20 });
+    if (isPhone()) {
+      return head('logs', '<span class="text-xs text-muted">共 ' + NUM(res.total) + ' 条</span>') +
+        filterbar('logs', filtersFor('logs', f)) + logsCards(res) + pager('logs', f, res);
+    }
+    var rows = (res.list || []).map(function (g) {
+      var u = TF.store.getUser(g.actorId);
+      return [
+        td('<span class="text-xs text-muted">' + E(FMT(g.createdAt)) + '</span>'),
+        td(userLink(u, '系统')),
+        td('<span class="mono text-xs">' + E(g.action) + '</span>'),
+        td(g.target ? '<span class="mono text-xs text-muted">' + E(g.target) + '</span>' : '<span class="text-muted">—</span>'),
+        td(E(g.detail || '—'))
+      ];
+    });
+    return head('logs', '<span class="text-xs text-muted">共 ' + NUM(res.total) + ' 条</span>') +
+      filterbar('logs', filtersFor('logs', f)) +
+      table([{ t: '时间' }, { t: '操作者' }, { t: '动作' }, { t: '对象' }, { t: '详情' }], rows, '没有符合条件的日志') +
+      pager('logs', f, res);
+  }
+
+  /* ------------------------------------------------------ 11 我的账号 */
+  function renderProfile(ctx) {
+    var me = TF.store.currentUser();
+    var info = '<div class="loglist">' +
+      '<div class="logrow"><span class="logrow__text">角色</span>' + roleBadge(me.role) + (me.role === 'mod' ? '<span class="text-xs text-muted">帖子、评论、举报、公告</span>' : '<span class="text-xs text-muted">全部 11 个分区</span>') + '</div>' +
+      '<div class="logrow"><span class="logrow__text">用户名</span><span class="mono text-sm">' + E(me.username) + '</span></div>' +
+      '<div class="logrow"><span class="logrow__text">积分 / 等级</span><span class="mono text-sm">' + NUM(me.points) + ' 分 · Lv.' + NUM(me.level || 1) + '</span></div>' +
+      '<div class="logrow"><span class="logrow__text">注册</span><span class="text-sm text-2">' + E(FMT(me.createdAt)) + '</span></div>' +
+      '<div class="logrow"><span class="logrow__text">上次登录</span><span class="text-sm text-2">' + E(me.lastLoginAt ? FMT(me.lastLoginAt) : '—') + '</span></div>' +
+      '<div class="logrow"><span class="logrow__text">发帖 / 评论</span><span class="mono text-sm">' + NUM(me.stats && me.stats.posts) + ' / ' + NUM(me.stats && me.stats.comments) + '</span></div>' +
+      '</div>';
+    var profileForm = '<form class="form" data-action="admin.profile.save"><div class="formgrid">' +
+      TF.ui.field({ label: '昵称', name: 'nickname', value: me.nickname || me.username, required: true, maxlength: 16, hint: '2~16 个字' }) +
+      TF.ui.field({ label: '邮箱', name: 'email', type: 'email', value: me.email || '', autocomplete: 'email', hint: '找回密码用，可以不填' }) +
+      TF.ui.selectField({ label: '年级', name: 'grade', value: me.grade || '', options: GRADE_OPTIONS }) +
+      TF.ui.field({ label: '班级', name: 'klass', value: me.klass || '', maxlength: 10, placeholder: '例如 3班' }) +
+      TF.ui.selectField({ label: '性别', name: 'sex', value: me.sex || '', options: [{ value: '', label: '不填' }, { value: '男', label: '男' }, { value: '女', label: '女' }] }) +
+      '</div>' + TF.ui.textarea({ label: '签名', name: 'bio', value: me.bio || '', rows: 3, block: true, maxlength: 120 }) +
+      '<div class="cluster mt-3"><button type="submit" class="btn btn--primary btn--sm">存起来</button></div></form>';
+    var pwdForm = '<form class="form" data-action="admin.profile.pwd">' +
+      '<div class="formgrid">' +
+      TF.ui.field({ label: '现在的密码', name: 'oldPwd', type: 'password', required: true, autocomplete: 'current-password' }) +
+      TF.ui.field({ label: '新密码', name: 'newPwd', type: 'password', required: true, autocomplete: 'new-password', hint: '至少 6 位' }) +
+      TF.ui.field({ label: '再输一遍', name: 'newPwd2', type: 'password', required: true, autocomplete: 'new-password' }) +
+      '</div><div class="cluster mt-3"><button type="submit" class="btn btn--primary btn--sm">改密码</button></div></form>';
+    return head('profile') +
+      '<div class="grid grid--2">' + block('资料', profileForm) + block('账号', info, { flush: true }) + '</div>' +
+      '<div class="mt-3">' + block('改密码', pwdForm) + '</div>';
+  }
+
+  /* -------------------------------------------- 学生认证审核（校卡照片）
+   * 只有超管能进（SUPER_ONLY.verify=1）；照片走 /api/admin/student/card/:id，仅管理员可看。
+   * 列表是异步拉的：页面先画骨架，mountVerifyPage() 再填内容。 */
+  var VERIFY_TABS = [['pending', '待审核'], ['student', '已通过'], ['rejected', '已驳回']];
+  var VERIFY_STATUS = {
+    pending: ['审核中', 'warn'], student: ['已通过', 'success'],
+    rejected: ['已驳回', 'danger'], external: ['校外未提交', 'default']
+  };
+  function verifyTabsHTML(active) {
+    return '<div class="tabs mt-3">' + VERIFY_TABS.map(function (t) {
+      return '<a class="tab' + (active === t[0] ? ' is-active' : '') + '" href="' + href('verify', { status: t[0] }) + '">' + t[1] + '</a>';
+    }).join('') + '</div>';
+  }
+  function verifyRejectModal() {
+    return TF.ui.modal({
+      id: 'admin-verify-reject', title: '驳回学生认证',
+      body: '<form data-action="admin.verify.reject.submit">' +
+        '<input type="hidden" name="id" value="">' +
+        '<p class="text-sm text-2" data-reject-who></p>' +
+        TF.ui.textarea({ label: '驳回原因（会发给同学，写清楚一点）', name: 'reason', rows: 3, maxlength: 200, placeholder: '比如：照片太糊，看不清姓名和班级；或者校卡信息不完整' }) +
+        '<div class="cluster gap-2 mt-4"><button type="submit" class="btn btn--danger">驳回</button>' +
+        '<button type="button" class="btn" data-modal-close>取消</button></div></form>'
+    });
+  }
+  function renderVerify(ctx) {
+    var status = Q(ctx, 'status', 'pending');
+    if (!VERIFY_STATUS[status] || status === 'external') status = 'pending';
+    return head('verify', '<span class="text-xs text-muted">校卡照片只有管理员能看，不要转发</span>') +
+      '<div class="card card--pad">' +
+        '<h2 class="card__title">学生认证审核</h2>' +
+        '<p class="text-sm text-2">同学上传校卡照片后在这里审核：点「通过」解锁看帖/发帖/评论；点「驳回」要写原因，同学会收到通知并可以重新提交。</p>' +
+        verifyTabsHTML(status) +
+        '<div data-verify-box class="mt-3"><p class="text-sm text-muted">加载中…</p></div>' +
+      '</div>' + verifyRejectModal();
+  }
+  function verifyRowHTML(u, status) {
+    var cardUrl = TF.api && TF.api.adminStudent ? TF.api.adminStudent.cardUrl(u.id) : '';
+    var photo = u.hasCard && cardUrl
+      ? '<a class="vcard" href="' + AT(cardUrl) + '" target="_blank" rel="noopener" title="点开看大图">' +
+        '<img class="vcard__img" src="' + AT(cardUrl) + '" alt="校卡照片" loading="lazy"></a>'
+      : '<div class="vcard vcard--none"><span class="text-xs text-muted">没有照片</span></div>';
+    var acts = '';
+    if (status === 'pending') {
+      acts = '<div class="cluster gap-2">' +
+        TF.ui.button({ text: '通过', variant: 'primary', size: 'sm', action: 'admin.verify.approve', param: { id: u.id, nickname: u.nickname } }) +
+        TF.ui.button({ text: '驳回', variant: 'outline', size: 'sm', action: 'admin.verify.reject', param: { id: u.id, nickname: u.nickname } }) +
+        '</div>';
+    } else {
+      var st = VERIFY_STATUS[status] || ['—', 'default'];
+      acts = TF.ui.badge(st[0], st[1]);
+    }
+    var meta = [];
+    if (u.realName) meta.push('姓名：' + E(u.realName));
+    if (u.klass) meta.push('班级：' + E(u.klass));
+    if (u.studentNo) meta.push('学号：' + E(u.studentNo));
+    meta.push('提交：' + (u.submittedAt ? FMT(u.submittedAt) : '—'));
+    return '<div class="vrow">' + photo +
+      '<div class="vrow__main">' +
+        '<div><b>' + E(u.nickname) + '</b> <span class="text-xs text-muted">@' + E(u.username) + ' · ID ' + E(u.id) + '</span></div>' +
+        '<div class="text-xs text-2 mt-1">' + meta.join(' · ') + '</div>' +
+        (u.note ? '<div class="text-xs text-danger mt-1">驳回原因：' + E(u.note) + '</div>' : '') +
+      '</div>' +
+      '<div class="vrow__acts">' + acts + '</div></div>';
+  }
+  function mountVerifyPage() {
+    var box = document.querySelector('[data-verify-box]');
+    if (!box) return;
+    var status = (TF.route && TF.route.query && TF.route.query.status) || 'pending';
+    if (['pending', 'student', 'rejected'].indexOf(status) < 0) status = 'pending';
+    if (!TF.api || !TF.api.adminStudent) { box.innerHTML = '<p class="text-sm text-danger">接口没准备好，刷新一下</p>'; return; }
+    TF.api.adminStudent.list(status).then(function (d) {
+      var list = (d && d.list) || [];
+      var counts = (d && d.counts) || {};
+      var summary = '<p class="text-xs text-muted">待审核 <b>' + NUM(counts.pending || 0) + '</b> · 已通过 ' +
+        NUM(counts.student || 0) + ' · 已驳回 ' + NUM(counts.rejected || 0) + '</p>';
+      if (!list.length) {
+        box.innerHTML = summary + '<div class="empty--plain">这一栏还没有记录</div>';
+        return;
+      }
+      box.innerHTML = summary + '<div class="vlist">' + list.map(function (u) { return verifyRowHTML(u, status); }).join('') + '</div>';
+    }, function (e) {
+      box.innerHTML = '<p class="text-sm text-danger">加载失败：' + E((e && e.message) || '网络错误') + '</p>';
+    });
+  }
+  /* 通过 / 驳回（通过前再确认一次，驳回要填原因） */
+  TF.app.on('admin.verify.approve', function (ctx) {
+    var p = ctx.param || {};
+    TF.ui.confirm({ title: '通过这位同学的学生认证？', body: '昵称：' + (p.nickname || '') + '。通过后对方就能看帖、发帖、评论。', okText: '通过' })
+      .then(function (ok) {
+        if (!ok) return;
+        TF.api.adminStudent.verify(p.id, true, '').then(function () {
+          TF.ui.toast('已通过', 'success');
+          TF.app.refresh();
+        }, function (e) { TF.ui.toast((e && e.message) || '操作失败', 'error'); });
+      });
+  });
+  TF.app.on('admin.verify.reject', function (ctx) {
+    var p = ctx.param || {};
+    var form = document.querySelector('#admin-verify-reject form');
+    if (form) {
+      var idInput = form.querySelector('input[name="id"]');
+      if (idInput) idInput.value = String(p.id || '');
+      var who = form.querySelector('[data-reject-who]');
+      if (who) who.textContent = '驳回「' + (p.nickname || '') + '」的认证，同学会收到通知。';
+    }
+    TF.ui.modal.open('admin-verify-reject');
+  });
+  TF.app.on('admin.verify.reject.submit', function (ctx) {
+    var v = ctx.values() || {};
+    var reason = String(v.reason || '').trim();
+    if (reason.length < 2) { TF.ui.toast('写一下驳回原因，同学才知道怎么改', 'warn'); return; }
+    TF.api.adminStudent.verify(v.id, false, reason).then(function () {
+      TF.ui.modal.close('admin-verify-reject');
+      TF.ui.toast('已驳回并通知对方', 'success');
+      TF.app.refresh();
+    }, function (e) { TF.ui.toast((e && e.message) || '操作失败', 'error'); });
+  });
+
+  /* ----------------------------------------------------- 路由分发 */
+  var RENDER = {
+    dashboard: renderDashboard, posts: renderPosts, comments: renderComments, users: renderUsers, boards: renderBoards,
+    reports: renderReports, notices: renderNotices, messages: renderMessages, settings: renderSettings, logs: renderLogs,
+    verify: renderVerify, profile: renderProfile
+  };
+  function renderAdmin(ctx) {
+    var params = ctx.params || (TF.route && TF.route.param) || {};
+    var asked = params.section || '';
+    var section = asked === '' ? 'dashboard' : (RENDER[asked] ? asked : '');
+    if (tmp.modal && tmp.modal.section !== section) tmp.modal = null;
+    if (section !== 'settings') tmp.words = null;
+    if (!section) {
+      var links = Object.keys(SEC).filter(function (k) { return SEC_ALLOWED(k); }).map(function (k) {
+        return TF.ui.button({ text: SEC[k].label, variant: 'outline', size: 'sm', href: href(k, {}) });
+      }).join('');
+      return {
+        html: '<div class="page" data-page="admin"><div class="card card--pad mt-4">' +
+          TF.ui.empty({ icon: 'question', title: '地址写错了', desc: '这个后台分区不存在，从下面挑一个。' }) +
+          '<div class="cluster mt-3 center">' + links + '</div></div></div>', title: '管理后台'
+      };
+    }
+    return {
+      html: '<div class="page" data-page="admin">' + RENDER[section](ctx) + editModal() + '</div>',
+      title: SEC[section].title,
+      onMount: function (root) {
+        watchViewport();
+        /* 学生认证审核：列表要异步拉（含校卡照片） */
+        if (section === 'verify') mountVerifyPage();
+        var input = root.querySelector('[data-words-input]');
+        if (input) {
+          input.addEventListener('keydown', function (ev) {
+            if (ev.key === 'Enter') { ev.preventDefault(); addWord(input); }
+          });
+        }
+        var roleSel = root.querySelector('form[data-action="admin.push.send"] select[name="role"]');
+        if (roleSel) roleSel.setAttribute('data-action-change', 'admin.push.role');
+        var userInp = root.querySelector('form[data-action="admin.push.send"] input[name="userId"]');
+        if (userInp) userInp.setAttribute('data-action-change', 'admin.push.user');
+      }
+    };
+  }
+
+  /* ------------------------------------------------------- 动作处理器 */
+  TF.app.on('admin.filter', function (ctx) {
+    var v = ctx.values(), q = {};
+    Object.keys(v).forEach(function (k) {
+      if (k.charAt(0) === '_') return;
+      var x = v[k];
+      if (x === '' || x === null || x === undefined) return;
+      q[k] = x;
+    });
+    TF.app.go('/admin/' + ctx.param.section, q);
+  });
+  TF.app.on('admin.filter.reset', function (ctx) { TF.app.go('/admin/' + ctx.param.section, {}); });
+  TF.app.on('admin.bulk', function () {
+    var n = selectedIds().length;
+    var btns = document.querySelectorAll('[data-bulk-btn]');
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = n === 0;
+    var bar = document.querySelector('.bulkbar');
+    if (bar && isPhone()) bar.classList.toggle('is-hidden', n === 0);
+  });
+  TF.app.on('admin.bulk.clear', function () {
+    var items = document.querySelectorAll('[data-check-item]');
+    for (var i = 0; i < items.length; i++) items[i].checked = false;
+    var all = document.querySelector('[data-check-all]');
+    if (all) { all.checked = false; all.indeterminate = false; }
+    var btns = document.querySelectorAll('[data-bulk-btn]');
+    for (var j = 0; j < btns.length; j++) btns[j].disabled = true;
+    var bar = document.querySelector('.bulkbar');
+    if (bar && isPhone()) bar.classList.add('is-hidden');
+    if (TF.ui.init) TF.ui.init(document.getElementById('page-host') || document);
+  });
+  TF.app.on('admin.batch', function (ctx) {
+    var type = ctx.param.type, op = ctx.param.op;
+    var ids = selectedIds();
+    if (!ids.length) { TF.ui.toast('先勾上要处理的行', 'warn'); return; }
+    var names = {
+      post: { hide: '下架', publish: '发布', pin: '置顶', unpin: '取消置顶', feature: '加精', unfeature: '取消加精', delete: '删掉' },
+      comment: { hide: '隐藏', publish: '放出来', delete: '删掉' },
+      user: { ban: '封禁', unban: '解封', delete: '删号' },
+      report: { resolve: '标记已处理', reject: '驳回' }
+    };
+    var label = ((names[type] || {})[op]) || '处理';
+    var run = function () { finish(TF.store.adminBatch(type, ids, op), label + '了'); };
+    if (op === 'delete' || (type === 'user' && op === 'ban')) {
+      confirmBox({
+        title: label + '这 ' + ids.length + ' 项？',
+        body: op === 'delete' ? '删掉就找不回来了' : '封了他们之后登不上、也发不了言',
+        okText: label, danger: op === 'delete'
+      }).then(function (ok) { if (ok) run(); });
+    } else run();
+  });
+  TF.app.on('admin.one', function (ctx) {
+    finish(TF.store.adminBatch(ctx.param.type, [ctx.param.id], ctx.param.op), ctx.param.msg || '好了');
+  });
+  TF.app.on('admin.modal.cancel', function () { tmp.modal = null; closeModal('admin-modal'); if (TF.ui.modal) TF.ui.modal.close('admin-modal'); });
+
+  /* 帖子 */
+  TF.app.on('admin.post.edit', function (ctx) { askModal('post', { id: ctx.param.id }, 'posts'); });
+  TF.app.on('admin.post.save', function (ctx) {
+    var v = ctx.values();
+    var id = v.id;
+    var p = TF.store.adminGet('post', id);
+    if (!p) { TF.ui.toast('帖子没了', 'error'); return; }
+    var title = (v.title || '').trim(), content = (v.content || '').trim();
+    if (title.length < 4) { TF.ui.toast('标题至少 4 个字', 'error'); return; }
+    if (content.length < 10) { TF.ui.toast('正文至少 10 个字', 'error'); return; }
+    var res = TF.store.adminSave('post', {
+      id: id, title: title, content: content, boardId: v.boardId,
+      tags: (v.tags || '').split(/[,，、\s]+/).filter(Boolean).slice(0, 5),
+      pinned: !!v.pinned, featured: !!v.featured
+    });
+    if (!res.ok) { TF.ui.toast(res.error || '没存上', 'error'); return; }
+    if (v.status && v.status !== p.status) TF.store.adminSetPostStatus(id, v.status);
+    tmp.modal = null; closeModal('admin-modal');
+    TF.ui.toast('存好了', 'success');
+    TF.app.refresh();
+  });
+  TF.app.on('admin.post.status', function (ctx) {
+    var id = ctx.param.id, st = ctx.param.status;
+    if (st === 'hidden') {
+      confirmBox({ title: '下架这篇帖子？', body: '下架后前台看不到，也会给他发个通知', okText: '下架', danger: true })
+        .then(function (ok) { if (ok) finish(TF.store.adminSetPostStatus(id, 'hidden'), '下架了'); });
+      return;
+    }
+    finish(TF.store.adminSetPostStatus(id, st), st === 'published' ? '发布出去了' : '改好了');
+  });
+  TF.app.on('admin.post.delete', function (ctx) {
+    confirmBox({ title: '删掉这篇帖子？', body: '帖子和它下面的评论一起删，找不回来', okText: '删掉', danger: true })
+      .then(function (ok) { if (ok) finish(TF.store.adminDelete('post', ctx.param.id), '删掉了'); });
+  });
+
+  /* 评论 */
+  TF.app.on('admin.comment.delete', function (ctx) {
+    confirmBox({ title: '删掉这条评论？', body: '它下面的回复会一起隐藏', okText: '删掉', danger: true })
+      .then(function (ok) { if (ok) finish(TF.store.adminDelete('comment', ctx.param.id), '删掉了'); });
+  });
+
+  /* 取一个用户（后台用）。
+     顺序：内存快照 → 服务端（adminGet('user') 会去打 /api/admin/item）→ 用动作参数里带的昵称兜底。
+     以前直接 TF.store.getUser(id)，而快照里只有一部分用户，
+     后台列表却是全量数据 → 点"设超管/设版主"会误报"查无此人"。 */
+  function findUserForAction(ctx) {
+    var id = (ctx.param || {}).id;
+    var u = TF.store.getUser(id);
+    if (u) return u;
+    var got = TF.store.adminGet ? TF.store.adminGet('user', id) : null;
+    if (got && (got.id || got.nickname)) return got;
+    /* 最后兜底：把"是谁"用按钮上带过来的昵称显示出来，动作本身交给服务端 */
+    var nick = String((ctx.param || {}).nick || '');
+    if (nick) return { id: String(id), nickname: nick, username: nick };
+    return { id: String(id), nickname: 'ID ' + id, username: '' };
+  }
+
+  /* 用户 */
+  TF.app.on('admin.user.ban.open', function (ctx) {
+    var u = findUserForAction(ctx);
+    if (u.id === ((TF.store.currentUser() || {}).id)) { TF.ui.toast('别封自己', 'error'); return; }
+    askModal('ban', { id: u.id }, 'users');
+  });
+  TF.app.on('admin.user.ban', function (ctx) {
+    var v = ctx.values();
+    var reason = (v.reason || '').trim();
+    if (reason.length < 2) { TF.ui.toast('写一下封禁原因', 'error'); return; }
+    var res = TF.store.adminSetUserBan(v.id, true, reason);
+    if (!res.ok) { TF.ui.toast(res.error || '没封上', 'error'); return; }
+    tmp.modal = null; closeModal('admin-modal');
+    TF.ui.toast('封了，也通知他了', 'success');
+    TF.app.refresh();
+  });
+  TF.app.on('admin.user.role', function (ctx) {
+    var u = findUserForAction(ctx);
+    var role = (ctx.param || {}).role;
+    var label = (ROLE[role] || ['学生'])[0];
+    var run = function () { finish(TF.store.adminSetUserRole(u.id, role), (u.nickname || u.username || '该同学') + ' 现在是' + label); };
+    if (role === 'admin') {
+      confirmBox({ title: '让他当超管？', body: '超管能改用户、版块、推送和站点设置，也能把别人设成超管', okText: '设为超管' })
+        .then(function (ok) { if (ok) run(); });
+    } else run();
+  });
+  /* 版主负责哪些版块（超管勾选）：超管不受限，版主只能管勾上的那些 */
+  TF.app.on('admin.user.boards', function (ctx) {
+    var id = (ctx.param || {}).id;
+    var nick = String((ctx.param || {}).nick || '这位版主');
+    if ((TF.store.currentUser() || {}).role !== 'admin') { TF.ui.toast('只有超管能分配', 'error'); return; }
+    var boards = TF.store.listBoards() || [];
+    var u = findUserForAction(ctx);
+    var picked = String(u.modBoards || '');
+    var boxes = boards.map(function (b) {
+      var on = picked.split(',').indexOf(String(b.id)) >= 0;
+      return '<label class="checkrow"><input type="checkbox" name="board" value="' + AT(b.id) + '"' + (on ? ' checked' : '') + '>' +
+        '<span>' + E(b.name) + ' <span class="text-xs text-muted">' + E(b.desc || '') + '</span></span></label>';
+    }).join('');
+    askModal('modboards', { id: id, nick: nick, boxes: boxes }, 'users');
+  });
+  TF.app.on('admin.user.boards.save', function (ctx) {
+    var v = ctx.values() || {};
+    var ids = [];
+    var root = ctx.form || document;
+    var els = root.querySelectorAll ? root.querySelectorAll('input[name="board"]') : [];
+    for (var i = 0; i < els.length; i++) if (els[i].checked) ids.push(els[i].value);
+    var res = TF.store.adminSetModBoards ? TF.store.adminSetModBoards(v.id, ids) : { ok: false, error: '这个功能还没上线' };
+    if (!res || !res.ok) { TF.ui.toast((res && res.error) || '没存上', 'error'); return; }
+    closeModal('admin-modal');
+    TF.ui.toast(ids.length ? '已设为他负责 ' + ids.length + ' 个版块' : '已清空（他将能管全部内容）', 'success');
+    TF.app.refresh();
+  });
+
+  TF.app.on('admin.user.pwd', function (ctx) {
+    var u = findUserForAction(ctx);
+    confirmBox({ title: '重置 ' + (u.nickname || u.username || '该同学') + ' 的密码？', body: '随机生成一个新密码，旧的马上失效', okText: '重置' })
+      .then(function (ok) {
+        if (!ok) return;
+        var res = TF.store.adminBatch('user', [u.id], 'resetPwd');
+        if (!res || !res.ok) { TF.ui.toast((res && res.error) || '没重置成', 'error'); return; }
+        if (res.pwd) askModal('pwd', { pwd: res.pwd, name: u.nickname || u.username }, 'users');
+        else { TF.ui.toast('重置好了，让他用「忘记密码」自己设一个', 'warn'); TF.app.refresh(); }
+      });
+  });
+  TF.app.on('admin.user.delete', function (ctx) {
+    var u = TF.store.getUser(ctx.param.id);
+    if (!u) { TF.ui.toast('查无此人', 'error'); return; }
+    confirmBox({ title: '删掉 ' + (u.nickname || u.username) + '？', body: '他的帖子和评论会一起删，找不回来', okText: '删号', danger: true })
+      .then(function (ok) { if (ok) finish(TF.store.adminDelete('user', u.id), '删掉了'); });
+  });
+
+  /* 版块 */
+  TF.app.on('admin.board.edit', function (ctx) { askModal('board', { id: ctx.param.id || '' }, 'boards'); });
+  TF.app.on('admin.board.save', function (ctx) {
+    var v = ctx.values();
+    var data = {
+      id: v.id || undefined, name: (v.name || '').trim(), desc: (v.desc || '').trim(), icon: v.icon,
+      group: (v.group || '').trim(), order: parseInt(v.order, 10), minRole: v.minRole, locked: !!v.locked, color: parseInt(v.color, 10)
+    };
+    if (!data.name) { TF.ui.toast('版块名不能空着', 'error'); return; }
+    if (data.name.length > 12) { TF.ui.toast('版块名最多 12 个字', 'error'); return; }
+    if (!isFinite(data.order)) delete data.order;
+    if (!isFinite(data.color)) delete data.color;
+    var res = TF.store.adminSave('board', data);
+    if (!res.ok) { TF.ui.toast(res.error || '没存上', 'error'); return; }
+    tmp.modal = null; closeModal('admin-modal');
+    TF.ui.toast(data.id ? '改好了' : '建好了', 'success');
+    TF.app.refresh();
+  });
+  TF.app.on('admin.board.delete', function (ctx) {
+    var b = TF.store.getBoard(ctx.param.id);
+    if (!b) { TF.ui.toast('版块不存在', 'error'); return; }
+    confirmBox({ title: '删掉「' + b.name + '」？', body: '里面还有帖子的话删不掉，得先搬走或删掉', okText: '删掉', danger: true })
+      .then(function (ok) { if (ok) finish(TF.store.deleteBoard(b.id), '删掉了'); });
+  });
+  TF.app.on('admin.board.move', function (ctx) {
+    var list = TF.store.listBoards();
+    var i = -1;
+    for (var k = 0; k < list.length; k++) if (list[k].id === ctx.param.id) i = k;
+    var j = i + (ctx.param.dir < 0 ? -1 : 1);
+    if (i < 0) { TF.ui.toast('版块不存在', 'error'); return; }
+    if (j < 0 || j >= list.length) { TF.ui.toast(ctx.param.dir < 0 ? '已经在最前面' : '已经在最后面', 'warn'); return; }
+    var arr = list.slice();
+    var t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    var okCount = 0;
+    for (var m = 0; m < arr.length; m++) {
+      if (Number(arr[m].order) === m + 1) continue;
+      var r = TF.store.adminSave('board', { id: arr[m].id, name: arr[m].name, order: m + 1 });
+      if (r && r.ok) okCount++;
+    }
+    finish({ ok: okCount > 0, count: okCount }, '顺序调好了');
+  });
+  TF.app.on('admin.board.lock', function (ctx) {
+    var b = TF.store.getBoard(ctx.param.id);
+    if (!b) { TF.ui.toast('版块不存在', 'error'); return; }
+    finish(TF.store.adminSave('board', { id: b.id, name: b.name, locked: !b.locked }), b.locked ? '解锁了' : '锁上了');
+  });
+
+  /* 举报 */
+  TF.app.on('admin.report.handle', function (ctx) { askModal('report', { id: ctx.param.id, status: ctx.param.status }, 'reports'); });
+  TF.app.on('admin.report.note', function (ctx) {
+    var v = ctx.values();
+    var res = TF.store.handleReport(v.id, v.status, (v.note || '').trim());
+    if (!res.ok) { TF.ui.toast(res.error || '没处理成', 'error'); return; }
+    tmp.modal = null; closeModal('admin-modal');
+    TF.ui.toast(v.status === 'resolved' ? '处理了' : '驳回了', 'success');
+    TF.app.refresh();
+  });
+
+  /* 公告 */
+  TF.app.on('admin.notice.edit', function (ctx) { askModal('notice', { id: ctx.param.id || '' }, 'notices'); });
+  TF.app.on('admin.notice.preview', function (ctx) { askModal('notice-view', { id: ctx.param.id }, 'notices'); });
+  TF.app.on('admin.notice.save', function (ctx) {
+    var v = ctx.values();
+    var title = (v.title || '').trim(), content = (v.content || '').trim();
+    if (title.length < 4) { TF.ui.toast('公告标题至少 4 个字', 'error'); return; }
+    if (content.length < 10) { TF.ui.toast('公告正文至少 10 个字', 'error'); return; }
+    var res = TF.store.adminSave('notice', { id: v.id || undefined, title: title, content: content, level: v.level, top: !!v.top });
+    if (!res.ok) { TF.ui.toast(res.error || '没存上', 'error'); return; }
+    tmp.modal = null; closeModal('admin-modal');
+    TF.ui.toast(v.id ? '改好了' : '发出去了', 'success');
+    TF.app.refresh();
+  });
+  TF.app.on('admin.notice.delete', function (ctx) {
+    confirmBox({ title: '删掉这条公告？', body: '首页和公告列表里马上就没了', okText: '删掉', danger: true })
+      .then(function (ok) { if (ok) finish(TF.store.adminDelete('notice', ctx.param.id), '删掉了'); });
+  });
+
+  /* 消息推送 */
+  TF.app.on('admin.push.target', function (ctx) {
+    var v = ctx.el.value, form = ctx.form;
+    if (!form) return;
+    var roleBox = form.querySelector('[data-push-role]');
+    var userBox = form.querySelector('[data-push-user]');
+    if (roleBox) roleBox.classList.toggle('is-hidden', v !== 'role');
+    if (userBox) userBox.classList.toggle('is-hidden', v !== 'user');
+    updateEstimate(form);
+    if (TF.ui.init) TF.ui.init(form);
+  });
+  TF.app.on('admin.push.role', function (ctx) { updateEstimate(ctx.form); });
+  TF.app.on('admin.push.user', function (ctx) { updateEstimate(ctx.form); });
+  TF.app.on('admin.push.send', function (ctx) {
+    var v = ctx.values();
+    var target = v.target || 'all';
+    var title = (v.title || '').trim(), body = (v.body || '').trim();
+    if (title.length < 2) { TF.ui.toast('标题太短', 'error'); return; }
+    if (body.length < 2) { TF.ui.toast('内容太短', 'error'); return; }
+    if (target === 'user' && !(v.userId || '').trim()) { TF.ui.toast('填一下用户名', 'error'); return; }
+    var who = target === 'role' ? ((ROLE[v.role] || ['学生'])[0]) : (target === 'user' ? (v.userId || '').trim() : '全体成员');
+    var est = pushCount(target, v.role || 'student', (v.userId || '').trim());
+    confirmBox({ title: '发给' + who + '（' + est + ' 人）？', body: '标题：' + title + '；发出后撤不回来', okText: '发出去' })
+      .then(function (ok) {
+        if (!ok) return;
+        var payload = { target: target, title: title, body: body };
+        if (target === 'role') payload.role = v.role || 'student';
+        if (target === 'user') payload.userId = (v.userId || '').trim();
+        var res = TF.store.broadcast(payload);
+        if (!res || !res.ok) { TF.ui.toast((res && res.error) || '没发出去', 'error'); return; }
+        TF.ui.toast('发给 ' + res.sent + ' 个人了', 'success');
+        TF.app.refresh();
+      });
+  });
+
+  /* 站点设置 */
+  function addWord(input) {
+    var box = document.querySelector('[data-words]');
+    var w = (input && input.value ? input.value : '').trim();
+    if (!w) { TF.ui.toast('先打一个词', 'warn'); return; }
+    if (w.length > 16) { TF.ui.toast('一个词最多 16 个字', 'error'); return; }
+    tmp.words = tmp.words || [];
+    if (tmp.words.indexOf(w) >= 0) { TF.ui.toast('词库里已经有这个词了', 'warn'); return; }
+    if (tmp.words.length >= 60) { TF.ui.toast('最多 60 个词', 'error'); return; }
+    tmp.words.push(w);
+    if (input) input.value = '';
+    if (box) box.innerHTML = wordsHTML();
+    TF.ui.toast('加上了，记得点保存', 'success');
+  }
+  TF.app.on('admin.settings.word.add', function (ctx) {
+    addWord((ctx.form || document).querySelector('[data-words-input]'));
+  });
+  TF.app.on('admin.settings.word.del', function (ctx) {
+    var w = ctx.param.w;
+    tmp.words = (tmp.words || []).filter(function (x) { return x !== w; });
+    var box = document.querySelector('[data-words]');
+    if (box) box.innerHTML = wordsHTML();
+    TF.ui.toast('去掉了，记得点保存', 'info');
+  });
+  TF.app.on('admin.settings.reload', function () { tmp.words = null; TF.ui.toast('没保存的改动都丢了', 'info'); TF.app.refresh(); });
+  TF.app.on('admin.settings.save', function (ctx) {
+    var v = ctx.values();
+    var siteName = (v.siteName || '').trim();
+    if (siteName.length < 2) { TF.ui.toast('站点名至少 2 个字', 'error'); return; }
+    var interval = parseInt(v.postInterval, 10);
+    if (!isFinite(interval) || interval < 0 || interval > 600) { TF.ui.toast('发帖间隔填 0~600 的秒数', 'error'); return; }
+    var res = TF.store.saveSettings({
+      siteName: siteName, slogan: (v.slogan || '').trim(), icp: (v.icp || '').trim(), footerText: (v.footerText || '').trim(),
+      contact: (v.contact || '').trim(), announcement: (v.announcement || '').trim(),
+      registerOpen: !!v.registerOpen, needAudit: !!v.needAudit, allowGuest: !!v.allowGuest,
+      postInterval: interval, themeDefault: v.themeDefault, sensitiveWords: tmp.words || []
+    });
+    if (!res || !res.ok) { TF.ui.toast((res && res.error) || '没存上', 'error'); return; }
+    tmp.words = null;
+    TF.ui.toast('存好了', 'success');
+    TF.app.refresh();
+  });
+  TF.app.on('admin.settings.reset', function () {
+    confirmBox({
+      title: '清空论坛数据？',
+      body: '帖子、评论、点歌、公告、登录记录会全部清空，账号和版块保留。这个操作在服务器上执行，找不回来。',
+      okText: '确认清空', danger: true
+    }).then(function (ok) {
+      if (!ok) return;
+      var r = TF.store.reset();
+      if (r && r.ok === false) { TF.ui.toast(r.error || '清空失败', 'error', 3600); return; }
+      TF.ui.toast('已清空论坛数据（账号还在）', 'success', 3600);
+      setTimeout(function () { TF.app.refresh(); }, 400);
+    });
+  });
+
+  /* 我的账号 */
+  TF.app.on('admin.profile.save', function (ctx) {
+    var v = ctx.values();
+    var nickname = (v.nickname || '').trim();
+    if (nickname.length < 2 || nickname.length > 16) { TF.ui.toast('昵称 2~16 个字', 'error'); return; }
+    var res = TF.store.updateProfile({
+      nickname: nickname, bio: (v.bio || '').trim(), grade: v.grade, klass: (v.klass || '').trim(), sex: v.sex, email: (v.email || '').trim()
+    });
+    finish(res, '存好了');
+  });
+  TF.app.on('admin.profile.pwd', function (ctx) {
+    var v = ctx.values();
+    if ((v.newPwd || '').length < 6) { TF.ui.toast('新密码至少 6 位', 'error'); return; }
+    if (v.newPwd !== v.newPwd2) { TF.ui.toast('两遍新密码不一样', 'error'); return; }
+    var res = TF.store.changePassword(v.oldPwd, v.newPwd, v.newPwd2);
+    if (!res.ok) { TF.ui.toast(res.error || '没改成', 'error'); return; }
+    TF.ui.toast('密码改了，下次用新的登', 'success');
+    if (ctx.form) ctx.form.reset();
+  });
+
+  /* --------------------------------------------------------- 路由注册（先 :section 再 /admin） */
+  TF.app.register('/admin/:section', renderAdmin);
+  TF.app.register('/admin', renderAdmin);
+})();

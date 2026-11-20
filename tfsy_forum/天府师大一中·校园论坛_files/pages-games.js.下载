@@ -1,0 +1,1886 @@
+/* 棋牌娱乐模块 · 前端页面
+ *
+ * 路由：
+ *   #/games            娱乐中心（六种游戏、随机匹配、创建房间、房间列表、我的战绩）
+ *   #/games/match      随机匹配等待页（抽取动画 → 队列人数/等待时间/取消）
+ *   #/games/room/:id   房间（等人/准备/开局）与对局（六种游戏各自的界面）
+ *
+ * 说明：
+ *   · 复用了现有 TF.ui / TF.app / TF.api 体系，没有另建一套；
+ *   · 所有对局状态都来自服务端，前端只提交操作请求；
+ *   · 实时更新用 SSE（/api/games/stream），断线时自动退回 2 秒轮询。
+ */
+(function () {
+  'use strict';
+
+  var esc = TF.util.esc;
+  var attr = TF.util.attr;
+  function S(v) { return v === null || v === undefined ? '' : String(v); }
+  function icon(n, s) { return TF.ui.icon(n, s); }
+  function toast(m, t) { TF.ui.toast(m, t || 'info'); }
+  function api() { return TF.api && TF.api.games; }
+  function me() { return TF.store && TF.store.currentUser ? TF.store.currentUser() : null; }
+  function loggedIn() { return !!me(); }
+  function key(e) { return (e && e.error) ? e.error : '网络出错了，再试一次'; }
+  function confirmBox(o) {
+    if (TF.ui.confirm) return TF.ui.confirm(o);
+    return Promise.resolve(window.confirm(o.title + '\n' + (o.body || '')));
+  }
+  function fmtSec(ms) {
+    var s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+    var m = Math.floor(s / 60);
+    return m ? (m + ' 分 ' + (s % 60) + ' 秒') : (s + ' 秒');
+  }
+
+  /* 图标映射（服务端给的是语义名，前端映射到已注册的图标） */
+  var GICON = { gomoku: 'grid', chess: 'crown', xiangqi: 'flag', doudizhu: 'cards', uno: 'palette', mahjong: 'mahjong' };
+  var GCOLOR = { gomoku: 0, chess: 1, xiangqi: 2, doudizhu: 3, uno: 4, mahjong: 5 };
+
+  /* 页面级状态（跨渲染保留，避免刷新丢选中/动画） */
+  var G = {
+    catalog: null, catalogAt: 0,
+    queue: null,
+    rooms: null,
+    room: null, roomId: '',
+    history: null,
+    rolling: false, picked: '', pickedName: '',
+    es: null, tick: null, busy: false, error: '',
+    /* 实时更新节流：只有状态签名变了才重画 */
+    roomSig: '', queueSig: '', queueStartedAt: 0, pollBusy: false,
+    roomLoadedAt: 0, allowPortrait: false,
+    /* 测试/排查用计数：渲染了几次、轮询了几次 */
+    renders: 0, polls: 0
+  };
+  var SEL = { from: -1, cards: {}, color: -1, unoSay: false, unoColor: 0 };
+  if (typeof window !== 'undefined') window.__tfGames = G;
+
+  /* ============================================================ 实时通道
+   * 关键原则：**不要无脑重渲染整页**。
+   * 之前每 2.2 秒 TF.app.refresh() 一次，手机上元素会在点击瞬间被替换 →
+   * 出牌/退出点了没反应，而且肉眼看到"一直在自动刷新"。
+   * 现在改成：轮询只取一次房间状态，比较"状态签名"，只有真的变了才重渲染；
+   * 选牌这种纯前端交互直接改 DOM，不触发渲染。
+   */
+
+  function stopLive() {
+    if (G.es) { try { G.es.close(); } catch (e) {} G.es = null; }
+  }
+
+  /* 房间状态签名：这些字段变化 = 需要重画 */
+  function roomSignature(room) {
+    if (!room) return '';
+    var st = room.state || {};
+    var members = (room.members || []).map(function (m) {
+      return [m.seat, m.ready ? 1 : 0, m.online ? 1 : 0, m.left ? 1 : 0].join('');
+    }).join(';');
+    return [
+      room.version, room.status, room.mySeat, members,
+      st.phase, st.turn, st.bidTurn, st.landlord, st.multiplier, st.ended ? 1 : 0,
+      (st.handCounts || []).join(','),
+      st.lastPlay && st.lastPlay.cards ? st.lastPlay.cards.length + ':' + st.lastPlay.seat : '',
+      st.claim ? (st.claim.tile && st.claim.tile.id) + ':' + ((st.claim.eligibele || st.claim.eligible || []).length) : '',
+      st.myTurn ? 1 : 0, st.myTurnToBid ? 1 : 0
+    ].join('|');
+  }
+
+  /* 队列状态签名：人数/游戏变了才重画（已等待时间单独更新文字，不重画） */
+  function queueSignature(q) {
+    if (!q) return '';
+    return [q.inQueue ? 1 : 0, q.game || '', q.count || 0, q.roomId || '', q.seats || 0].join('|');
+  }
+
+  function pollRoom() {
+    if (G.pollBusy || !G.roomId || !loggedIn() || !api()) return;
+    G.pollBusy = true; G.polls++;
+    api().room(G.roomId).then(function (d) {
+      G.pollBusy = false;
+      if (location.hash.indexOf('#/games/room/') !== 0) return;
+      var sig = roomSignature(d.room);
+      G.lastRoomAt = Date.now();
+      if (sig !== G.roomSig) {
+        G.room = d.room;
+        G.roomSig = sig;
+        TF.app.refresh();
+      }
+    }, function (e) {
+      G.pollBusy = false;
+      /* 房间没了（被解散/被清理）→ 提示并回娱乐中心 */
+      if (e && e.status === 404 && location.hash.indexOf('#/games/room/') === 0) {
+        toast('房间已关闭', 'warn');
+        G.room = null; G.roomId = '';
+        TF.app.go('/games');
+      }
+    });
+  }
+
+  function pollQueue() {
+    if (G.pollBusy || !loggedIn() || !api()) return;
+    G.pollBusy = true; G.polls++;
+    api().queue().then(function (d) {
+      G.pollBusy = false;
+      if (location.hash.indexOf('#/games/match') !== 0) return;
+      if (d.queue && d.queue.roomId) { TF.app.go('/games/room/' + d.queue.roomId); return; }
+      var sig = queueSignature(d.queue);
+      if (sig !== G.queueSig) {
+        G.queue = d.queue;
+        G.queueSig = sig;
+        TF.app.refresh();
+      }
+      updateWaitedTexts();
+    }, function () { G.pollBusy = false; });
+  }
+
+  /* 匹配页"已等待 X 秒"只改文字，不重画整页 */
+  function updateWaitedTexts() {
+    var nodes = document.querySelectorAll('[data-waited]');
+    if (!nodes.length || !G.queueStartedAt) return;
+    var text = fmtSec(Date.now() - G.queueStartedAt);
+    for (var i = 0; i < nodes.length; i++) nodes[i].textContent = text;
+  }
+
+  function ensureLive() {
+    if (location.hash.indexOf('#/games') !== 0) { stopLive(); return; }
+    if (!loggedIn()) { stopLive(); return; }
+    if (!G.es && window.EventSource) {
+      try {
+        G.es = new EventSource('/api/games/stream');
+        G.es.addEventListener('matched', function (ev) {
+          var d = null;
+          try { d = JSON.parse(ev.data); } catch (e) {}
+          if (!d || !d.roomId) return;
+          G.rolling = false; G.picked = ''; G.pickedName = '';
+          TF.app.go('/games/room/' + d.roomId);
+        });
+        /* 收到房态变化通知：交给轮询做"签名比较"，变了才重画 */
+        G.es.addEventListener('room', function () { pollRoom(); });
+        G.es.addEventListener('gameStart', function () { pollRoom(); });
+        G.es.addEventListener('gameEnd', function () { pollRoom(); });
+        G.es.onerror = function () { /* 浏览器会自动重连；失败时靠轮询兜底 */ };
+      } catch (e) { G.es = null; }
+    }
+    if (!G.tick) {
+      G.tick = setInterval(function () {
+        if (location.hash.indexOf('#/games') !== 0) { stopLive(); return; }
+        if (location.hash.indexOf('#/games/match') === 0) { pollQueue(); return; }
+        if (location.hash.indexOf('#/games/room/') === 0) { pollRoom(); return; }
+        /* 匹配页放着不动时，也把"已等待"每秒走一下 */
+        updateWaitedTexts();
+      }, 1000);
+    }
+  }
+
+  /* ============================================================ 公共片段 */
+
+  function loginTip(text) {
+    return '<div class="gcard gcard--flat"><div class="gcard__body g-empty-box">' +
+      '<p class="g-muted">' + esc(text || '这个功能要登录之后才能用') + '</p>' +
+      '<div class="mt-3"><a class="btn btn--primary" href="#/login?redirect=' +
+      encodeURIComponent(location.hash.replace(/^#/, '')) + '">去登录</a>' +
+      '<a class="btn btn--ghost ml-2" href="#/register">注册</a></div></div></div>';
+  }
+
+  function errBox(msg, retryAction) {
+    return '<div class="gcard gcard--flat"><div class="gcard__body g-empty-box">' +
+      '<p class="g-error">' + esc(msg) + '</p>' +
+      (retryAction ? '<div class="mt-3"><button type="button" class="btn btn--ghost" data-action="' + attr(retryAction) + '">' + icon('refresh', 15) + ' 重新加载</button></div>' : '') +
+      '</div></div>';
+  }
+
+  function avatarHTML(m, size) {
+    return TF.ui.avatar({ id: m.id, nickname: m.nickname, avatar: m.avatar, avatarUrl: m.avatarUrl }, size || 36, 'avatar--round');
+  }
+
+  function gameName(id) {
+    var g = findGame(id);
+    return g ? g.name : id;
+  }
+  function findGame(id) {
+    for (var i = 0; i < (G.catalog || []).length; i++) if (G.catalog[i].id === id) return G.catalog[i];
+    return null;
+  }
+  function ruleText(g) { return (g && g.ruleName) ? g.ruleName : ''; }
+
+  /* ============================================================ 娱乐中心 */
+
+  function loadHub() {
+    if (!api()) return Promise.resolve();
+    var now = Date.now();
+    if (G.catalog && now - G.catalogAt < 4000 && G.rooms) return Promise.resolve();
+    G.error = '';
+    return Promise.all([
+      api().catalog().then(function (d) { G.catalog = d.games || []; G.catalogAt = Date.now(); }, function (e) { G.error = key(e); }),
+      api().rooms('').then(function (d) { G.rooms = d.rooms || []; }, function (e) { if (!G.error) G.error = key(e); })
+    ]);
+  }
+
+  function hubHTML() {
+    var u = me();
+    var html = '<div class="page games" data-page="games">';
+
+    /* 顶部：随机匹配 */
+    html += '<section class="ghero">' +
+      '<div class="ghero__main">' +
+        '<h1 class="ghero__title">' + icon('sparkle', 22) + ' 娱乐中心</h1>' +
+        '<p class="ghero__desc">六种棋牌，随机匹配或者和同学开一局。所有操作都由服务器判定，输了也是真的输了。</p>' +
+        '<div class="ghero__acts">' +
+          (loggedIn()
+            ? '<button type="button" class="btn btn--primary btn--lg" data-action="games.random">' + icon('dice', 18) + ' 随机匹配</button>'
+            : '<a class="btn btn--primary btn--lg" href="#/login?redirect=%2Fgames">登录后开始</a>') +
+          '<button type="button" class="btn btn--ghost btn--lg" data-action="games.create.open">' + icon('plus', 18) + ' 创建房间</button>' +
+          (loggedIn() ? '<a class="btn btn--ghost btn--lg" href="#/games/match">' + icon('users', 18) + ' 我的匹配</a>' : '') +
+        '</div>' +
+        '<p class="ghero__hint">' + (G.catalog ? ('当前在线 ' + ((G.catalog[0] && G.catalog[0].onlinePlayers) || 0) + ' 人 · 排队中 ' +
+          G.catalog.reduce(function (n, g) { return n + (g.queue || 0); }, 0) + ' 人') : '') + '</p>' +
+      '</div>' +
+    '</section>';
+
+    if (G.error) html += errBox(G.error, 'games.reload');
+
+    /* 六种游戏 */
+    html += '<h2 class="gsection">选一个游戏</h2><div class="ggrid">';
+    var games = G.catalog || [];
+    for (var i = 0; i < games.length; i++) {
+      var g = games[i];
+      html += '<div class="gcard gcard--game" data-game="' + attr(g.id) + '">' +
+        '<div class="gcard__head">' +
+          '<span class="gicon gicon--' + attr(g.id) + '">' + icon(GICON[g.id] || 'cards', 26) + '</span>' +
+          '<div><b class="gcard__title">' + esc(g.name) + '</b>' +
+          '<div class="g-muted g-tiny">' + g.seats + ' 人对局</div></div>' +
+        '</div>' +
+        '<p class="gcard__desc">' + esc(g.desc || '') + '</p>' +
+        '<p class="g-tiny g-muted">规则：' + esc(ruleText(g)) + '</p>' +
+        '<div class="gcard__foot">' +
+          '<span class="g-tiny g-muted">' + (g.queue ? ('排队 ' + g.queue + ' 人') : '暂时没人排队') + '</span>' +
+          '<span class="gspacer"></span>' +
+          (loggedIn()
+            ? '<button type="button" class="btn btn--sm btn--primary" data-action="games.match.game" data-param="' + attr(JSON.stringify({ game: g.id })) + '">匹配</button>' +
+              '<button type="button" class="btn btn--sm btn--ghost" data-action="games.create.open" data-param="' + attr(JSON.stringify({ game: g.id })) + '">建房</button>'
+            : '<a class="btn btn--sm btn--ghost" href="#/login?redirect=%2Fgames">登录</a>') +
+        '</div>' +
+      '</div>';
+    }
+    html += '</div>';
+
+    /* 房间列表 */
+    var rooms = G.rooms || [];
+    html += '<h2 class="gsection">等人加入的房间</h2>';
+    if (!rooms.length) {
+      html += '<div class="gcard gcard--flat"><div class="gcard__body g-muted">还没有人开房。你可以点上面的「创建房间」开一间，把房间号发到群里叫同学来。</div></div>';
+    } else {
+      html += '<div class="glist">';
+      for (var r = 0; r < rooms.length; r++) {
+        var rm = rooms[r];
+        html += '<div class="grow">' +
+          '<span class="gicon gicon--sm gicon--' + attr(rm.game) + '">' + icon(GICON[rm.game] || 'cards', 18) + '</span>' +
+          '<div class="grow__main"><b>' + esc(rm.name) + '</b>' +
+            '<div class="g-tiny g-muted">' + esc(rm.gameName) + ' · ' + esc(rm.hostNickname) + ' 开的 · ' +
+            rm.members + '/' + rm.seats + ' 人' + (rm.hasPassword ? ' · 有密码' : '') + '</div></div>' +
+          (loggedIn()
+            ? '<button type="button" class="btn btn--sm btn--primary" data-action="games.join.open" data-param="' +
+              attr(JSON.stringify({ id: rm.id, hasPassword: rm.hasPassword })) + '">加入</button>'
+            : '') +
+        '</div>';
+      }
+      html += '</div>';
+    }
+
+    /* 我的战绩 */
+    if (loggedIn()) {
+      html += '<h2 class="gsection">我的最近对局</h2>';
+      if (!G.history) {
+        html += '<div class="gcard gcard--flat"><div class="gcard__body g-muted">加载中…</div></div>';
+      } else if (!G.history.length) {
+        html += '<div class="gcard gcard--flat"><div class="gcard__body g-muted">还没有对局记录。开一局试试。</div></div>';
+      } else {
+        html += '<div class="glist">';
+        for (var h = 0; h < G.history.length; h++) {
+          var it = G.history[h];
+          html += '<div class="grow">' +
+            '<span class="gicon gicon--sm gicon--' + attr(it.game) + '">' + icon(GICON[it.game] || 'cards', 18) + '</span>' +
+            '<div class="grow__main"><b>' + esc(it.gameName) + '</b>' +
+              '<div class="g-tiny g-muted">' + esc(it.detail || '') + ' · ' + esc((it.players || []).join('、')) + '</div></div>' +
+            '<span class="gbadge ' + (it.iWon ? 'gbadge--win' : '') + '">' + (it.iWon ? '赢了' : '没赢') + '</span>' +
+          '</div>';
+        }
+        html += '</div>';
+      }
+    }
+
+    /* 弹窗：建房 / 加入 */
+    html += createRoomModalHTML() + joinModalHTML();
+    html += '</div>';
+    return html;
+  }
+
+  function createRoomModalHTML() {
+    var opts = (G.catalog || []).map(function (g) {
+      return { value: g.id, label: g.name + '（' + g.seats + ' 人）' };
+    });
+    if (!opts.length) opts = [{ value: 'gomoku', label: '五子棋' }];
+    return TF.ui.modal({
+      id: 'games-create', title: '创建房间',
+      body: '<form data-action="games.create.submit">' +
+        TF.ui.selectField({ label: '玩什么', name: 'game', options: opts }) +
+        '<div class="mt-3">' + TF.ui.field({ label: '房间名', name: 'name', maxlength: 24, placeholder: '可以不填' }) + '</div>' +
+        '<div class="mt-3">' + TF.ui.field({ label: '房间密码', name: 'password', maxlength: 20, placeholder: '不填就是公开房间', hint: '想让认识的人才能进来就设一个' }) + '</div>' +
+        '<p class="g-tiny g-muted mt-3">建好之后把房间号发给同学，他们输入房间号就能进来。</p>' +
+        '<div class="cluster gap-2 mt-4"><button class="btn btn--primary" type="submit">开房</button>' +
+        '<button class="btn" type="button" data-modal-close>取消</button></div></form>'
+    });
+  }
+
+  function joinModalHTML() {
+    return TF.ui.modal({
+      id: 'games-join', title: '加入房间',
+      body: '<form data-action="games.join.submit">' +
+        '<input type="hidden" name="id" value="">' +
+        '<div data-pw><label class="field__label">房间密码</label>' +
+        '<input class="input" name="password" type="password" maxlength="20" placeholder="这个房间有密码">' +
+        '<div class="field__hint">没密码的房间会直接进去</div></div>' +
+        '<div class="cluster gap-2 mt-4"><button class="btn btn--primary" type="submit">进去</button>' +
+        '<button class="btn" type="button" data-modal-close>取消</button></div></form>'
+    });
+  }
+
+  /* ============================================================ 匹配等待页 */
+
+  function matchHTML() {
+    var u = me();
+    if (!u) {
+      return '<div class="page games" data-page="games">' + loginTip('要登录才能匹配对手') + '</div>';
+    }
+    var q = G.queue || { inQueue: false };
+    var html = '<div class="page games" data-page="games" data-sub="match">';
+
+    if (G.rolling) {
+      /* 抽取动画：六张卡片滚动高亮 */
+      html += '<section class="gmroll">' +
+        '<h1 class="gmroll__title">正在抽……</h1>' +
+        '<p class="g-muted">六种游戏里随机抽一个，抽到就进去匹配。</p>' +
+        '<div class="gmroll__grid">' +
+          (G.catalog || []).map(function (g) {
+            return '<div class="gmroll__item" data-roll="' + attr(g.id) + '">' +
+              '<span class="gicon gicon--' + attr(g.id) + '">' + icon(GICON[g.id] || 'cards', 30) + '</span>' +
+              '<b>' + esc(g.name) + '</b></div>';
+          }).join('') +
+        '</div></section>';
+    } else if (q.inQueue) {
+      var others = Math.max(0, (q.count || 1) - 1);
+      html += '<section class="gmatch">' +
+        '<div class="gmatch__top">' +
+          '<span class="gicon gicon--lg gicon--' + attr(q.game) + '">' + icon(GICON[q.game] || 'cards', 34) + '</span>' +
+          '<div><h1 class="gmatch__title">' + esc(q.gameName || gameName(q.game)) + '</h1>' +
+          '<div class="g-muted">已加入匹配队列</div></div>' +
+        '</div>' +
+        '<div class="gmstat">' +
+          '<div class="gmstat__item"><b>' + (q.count || 1) + ' / ' + (q.seats || 2) + '</b><span>当前匹配人数</span></div>' +
+          '<div class="gmstat__item"><b data-waited>' + fmtSec(q.waitedMs || 0) + '</b><span>已等待</span></div>' +
+          '<div class="gmstat__item"><b>' + (q.needsMore || 0) + ' 人</b><span>还差</span></div>' +
+        '</div>' +
+        (others === 0
+          ? '<div class="gnotice gnotice--wait"><b>当前暂无可匹配的玩家，已为你加入匹配队列，请稍候。</b>' +
+            '<div class="g-tiny">等别的同学也点匹配、并且抽到同一个游戏，服务器会自动把你们放进同一局。</div></div>'
+          : '<div class="gnotice gnotice--go">已经有 ' + others + ' 位同学在等，人凑齐就自动开局。</div>') +
+        '<div class="gmatch__acts">' +
+          '<a class="btn btn--ghost" href="#/games">回娱乐中心</a>' +
+          '<button type="button" class="btn btn--danger-ghost" data-action="games.match.cancel">取消匹配</button>' +
+        '</div>' +
+        '<p class="g-tiny g-muted mt-3">离开这个页面也会继续排，回来还能看到进度。</p>' +
+      '</section>';
+    } else {
+      html += '<section class="gmatch">' +
+        '<h1 class="gmatch__title">还没在匹配</h1>' +
+        '<p class="g-muted">点下面随机抽一个游戏，或者回娱乐中心自己选。</p>' +
+        '<div class="gmatch__acts">' +
+          '<button type="button" class="btn btn--primary" data-action="games.random">' + icon('dice', 16) + ' 随机匹配</button>' +
+          '<a class="btn btn--ghost" href="#/games">回娱乐中心</a>' +
+        '</div></section>';
+    }
+    return html + '</div>';
+  }
+
+  /* ============================================================ 房间 / 对局 */
+
+  function roomStatusText(room) {
+    if (room.status === 'waiting') return '等人中';
+    if (room.status === 'playing') return '对局中';
+    if (room.status === 'ended') return '已结束';
+    return '已关闭';
+  }
+
+  function winnersText(room) {
+    var st = room.state || {};
+    var members = room.members || [];
+    var names = [];
+    function nameOf(seatOrId) {
+      for (var i = 0; i < members.length; i++) {
+        if (String(members[i].id) === String(seatOrId) || members[i].seat === seatOrId) return members[i].nickname;
+      }
+      return '';
+    }
+    var game = room.game;
+    if (game === 'doudizhu' && st.winners) {
+      names = st.winners.map(nameOf);
+    } else if (game === 'mahjong' && st.won) {
+      names = st.won.map(function (w) { return nameOf(w.seat); });
+    } else if (st.winner !== null && st.winner !== undefined) {
+      names = [nameOf(st.winner)];
+    }
+    return names.filter(Boolean);
+  }
+
+  function resultText(room) {
+    var st = room.state || {};
+    var who = winnersText(room);
+    var r = st.result || '';
+    if (room.game === 'doudizhu') {
+      return (st.result === 'landlord' ? '地主赢' : st.result === 'farmers' ? '农民赢' : '结束');
+    }
+    if (room.game === 'mahjong') {
+      return st.result === 'wall-empty' ? '牌摸完，流局' : (st.result === 'three-won' ? '三家胡完，结束' : '结束');
+    }
+    if (r === 'checkmate') return '将死';
+    if (r === 'stalemate') return '困毙 / 逼和';
+    if (r === 'resign') return '认输';
+    if (r === 'agreement') return '和棋';
+    if (r === 'repetition') return '重复局面判和';
+    if (r === 'insufficient') return '子力不足判和';
+    if (r === 'fifty' || r === 'seventyfive') return '回合数上限判和';
+    return who.length ? (who.join('、') + ' 获胜') : '结束';
+  }
+
+  function roomLobbyHTML(room) {
+    var html = '';
+    var members = room.members || [];
+    /* 座位 */
+    html += '<div class="gseats">';
+    for (var seat = 0; seat < room.seats; seat++) {
+      var m = null;
+      for (var i = 0; i < members.length; i++) if (members[i].seat === seat) m = members[i];
+      html += '<div class="gseat' + (m ? ' is-taken' : '') + '">';
+      if (m) {
+        html += avatarHTML(m, 40) +
+          '<div class="gseat__name">' + esc(m.nickname) + (m.isHost ? '<span class="gbadge gbadge--host">房主</span>' : '') + '</div>' +
+          '<div class="g-tiny ' + (m.ready ? 'g-ok' : 'g-muted') + '">' + (room.status === 'waiting' ? (m.ready ? '已准备' : '没准备') : '对局中') + '</div>' +
+          (m.online ? '' : '<div class="g-tiny g-warn">掉线了</div>');
+      } else {
+        html += '<div class="gseat__empty">' + icon('users', 26) + '<div class="g-tiny g-muted">空位</div></div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+
+    /* 房间信息 */
+    html += '<div class="ginfo">' +
+      '<div>房间号 <b class="gcode">' + esc(room.id) + '</b>' +
+        '<button type="button" class="btn btn--text btn--sm" data-copy="' + attr(room.id) + '">复制</button>' +
+        '<button type="button" class="btn btn--text btn--sm" data-action="games.room.share" data-param="' +
+        attr(JSON.stringify({ id: room.id })) + '">复制邀请链接</button></div>' +
+      '<div class="g-muted g-tiny">' + esc(room.gameName) + ' · ' + esc(room.ruleName) + ' · ' +
+        room.members.length + '/' + room.seats + ' 人 · ' + (room.hasPassword ? '有密码' : '公开房间') + '</div>' +
+    '</div>';
+
+    /* 操作 */
+    html += '<div class="gacts">';
+    var myReady = room.myReady;
+    html += '<button type="button" class="btn ' + (myReady ? 'btn--ghost' : 'btn--primary') + '" data-action="games.room.ready" data-param="' +
+      attr(JSON.stringify({ ready: !myReady })) + '">' + (myReady ? '取消准备' : '准备') + '</button>';
+    if (room.isHost) {
+      html += '<button type="button" class="btn btn--primary"' + (room.canStart ? '' : ' disabled') +
+        ' data-action="games.room.start">开始游戏</button>';
+    }
+    html += '<button type="button" class="btn btn--ghost" data-action="games.room.leave">离开房间</button>';
+    html += '</div>';
+    if (room.isHost && !room.canStart && room.startBlockReason) {
+      html += '<p class="g-tiny g-muted mt-2">还不能开始：' + esc(room.startBlockReason) + '</p>';
+    }
+    if (!room.isHost) html += '<p class="g-tiny g-muted mt-2">等房主点开始（所有人准备好之后才能开）。</p>';
+    return html;
+  }
+
+  /* ---------- 通用：对局顶部状态 ---------- */
+  function gameTopHTML(room) {
+    var st = room.state || {};
+    var names = [];
+    for (var i = 0; i < (room.members || []).length; i++) names[room.members[i].seat] = room.members[i].nickname;
+    var turnSeat = st.turn;
+    var turnName = (typeof turnSeat === 'number' && names[turnSeat]) ? names[turnSeat] : '';
+    var html = '<div class="gtop">' +
+      '<div class="gtop__left">' +
+        '<b>' + esc(room.gameName) + '</b>' +
+        '<span class="g-tiny g-muted">' + esc(room.ruleName) + '</span>' +
+      '</div>' +
+      '<div class="gtop__right">';
+    if (room.status === 'playing') {
+      if (st.myTurn) html += '<span class="gbadge gbadge--go">轮到你了</span>';
+      else if (turnName) html += '<span class="gbadge">等待 ' + esc(turnName) + '</span>';
+    }
+    html += '<button type="button" class="btn btn--text btn--sm" data-action="games.room.members">成员</button>' +
+      '<button type="button" class="btn btn--text btn--sm" data-action="games.room.rules">规则</button>' +
+    '</div></div>';
+    return html;
+  }
+
+  function endedHTML(room) {
+    var who = winnersText(room);
+    var st = room.state || {};
+    var isDraw = !who.length;
+    return '<div class="gend">' +
+      '<div class="gend__icon">' + icon(isDraw ? 'flag' : 'trophy', 30) + '</div>' +
+      '<div class="gend__title">' + (isDraw ? '这局和了' : (who.join('、') + ' 赢了')) + '</div>' +
+      '<div class="gend__sub">' + esc(resultText(room)) + '</div>' +
+      '<div class="gacts mt-3">' +
+        '<button type="button" class="btn btn--primary" data-action="games.room.leave">回娱乐中心</button>' +
+      '</div></div>';
+  }
+
+  /* ---------- 五子棋 ---------- */
+  function gomokuHTML(room) {
+    var v = room.state || {};
+    var cells = '';
+    var win = v.winLine || [];
+    for (var y = 0; y < 15; y++) {
+      for (var x = 0; x < 15; x++) {
+        var i = y * 15 + x;
+        var c = v.board ? v.board[i] : 0;
+        var cls = 'gmn__cell' + (c === 1 ? ' is-b' : c === 2 ? ' is-w' : '');
+        if (v.lastMove === i) cls += ' is-last';
+        if (win.indexOf(i) >= 0) cls += ' is-win';
+        var can = v.myTurn && !c;
+        cells += '<button type="button" class="' + cls + '"' + (can ? '' : ' disabled') +
+          ' data-action="games.act" data-param="' + attr(JSON.stringify({ type: 'place', x: x, y: y })) +
+          '" aria-label="' + (x + 1) + ',' + (y + 1) + '"></button>';
+      }
+    }
+    return '<div class="gmn">' + cells + '</div>' +
+      '<p class="g-tiny g-muted mt-2">你执' + (v.myIndex === 0 ? '黑（先手）' : '白') + '。点格子落子。</p>';
+  }
+
+  /* ---------- 国际象棋 ---------- */
+  var CHESS_GLYPH = {
+    wK: '♔', wQ: '♕', wR: '♖', wB: '♗', wN: '♘', wP: '♙',
+    bK: '♚', bQ: '♛', bR: '♜', bB: '♝', bN: '♞', bP: '♟'
+  };
+  function chessTargets(v, from) {
+    var out = {};
+    (v.legal || []).forEach(function (s) {
+      var parts = s.split('-');
+      if (Number(parts[0]) === from) out[Number(parts[1])] = true;
+    });
+    return out;
+  }
+  function chessHTML(room) {
+    var v = room.state || {};
+    var from = SEL.from;
+    var targets = from >= 0 ? chessTargets(v, from) : {};
+    var cells = '';
+    for (var i = 0; i < 64; i++) {
+      var row = Math.floor(i / 8), col = i % 8;
+      var dark = (row + col) % 2 === 1;
+      var piece = v.board ? v.board[i] : null;
+      var cls = 'gch__cell' + (dark ? ' is-dark' : '');
+      if (from === i) cls += ' is-sel';
+      if (targets[i]) cls += ' is-target';
+      var can = v.myTurn && !v.ended && (targets[i] || (piece && piece[0] === v.myColor));
+      cells += '<button type="button" class="' + cls + '"' + (can ? '' : ' disabled') +
+        ' data-action="games.chess.click" data-param="' + attr(JSON.stringify({ i: i })) + '"' +
+        ' aria-label="' + (col + 1) + ',' + (8 - row) + '">' +
+        (piece ? '<span class="gch__p gch__p--' + piece[0] + '">' + (CHESS_GLYPH[piece] || '?') + '</span>' : '') +
+      '</button>';
+    }
+    var html = '<div class="gch">' + cells + '</div>';
+    html += '<p class="g-tiny g-muted mt-2">你执' + (v.myColor === 'w' ? '白（先手）' : '黑') + '。先点自己的棋子，再点目标格。';
+    if (v.inCheck) html += ' <b class="g-warn">你被将军了！</b>';
+    html += '</p>';
+    if (v.canClaimDraw) {
+      html += '<button type="button" class="btn btn--ghost btn--sm mt-2" data-action="games.act" data-param="' +
+        attr(JSON.stringify({ type: 'claim' })) + '">申请和棋（三次重复 / 50 回合）</button>';
+    }
+    html += '<button type="button" class="btn btn--text btn--sm" data-action="games.forfeit">认输</button>';
+    return html;
+  }
+
+  /* ---------- 中国象棋 ---------- */
+  var XQ_NAME = {
+    rK: '帅', rA: '仕', rB: '相', rN: '马', rR: '车', rC: '炮', rP: '兵',
+    bK: '将', bA: '士', bB: '象', bN: '马', bR: '车', bC: '炮', bP: '卒'
+  };
+  function xiangqiHTML(room) {
+    var v = room.state || {};
+    var from = SEL.from;
+    var targets = {};
+    (v.legal || []).forEach(function (s) {
+      var p = s.split('-');
+      if (Number(p[0]) === from) targets[Number(p[1])] = true;
+    });
+    var cells = '';
+    for (var r = 0; r < 10; r++) {
+      for (var c = 0; c < 9; c++) {
+        var i = r * 9 + c;
+        var piece = v.board ? v.board[i] : null;
+        var cls = 'gxq__cell';
+        if (from === i) cls += ' is-sel';
+        if (targets[i]) cls += ' is-target';
+        var can = v.myTurn && !v.ended && (targets[i] || (piece && piece[0] === v.myColor));
+        cells += '<button type="button" class="' + cls + '"' + (can ? '' : ' disabled') +
+          ' data-action="games.chess.click" data-param="' + attr(JSON.stringify({ i: i })) + '"' +
+          ' aria-label="' + (c + 1) + ',' + (10 - r) + '">' +
+          (piece ? '<span class="gxq__p gxq__p--' + piece[0] + '">' + (XQ_NAME[piece] || '?') + '</span>' : '') +
+        '</button>';
+      }
+    }
+    var html = '<div class="gxq">' + cells + '</div>';
+    html += '<p class="g-tiny g-muted mt-2">你执' + (v.myColor === 'r' ? '红（先手）' : '黑') + '。先点自己的棋子，再点目标格。';
+    if (v.inCheck) html += ' <b class="g-warn">你被将军了！</b>';
+    html += '</p>';
+    html += '<button type="button" class="btn btn--text btn--sm" data-action="games.forfeit">认输</button>';
+    return html;
+  }
+
+  /* ============================================================ 音效 & 回合计时器
+   * 音效文件在 assets/audio/（发牌 / 出牌 / 倒计时 / 超时），全部本地 WAV。
+   * 浏览器要求先有一次点击才允许播放，点过牌或按钮后就会自动生效。 */
+  var SFX = (function () {
+    var BASE = 'assets/audio/';
+    var FILES = { deal: 'deal.wav', play: 'play.wav', tick: 'tick.wav', timeout: 'timeout.wav' };
+    var cache = {};
+    var muted = false;
+    function get(name) {
+      var f = FILES[name]; if (!f) return null;
+      if (!cache[name]) { var a = new Audio(BASE + f); a.preload = 'auto'; cache[name] = a; }
+      return cache[name];
+    }
+    function play(name, vol) {
+      if (muted) return;
+      try {
+        var a = get(name); if (!a) return;
+        a.currentTime = 0;
+        a.volume = (vol == null ? 0.55 : vol);
+        var p = a.play();
+        if (p && p.catch) p.catch(function () {});
+      } catch (e) { /* 静默失败，不影响游戏 */ }
+    }
+    function toggle() { muted = !muted; return muted; }
+    return { play: play, toggle: toggle, isMuted: function () { return muted; } };
+  })();
+
+  /* 回合计时器：服务器给 turnLeftMs / turnTimeoutMs，本地只负责倒计时显示和音效；
+     到 0 后由服务器在 tick 里自动代走（不叫 / 出最小牌 / 过 / 摸牌），前端等新状态即可。 */
+  var TURN_TIMER = { id: 0, deadline: 0, lastSec: -1, fired: false, beep: false };
+  function stopTurnTimer() {
+    if (TURN_TIMER.id) { clearInterval(TURN_TIMER.id); TURN_TIMER.id = 0; }
+  }
+  function startTurnTimer() {
+    stopTurnTimer();
+    var room = G.room;
+    var st = (room && room.state) || {};
+    if (!room || room.status !== 'playing' || !st.turnTimeoutMs || st.ended) return;
+    TURN_TIMER.deadline = Date.now() + Math.max(0, Number(st.turnLeftMs) || 0);
+    TURN_TIMER.lastSec = -1;
+    TURN_TIMER.fired = false;
+    TURN_TIMER.beep = !!(st.myTurn || (room.game === 'doudizhu' && st.phase === 'bid' && st.myTurnToBid));
+    TURN_TIMER.id = setInterval(function () {
+      var left = Math.max(0, TURN_TIMER.deadline - Date.now());
+      var sec = Math.ceil(left / 1000);
+      var nodes = document.querySelectorAll('[data-turn-timer]');
+      for (var i = 0; i < nodes.length; i++) {
+        nodes[i].textContent = left > 0 ? ('⏱ ' + sec + 's') : '超时判定中…';
+        nodes[i].className = 'g-turn-timer' + (left <= 5000 && left > 0 ? ' is-low' : '');
+      }
+      if (TURN_TIMER.beep && left > 0 && left <= 5000 && sec !== TURN_TIMER.lastSec) {
+        TURN_TIMER.lastSec = sec;
+        SFX.play('tick', 0.4);
+      }
+      if (left <= 0 && !TURN_TIMER.fired) {
+        TURN_TIMER.fired = true;
+        if (TURN_TIMER.beep) SFX.play('timeout', 0.65);
+      }
+    }, 250);
+  }
+  function turnTimerHTML(v) {
+    if (!v || !v.turnTimeoutMs) return '';
+    var left = Math.max(0, Number(v.turnLeftMs) || 0);
+    var sec = Math.ceil(left / 1000);
+    return '<span class="g-turn-timer' + (left <= 5000 && left > 0 ? ' is-low' : '') + '" data-turn-timer>' +
+      (left > 0 ? '⏱ ' + sec + 's' : '超时判定中…') + '</span>';
+  }
+
+  /* ---------- 斗地主 ----------
+   * 界面按"牌桌"布局仿照常见斗地主：左右两家、中间出牌区、底部我的手牌。
+   * 手牌自动按点数从大到小排好（不用手动理牌）；选牌只改 DOM，不整页重画。
+   */
+  function ddzRankOf(id) {
+    if (id === 52) return 16;
+    if (id === 53) return 17;
+    return 3 + (id % 13);
+  }
+  function ddzSortDesc(list) {
+    return (list || []).slice().sort(function (a, b) {
+      var ra = ddzRankOf(a.id), rb = ddzRankOf(b.id);
+      if (ra !== rb) return rb - ra;
+      return a.id - b.id;
+    });
+  }
+  /* 记牌器：全副 - 我的 - 已出 - 底牌（地主那三张已经在手里，不重复减） */
+  function ddzCounter(v) {
+    var full = {}, rest = {};
+    for (var r = 3; r <= 15; r++) { full[r] = 4; rest[r] = 4; }
+    full[16] = 1; rest[16] = 1;
+    full[17] = 1; rest[17] = 1;
+    (v.hand || []).forEach(function (c) { rest[ddzRankOf(c.id)] = (rest[ddzRankOf(c.id)] || 0) - 1; });
+    (v.played || []).forEach(function (id) { rest[ddzRankOf(id)] = (rest[ddzRankOf(id)] || 0) - 1; });
+    if (v.landlord >= 0 && v.seat !== v.landlord && v.bottom && v.bottom.length) {
+      v.bottom.forEach(function (c) { rest[ddzRankOf(c.id)] = (rest[ddzRankOf(c.id)] || 0) - 1; });
+    }
+    var html = '<div class="ddz-counter" aria-label="记牌器（还没出现的牌）">';
+    var labels = ['3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A', '2', '小王', '大王'];
+    for (var rank = 17; rank >= 3; rank--) {
+      var n = Math.max(0, rest[rank] === undefined ? full[rank] : rest[rank]);
+      html += '<span class="ddz-counter__item' + (n === 0 ? ' is-out' : '') + '" data-crank="' + rank + '">' +
+        '<i>' + labels[rank - 3] + '</i><b>' + n + '</b></span>';
+    }
+    return html + '</div>';
+  }
+  function ddzCardBig(c, idx, total) {
+    var joker = c.suit === 'joker';
+    var red = c.suit === '♥' || c.suit === '♦' || (joker && c.label === '大王');
+    var cls = 'ddz-card' + (red ? ' ddz-card--red' : '') + (joker ? ' ddz-card--joker' : '') +
+      (SEL.cards[c.id] ? ' is-sel' : '');
+    var rank = joker ? (c.label === '大王' ? '大' : '小') : esc(c.label);
+    var suit = joker ? '王' : esc(c.suit);
+    var corner = '<span class="ddz-card__idx"><b>' + rank + '</b><i>' + suit + '</i></span>';
+    var fan = '';
+    if (typeof idx === 'number' && total) {
+      var mid = (total - 1) / 2;
+      var rot = (idx - mid) * (total > 12 ? 1.5 : 2.2);
+      var lift = Math.abs(idx - mid) * 1.6;
+      fan = ' style="--rot:' + rot.toFixed(2) + 'deg;--lift:' + lift.toFixed(1) + 'px"';
+    }
+    return '<button type="button" class="' + cls + '"' + fan + ' data-action="games.ddz.toggle" data-param="' +
+      attr(JSON.stringify({ id: c.id })) + '" data-rank="' + ddzRankOf(c.id) + '" data-card="' + c.id + '" aria-label="' + esc(c.label) + '">' +
+      corner +
+      (joker ? '<span class="ddz-card__joker">王</span>' : '<span class="ddz-card__pip">' + suit + '</span>') +
+    '</button>';
+  }
+  function ddzMiniCard(c, played) {
+    var joker = c.suit === 'joker';
+    var red = c.suit === '♥' || c.suit === '♦' || (joker && c.label === '大王');
+    var rank = joker ? (c.label === '大王' ? '大' : '小') : c.label;
+    return '<span class="ddz-mini' + (red ? ' is-red' : '') + '"' + (played ? ' data-played="' + c.id + '"' : '') + '>' +
+      '<b>' + esc(rank) + '</b><i>' + (joker ? '王' : esc(c.suit)) + '</i></span>';
+  }
+  /* 斗地主牌桌：和 UNO 同一套参考图布局 ——
+   * 深绿桌面 + 顶栏（斗地主/房间号/对局信息/底牌/退出·横屏·规则）+ 左右两家 +
+   * 中央轮次条和出牌区 + 底部我的手牌（扇形）+ 右下角出牌/不要 + 底部状态条。 */
+  function ddzHTML(room) {
+    var v = room.state || {};
+    var members = room.members || [];
+    var bySeat = {};
+    members.forEach(function (m) { bySeat[m.seat] = m; });
+    var mySeat = typeof v.seat === 'number' ? v.seat : 0;
+    var leftSeat = (mySeat + 1) % 3, rightSeat = (mySeat + 2) % 3;
+    var left = bySeat[leftSeat], right = bySeat[rightSeat], self = bySeat[mySeat];
+    var hand = ddzSortDesc(v.hand);
+    function nameOf(seat) { return bySeat[seat] ? bySeat[seat].nickname : ('玩家' + (seat + 1)); }
+    function seatBox(m, seat, side) {
+      if (!m) return '';
+      var isTurn = v.phase === 'play' && v.turn === seat;
+      var landlord = v.landlord === seat;
+      var count = (v.handCounts && v.handCounts[seat]) || 0;
+      var bars = '';
+      var bn = Math.min(count, 10);
+      for (var i = 0; i < bn; i++) bars += '<i></i>';
+      if (count > 10) bars += '<b>+' + (count - 10) + '</b>';
+      return '<div class="ddz-seat ddz-seat--' + side + (isTurn ? ' is-turn' : '') + '" data-seat="' + seat + '">' +
+        '<div class="ddz-seat__ava">' + avatarHTML(m, 44) +
+          (landlord ? '<span class="ddz-seat__tag">地主</span>' : '') + '</div>' +
+        '<div class="ddz-seat__info">' +
+          '<b class="ddz-seat__name">' + esc(m.nickname) + '</b>' +
+          '<span class="ddz-seat__grade">' + esc(m.grade || '同学') + '</span>' +
+        '</div>' +
+        '<span class="ddz-seat__count"><i class="ddz-bars">' + bars + '</i><em>' + count + '<small>张</small></em></span>' +
+        (isTurn ? '<span class="ddz-seat__turn">出牌中</span>' : '') +
+      '</div>';
+    }
+    var isMyBid = v.phase === 'bid' && v.myTurnToBid;
+    var statusLeft;
+    if (v.phase === 'bid') {
+      statusLeft = isMyBid ? '叫地主阶段 · 轮到你决定' : ('叫地主阶段 · 等 ' + esc(nameOf(v.bidTurn)) + ' 决定');
+    } else if (v.myTurn) {
+      statusLeft = '轮到你出牌 · 剩 ' + hand.length + ' 张';
+    } else {
+      statusLeft = '等 ' + esc(nameOf(v.turn)) + ' 出牌… · 剩 ' + hand.length + ' 张';
+    }
+    var turnText = v.phase === 'bid'
+      ? (isMyBid ? '轮到你叫地主' : '等 ' + esc(nameOf(v.bidTurn)) + ' 叫地主')
+      : ('轮到' + (v.myTurn ? '你' : esc(nameOf(v.turn))));
+
+    var html = '<div class="ddz-table" data-ddz-seat="' + mySeat + '">';
+    /* 顶栏 */
+    html += '<div class="ddz-topbar">' +
+      '<span class="ddz-brand" aria-label="斗地主">斗地主</span>' +
+      '<span class="ddz-roompill">房间 ' + esc(room.id) + '</span>' +
+      '<span class="ddz-topbar__info">3 人对局 · 走法与轮次由服务器判定</span>' +
+      '<span class="ddz-topbar__mid">' +
+        (v.landlord >= 0
+          ? '<span class="ddz-topbar__label">底牌</span>' + (v.bottom || []).map(function (c) { return ddzMiniCard(c); }).join('')
+          : '<span class="ddz-topbar__label">叫地主阶段</span>') +
+      '</span>' +
+      '<span class="ddz-topbar__acts">' +
+        '<button type="button" class="ddz-minibtn" data-action="games.sound">音效</button>' +
+        '<button type="button" class="ddz-minibtn" data-action="games.room.leave">退出</button>' +
+        '<button type="button" class="ddz-minibtn ddz-rotate-btn" data-action="games.room.landscape">横屏</button>' +
+        '<button type="button" class="ddz-minibtn" data-action="games.room.rules">规则</button>' +
+      '</span></div>';
+
+    /* 记牌器 */
+    html += ddzCounter(v);
+
+    /* 桌面 */
+    html += '<div class="ddz-felt">';
+    html += seatBox(left, leftSeat, 'left');
+    html += seatBox(right, rightSeat, 'right');
+    html += '<div class="ddz-center">' +
+      '<div class="ddz-turn">' + turnText + turnTimerHTML(v) + '</div>';
+    if (v.lastPlay) {
+      html += '<div class="ddz-last">' +
+        '<div class="ddz-last__who">' + (v.lastPlay.seat === mySeat ? '你' : esc(nameOf(v.lastPlay.seat))) +
+          ' 出了 ' + esc(v.lastPlay.typeName || '') + '</div>' +
+        '<div class="ddz-last__cards">' + v.lastPlay.cards.map(function (c) { return ddzMiniCard(c, true); }).join('') + '</div>' +
+      '</div>';
+    } else {
+      html += '<div class="ddz-last ddz-last--empty">' +
+        (v.phase === 'bid'
+          ? (isMyBid ? '轮到你叫地主' : '等 ' + esc(nameOf(v.bidTurn)) + ' 叫地主…')
+          : (v.myTurn ? '点手牌选中，再点「出牌」' : '等 ' + esc(nameOf(v.turn)) + ' 出牌…')) +
+      '</div>';
+    }
+    html += '</div>'; /* ddz-center */
+
+    /* 底部：我的信息 + 手牌 + 操作 */
+    html += '<div class="ddz-bottom">' +
+      '<div class="ddz-me">' +
+        '<span class="ddz-me__avatar">' + (self ? avatarHTML(self, 26) : '') + '</span>' +
+        '<b class="ddz-me__name">' + (self ? esc(self.nickname) : '我') + '</b>' +
+        '<span class="ddz-me__role">' + (v.landlord === mySeat ? '地主' : '农民') + '</span>' +
+        '<span class="ddz-me__mult">倍数 ' + (v.multiplier || 1) + '</span>' +
+        '<span class="ddz-me__sel" data-sel-count>' +
+          (Object.keys(SEL.cards).length ? '已选 ' + Object.keys(SEL.cards).length + ' 张' : '') + '</span>' +
+        '<span class="ddz-me__spacer"></span>' +
+        '<button type="button" class="ddz-clearbtn" data-action="games.ddz.clear">清空选择</button>' +
+      '</div>' +
+      '<div class="ddz-hand" data-ddz-hand>' +
+        (hand.length ? hand.map(function (c, idx) { return ddzCardBig(c, idx, hand.length); }).join('') : '<span class="g-muted g-tiny">没有手牌</span>') +
+      '</div>' +
+      '<div class="ddz-actions">' +
+        (v.phase === 'bid'
+          ? (isMyBid
+            ? '<button type="button" class="ddz-actbtn ddz-actbtn--primary" data-action="games.act" data-param="' +
+                attr(JSON.stringify({ type: 'bid', call: true })) + '">叫地主</button>' +
+              '<button type="button" class="ddz-actbtn" data-action="games.act" data-param="' +
+                attr(JSON.stringify({ type: 'bid', call: false })) + '">不叫</button>'
+            : '<span class="ddz-waittip">等 ' + esc(nameOf(v.bidTurn)) + ' 决定是否叫地主…</span>')
+          : (v.myTurn
+            ? '<button type="button" class="ddz-actbtn ddz-actbtn--primary" data-action="games.ddz.play"' +
+                (Object.keys(SEL.cards).length ? '' : ' disabled') + '>出牌</button>' +
+              (v.canPass
+                ? '<button type="button" class="ddz-actbtn" data-action="games.act" data-param="' +
+                  attr(JSON.stringify({ type: 'pass' })) + '">不要</button>'
+                : '')
+            : '<span class="ddz-waittip">等 ' + esc(nameOf(v.turn)) + ' 出牌…</span>')) +
+      '</div>' +
+    '</div>'; /* ddz-bottom */
+    html += '</div>'; /* ddz-felt */
+
+    /* 底部状态条 */
+    html += '<div class="ddz-status">' +
+      '<span class="ddz-status__left"><i class="ddz-status__dot' + ((v.myTurn || isMyBid) ? ' is-on' : '') + '"></i>' + statusLeft + '</span>' +
+      '<span class="ddz-status__right">手牌、底牌、胜负都由服务器判定</span>' +
+    '</div>';
+    html += '</div>'; /* ddz-table */
+
+    /* 竖屏提示：卡牌类游戏建议横过来玩（点"先竖着玩"后不再打扰） */
+    if (!G.allowPortrait) {
+      html += '<div class="grotate">' +
+        '<div class="grotate__box">' +
+          '<div class="grotate__icon">' + icon('cards', 34) + '</div>' +
+          '<b>横过来玩更顺手</b>' +
+          '<p>斗地主的牌比较多，手机建议横屏。点下面按钮会自动全屏并尝试转成横屏（不支持的话把手机横过来就行）。</p>' +
+          '<div class="gacts">' +
+            '<button type="button" class="btn btn--primary" data-action="games.room.landscape">全屏横屏</button>' +
+            '<button type="button" class="btn btn--ghost" data-action="games.rotate.dismiss">先竖着玩</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }
+    return html;
+  }
+
+  /* ---------- UNO ----------
+   * 牌桌按参考图 1:1 复刻：绿色桌面 + 顶栏（UNO 标志/房间号/对局信息）+ 左右对手
+   * （头像/昵称/年级/手牌张数条）+ 中央牌堆和出牌 + 扇形手牌 + 右下角大 UNO 按钮 + 底部状态条。
+   * 所有规则仍在服务端；这里只负责把服务器给的状态画出来、把点击变成 action。 */
+  var UNO_COLOR = ['红', '黄', '绿', '蓝'];
+  var UNO_COLOR_HEX = ['#d7263d', '#e8b71a', '#1f9d55', '#1f6fb2'];
+  var UNO_FACE = { skip: '⊘', reverse: '⇄', draw2: '+2', wild: 'W', wild4: '+4' };
+  function unoFace(c) {
+    if (!c) return '?';
+    if (c.kind === 'num') return String(c.num);
+    return UNO_FACE[c.kind] || c.label || '?';
+  }
+  var UNO_WILD_KIND = { wild: 1, wild4: 1 };
+  /* 一张牌：白边 + 彩色内芯 + 白椭圆 + 大字符（左下/右上角小字） */
+  function unoCardHTML(c, opts) {
+    opts = opts || {};
+    if (opts.deck) {
+      return '<button type="button" class="uno-card uno-card--back' + (opts.canDraw ? ' is-drawable' : '') + '"' +
+        (opts.canDraw
+          ? ' data-action="games.uno.draw" aria-label="从牌堆摸一张"'
+          : ' aria-label="牌堆" disabled') + '>' +
+        '<span class="uno-card__inner"><span class="uno-card__oval"></span>' +
+        '<span class="uno-card__logo">UNO</span></span></button>';
+    }
+    if (!c) return '';
+    var wild = !!UNO_WILD_KIND[c.kind] || Number(c.color) < 0;
+    var colorIdx = wild ? -1 : (Number(c.color) || 0);
+    var face = unoFace(c);
+    var cls = 'uno-card uno-card--' + (wild ? 'wild' : colorIdx) +
+      (opts.hand ? ' uno-card--hand' : '') + (opts.big ? ' uno-card--big' : '') +
+      (opts.playable ? ' is-playable' : '') + (opts.dim ? ' is-dim' : '');
+    var style = opts.style ? ' style="' + attr(opts.style) + '"' : '';
+    var inner = '<span class="uno-card__inner">' +
+      (wild ? '<span class="uno-card__quads">' +
+        '<i class="uno-card__q uno-card__q--0"></i><i class="uno-card__q uno-card__q--1"></i>' +
+        '<i class="uno-card__q uno-card__q--2"></i><i class="uno-card__q uno-card__q--3"></i></span>' : '') +
+      '<span class="uno-card__oval"></span>' +
+      '<span class="uno-card__face">' + esc(face) + '</span>' +
+      '<span class="uno-card__corner uno-card__corner--tl">' + esc(face) + '</span>' +
+      '<span class="uno-card__corner uno-card__corner--br">' + esc(face) + '</span>' +
+      '</span>';
+    if (opts.hand) {
+      return '<button type="button" class="' + cls + '"' + style +
+        ' data-action="games.uno.play" data-param="' + attr(JSON.stringify({ id: c.id, wild: wild })) + '"' +
+        ' data-card="' + attr(c.id) + '" aria-label="' + esc(c.label || face) + '">' + inner + '</button>';
+    }
+    return '<span class="' + cls + '"' + (opts.played ? ' data-played="' + attr(c.id) + '"' : '') + '>' + inner + '</span>';
+  }
+  function unoOpponentHTML(m, v, pos) {
+    var count = (v.handCounts && v.handCounts[m.seat]) || 0;
+    var isTurn = !v.ended && v.turn === m.seat;
+    var bars = '';
+    var n = Math.min(count, 7);
+    for (var i = 0; i < n; i++) bars += '<i></i>';
+    if (count > 7) bars += '<b>+' + (count - 7) + '</b>';
+    return '<div class="uno-seat uno-seat--' + pos + (isTurn ? ' is-turn' : '') + '" data-seat="' + m.seat + '">' +
+      '<div class="uno-seat__ava">' + avatarHTML(m, 42) + '</div>' +
+      '<div class="uno-seat__info">' +
+        '<b class="uno-seat__name">' + esc(m.nickname) + '</b>' +
+        '<span class="uno-seat__sub">' + esc(m.grade || '同学') + '</span>' +
+      '</div>' +
+      '<span class="uno-seat__count"><i class="uno-bars">' + bars + '</i><em>' + count + '<small>张</small></em></span>' +
+      '</div>';
+  }
+  function unoHTML(room) {
+    var v = room.state || {};
+    var members = (room.members || []).slice().sort(function (a, b) { return a.seat - b.seat; });
+    var n = members.length || 1;
+    var mySeat = typeof v.seat === 'number' ? v.seat : (typeof room.mySeat === 'number' ? room.mySeat : 0);
+    var hand = v.hand || [];
+    var playable = {};
+    (v.myPlayable || []).forEach(function (id) { playable[id] = true; });
+    var nameOf = function (seat) {
+      for (var k = 0; k < members.length; k++) if (members[k].seat === seat) return members[k].nickname;
+      return '';
+    };
+    var myTurn = !!v.myTurn;
+    var turnName = nameOf(v.turn);
+    var top = v.top;
+    var deckCount = Number(v.deckCount) || 0;
+    var colorIdx = (typeof v.currentColor === 'number' && v.currentColor >= 0) ? v.currentColor : 0;
+    var canCatch = !!v.canCatch;
+    var canChallenge = !!(v.wild4 && v.canChallenge);
+    var pendingOnMe = !!(v.unoPending && v.unoPending.seat === mySeat);
+
+    /* 对手：从下家开始顺时针排，左 / 右 / 上（3 人时正好左右各一个，和参考图一致） */
+    var others = [];
+    for (var i = 1; i < n; i++) {
+      var seat = (mySeat + i) % n;
+      for (var j = 0; j < members.length; j++) {
+        if (members[j].seat === seat) {
+          others.push({ m: members[j], pos: ['left', 'right', 'top'][others.length] || 'top' });
+          break;
+        }
+      }
+    }
+
+    /* 手牌宽度按张数自适应：牌多就叠紧一点，保证扇形不溢出屏幕。
+       叠放比例要与 CSS 的 -0.32 对齐：总宽 = w * (1 + 0.68*(n-1)) */
+    var cardW = 64;
+    try {
+      var viewW = Math.min(window.innerWidth || 960, 1180);
+      var avail = Math.max(260, viewW * 0.94 - 24);
+      cardW = Math.max(40, Math.min(110, avail / (1 + Math.max(0, hand.length - 1) * 0.68)));
+    } catch (e) { cardW = 60; }
+
+    var html = '<div class="uno-table' + (others.length >= 3 ? ' uno-table--4p' : '') + '" data-uno-seat="' + mySeat + '">';
+    /* 顶栏 */
+    html += '<div class="uno-topbar">' +
+      '<span class="uno-logo" aria-label="UNO">UNO</span>' +
+      '<span class="uno-roompill">房间 ' + esc(room.id) + '</span>' +
+      '<span class="uno-topbar__info">' + n + ' 人对局 · 走法与轮次由服务器判定</span>' +
+      '<span class="uno-topbar__acts">' +
+        '<button type="button" class="uno-minibtn" data-action="games.sound">音效</button>' +
+        '<button type="button" class="uno-minibtn" data-action="games.room.leave">退出</button>' +
+        '<button type="button" class="uno-minibtn" data-action="games.room.landscape">横屏</button>' +
+        '<button type="button" class="uno-minibtn" data-action="games.room.rules">规则</button>' +
+      '</span></div>';
+
+    /* 桌面 */
+    html += '<div class="uno-felt">';
+    others.forEach(function (o) { html += unoOpponentHTML(o.m, v, o.pos); });
+    html += '<div class="uno-center">' +
+      '<div class="uno-turn">' + (v.dir < 0 ? '逆时针' : '顺时针') + ' · ' +
+        (myTurn ? '轮到你' : ('轮到' + esc(turnName))) + turnTimerHTML(v) + '</div>' +
+      '<span class="uno-arrow uno-arrow--' + (v.dir < 0 ? 'ccw' : 'cw') + '" aria-hidden="true"></span>' +
+      '<div class="uno-piles">' +
+        '<div class="uno-pile">' +
+          unoCardHTML(null, { deck: true, canDraw: myTurn && !v.drawnThisTurn }) +
+          '<span class="uno-pile__label">牌堆 · ' + deckCount + ' 张</span>' +
+        '</div>' +
+        '<div class="uno-pile">' +
+          (top ? unoCardHTML(top, { big: true, played: true }) : '<span class="uno-card uno-card--empty">?</span>') +
+          '<span class="uno-pile__label">出牌 · <i class="uno-dot" style="background:' + UNO_COLOR_HEX[colorIdx] + '"></i>' +
+            UNO_COLOR[colorIdx] + '</span>' +
+        '</div>' +
+      '</div>';
+    if (canCatch) {
+      html += '<div class="uno-notice">' + esc(nameOf(v.unoPending && v.unoPending.seat)) + ' 只剩 1 张没喊 UNO' +
+        '<button type="button" class="btn btn--sm btn--primary" data-action="games.act" data-param="' +
+        attr(JSON.stringify({ type: 'catch' })) + '">抓他！</button></div>';
+    }
+    if (canChallenge) {
+      html += '<div class="uno-notice">对方出了 +4，你可以质疑' +
+        '<button type="button" class="btn btn--sm btn--primary" data-action="games.act" data-param="' +
+        attr(JSON.stringify({ type: 'challenge' })) + '">质疑</button></div>';
+    }
+    if (v.drawnThisTurn && myTurn) {
+      html += '<div class="uno-drawn">摸了一张，能出就出，出不了就' +
+        '<button type="button" class="btn btn--sm" data-action="games.uno.pass">过</button></div>';
+    }
+    if (v.lastAction) html += '<div class="uno-last">' + esc(v.lastAction) + '</div>';
+    if (SEL.unoColor) {
+      html += '<div class="uno-colors" role="dialog" aria-label="选一个颜色">' +
+        '<span class="uno-colors__title">这张万能牌变成什么颜色？</span>' +
+        '<span class="uno-colors__row">' + [0, 1, 2, 3].map(function (c) {
+          return '<button type="button" class="uno-colorbtn uno-colorbtn--' + c + '" data-action="games.uno.color" data-param="' +
+            attr(JSON.stringify({ color: c })) + '">' + UNO_COLOR[c] + '</button>';
+        }).join('') + '</span>' +
+        '<button type="button" class="uno-colors__cancel" data-action="games.uno.cancelColor">取消</button>' +
+      '</div>';
+    }
+    html += '</div>'; /* uno-center */
+
+    /* 扇形手牌：每张按位置旋转一点，中间高、两边低 */
+    var mid = (hand.length - 1) / 2;
+    var rotateStep = hand.length > 8 ? 1.9 : 2.6;
+    html += '<div class="uno-hand" style="' + attr('--uno-w:' + cardW.toFixed(1) + 'px') + '">' +
+      hand.map(function (c, idx) {
+        var rot = (idx - mid) * rotateStep;
+        var lift = Math.abs(idx - mid) * 2.2;
+        return unoCardHTML(c, {
+          hand: true,
+          playable: !!(playable[c.id] && myTurn),
+          style: '--rot:' + rot.toFixed(2) + 'deg;--lift:' + lift.toFixed(1) + 'px'
+        });
+      }).join('') + '</div>';
+
+    /* 右下角大 UNO 按钮：剩 2 张时先喊；忘了喊就被抓之前补喊 */
+    var unoState = pendingOnMe ? 'call' : (myTurn && hand.length === 2 ? (SEL.unoSay ? 'armed' : 'ready') : 'idle');
+    var unoHint = pendingOnMe ? '补喊' : (SEL.unoSay ? '已喊' : (unoState === 'ready' ? '点一下再出牌' : ''));
+    html += '<button type="button" class="uno-btn uno-btn--' + unoState + '" data-action="games.uno.say"' +
+      (unoState === 'idle' ? ' disabled' : '') + ' aria-label="喊 UNO">' +
+      '<span>UNO!</span>' + (unoHint ? '<small>' + unoHint + '</small>' : '') + '</button>';
+    html += '</div>'; /* uno-felt */
+
+    /* 底部状态条 */
+    var leftText = myTurn
+      ? '轮到你出牌 · 剩 ' + hand.length + ' 张'
+      : ('等 ' + (turnName ? esc(turnName) : '对手') + ' 出牌… · 剩 ' + hand.length + ' 张');
+    html += '<div class="uno-status">' +
+      '<span class="uno-status__left"><i class="uno-status__dot' + (myTurn ? ' is-on' : '') + '"></i>' + leftText + '</span>' +
+      '<span class="uno-status__right">手牌、牌堆、胜负都由服务器判定</span>' +
+    '</div>';
+    html += '</div>'; /* uno-table */
+    return html;
+  }
+
+  /* ---------- 麻将 ---------- */
+  var MJ_SUIT = ['万', '条', '筒'];
+  function mjTile(t, clickable, selected) {
+    var cls = 'gmt' + (clickable ? ' is-clickable' : '') + (selected ? ' is-sel' : '') + ' gmt--s' + (t.suit !== undefined ? t.suit : 0);
+    return '<button type="button" class="' + cls + '"' + (clickable ? ' data-action="games.mj.discard" data-param="' + attr(JSON.stringify({ tile: t.id })) + '"' : ' disabled') + '>' +
+      '<b>' + t.num + '</b><i>' + MJ_SUIT[t.suit] + '</i></button>';
+  }
+  function mjMeldsHTML(ms) {
+    if (!ms || !ms.length) return '';
+    return ms.map(function (m) {
+      var label = { pong: '碰', kong: '明杠', angang: '暗杠', bukong: '补杠' }[m.type] || '';
+      return '<span class="gmmeld"><i>' + label + '</i>' +
+        (m.type === 'angang' ? '<span class="gmt gmt--sm"><b>暗</b><i>杠</i></span>' : mjTile(m.info, false)) + '</span>';
+    }).join('');
+  }
+  function mahjongHTML(room) {
+    var v = room.state || {};
+    var names = [];
+    (room.members || []).forEach(function (m) { names[m.seat] = m.nickname; });
+    var html = '';
+
+    if (v.phase === 'lack') {
+      html += '<div class="gnotice"><b>先定缺</b>：选一门你没有的牌，之后手上这门必须全打掉，也不能用这门胡牌。' +
+        (v.myLack !== null && v.myLack !== undefined ? '（你已选：' + MJ_SUIT[v.myLack] + '）' : '') + '</div>';
+      if (v.myLack === null || v.myLack === undefined) {
+        html += '<div class="gacts">' + [0, 1, 2].map(function (s) {
+          return '<button type="button" class="btn btn--primary" data-action="games.mj.lack" data-param="' +
+            attr(JSON.stringify({ suit: s })) + '">缺' + MJ_SUIT[s] + '</button>';
+        }).join('') + '</div>';
+      }
+      html += '<p class="g-tiny g-muted">等四家都定缺之后开始。</p>';
+      html += '<div class="gplayers">';
+      (room.members || []).slice().sort(function (a, b) { return a.seat - b.seat; }).forEach(function (m) {
+        var lk = v.lack && v.lack[m.seat];
+        html += '<div class="gplayer"><div class="gplayer__main"><b>' + esc(m.nickname) + '</b>' +
+          '<div class="g-tiny g-muted">' + (lk === null || lk === undefined ? '还没定缺' : ('缺' + MJ_SUIT[lk])) + '</div></div></div>';
+      });
+      html += '</div>';
+      return html;
+    }
+
+    /* 其他家 */
+    html += '<div class="gplayers gplayers--mj">';
+    (room.members || []).slice().sort(function (a, b) { return a.seat - b.seat; }).forEach(function (m) {
+      var isMe = m.seat === v.seat;
+      var won = (v.won || []).some(function (w) { return w.seat === m.seat; });
+      html += '<div class="gplayer' + (isMe ? ' is-me' : '') + (won ? ' is-won' : '') + (v.turn === m.seat ? ' is-turn' : '') + '">' +
+        '<div class="gplayer__main"><b>' + esc(m.nickname) + '</b>' +
+        '<div class="g-tiny g-muted">' + (isMe ? '' : ((v.handCounts ? v.handCounts[m.seat] : 0) + ' 张 · ')) +
+        '缺' + MJ_SUIT[v.lack && v.lack[m.seat] !== null ? v.lack[m.seat] : 0] +
+        (won ? ' · 已胡' : '') + (v.turn === m.seat ? ' · 摸牌中' : '') + '</div>' +
+        '<div class="gmmelds">' + mjMeldsHTML(v.melds && v.melds[m.seat]) + '</div>' +
+        '</div></div>';
+    });
+    html += '</div>';
+
+    html += '<div class="gmjbar">牌墙 <b>' + (v.wallCount || 0) + '</b> 张' +
+      ' · 分数 ' + (v.scores || []).map(function (x, i) { return (names[i] || i) + ':' + x; }).join(' ') + '</div>';
+
+    /* 牌河 */
+    if (v.discards && v.discards.length) {
+      html += '<div class="gmjriver">' + v.discards.map(function (d) {
+        return '<span class="gmjriver__item">' + mjTile(d.info, false) + '</span>';
+      }).join('') + '</div>';
+    }
+
+    /* 碰杠胡提示 */
+    if (v.claim && v.claim.mine) {
+      html += '<div class="gnotice gnotice--go"><b>别人打了 ' + v.claim.tile.num + MJ_SUIT[v.claim.tile.suit] + '</b>，你可以：' +
+        '<div class="mt-2 gacts">' +
+        (v.claim.mine.hu ? '<button type="button" class="btn btn--primary" data-action="games.act" data-param="' +
+          attr(JSON.stringify({ type: 'hu' })) + '">胡</button>' : '') +
+        (v.claim.mine.canGang ? '<button type="button" class="btn btn--ghost" data-action="games.act" data-param="' +
+          attr(JSON.stringify({ type: 'gang' })) + '">杠</button>' : '') +
+        (v.claim.mine.canPong ? '<button type="button" class="btn btn--ghost" data-action="games.act" data-param="' +
+          attr(JSON.stringify({ type: 'pong' })) + '">碰</button>' : '') +
+        '<button type="button" class="btn btn--text" data-action="games.act" data-param="' +
+          attr(JSON.stringify({ type: 'pass' })) + '">过</button>' +
+        '</div></div>';
+    } else if (v.claim) {
+      html += '<div class="gnotice g-tiny">等其他人决定要不要碰/杠/胡…</div>';
+    }
+
+    /* 我的操作 */
+    if (v.myTurn) {
+      html += '<div class="gacts">';
+      if (v.canHuNow) {
+        html += '<button type="button" class="btn btn--primary" data-action="games.act" data-param="' +
+          attr(JSON.stringify({ type: 'hu' })) + '">自摸胡</button>';
+      }
+      (v.myAngang || []).forEach(function (t) {
+        html += '<button type="button" class="btn btn--ghost btn--sm" data-action="games.act" data-param="' +
+          attr(JSON.stringify({ type: 'angang', tile: t.id })) + '">暗杠 ' + t.num + MJ_SUIT[t.suit] + '</button>';
+      });
+      (v.myBukong || []).forEach(function (t) {
+        html += '<button type="button" class="btn btn--ghost btn--sm" data-action="games.act" data-param="' +
+          attr(JSON.stringify({ type: 'bukong', tile: t.id })) + '">补杠 ' + t.num + MJ_SUIT[t.suit] + '</button>';
+      });
+      html += '</div>';
+    }
+
+    /* 我的手牌 */
+    if (v.hands && v.hands[v.seat]) {
+      html += '<div class="ghand ghand--mj">' + v.hands[v.seat].map(function (t) {
+        return mjTile(t, !!(v.myTurn && !v.claim));
+      }).join('') + '</div>';
+      html += '<p class="g-tiny g-muted mt-2">' + (v.myTurn ? '点一张牌打出。' : '等 ' + esc(names[v.turn] || '') + ' 出牌…') +
+        '（规则：四川麻将·血战到底，缺一门，无吃，含碰/杠/胡，一炮多响）</p>';
+    }
+    return html;
+  }
+
+  function boardHTML(room) {
+    if (!room || !room.state) return '';
+    switch (room.game) {
+      case 'gomoku': return gomokuHTML(room);
+      case 'chess': return chessHTML(room);
+      case 'xiangqi': return xiangqiHTML(room);
+      case 'doudizhu': return ddzHTML(room);
+      case 'uno': return unoHTML(room);
+      case 'mahjong': return mahjongHTML(room);
+      default: return '<p class="g-muted">这个游戏还没做界面</p>';
+    }
+  }
+
+  function roomHTML(room) {
+    var html = '<div class="page games" data-page="games" data-sub="room" data-game="' + attr(room.game) + '"' +
+      (room.status && room.status !== 'waiting' ? ' data-status="live"' : '') + '>';
+    html += '<div class="groomhead">' +
+      '<a class="btn btn--text btn--sm" href="#/games">← 娱乐中心</a>' +
+      '<span class="gspacer"></span>' +
+      '<span class="gbadge">' + esc(roomStatusText(room)) + '</span>' +
+      '<span class="g-tiny g-muted">房间 ' + esc(room.id) + '</span>' +
+    '</div>';
+    /* 通过邀请链接进来但还不是成员：给一个明确的「加入」入口（以前只能看到房间、进不去） */
+    if (typeof room.mySeat === 'number' && room.mySeat < 0) {
+      html += '<h1 class="groomtitle">' + esc(room.name) + '</h1>' +
+        '<div class="gnotice">你还不在这个房间里。' +
+        (room.status === 'waiting' ? '' : '这一局已经开始了，等下一局吧。') + '</div>';
+      if (room.status === 'waiting') {
+        html += '<form data-action="games.room.join">' +
+          '<input type="hidden" name="id" value="' + attr(room.id) + '">' +
+          (room.hasPassword ? '<div class="mt-2">' + TF.ui.field({ label: '房间密码', name: 'password', type: 'password', maxlength: 20, placeholder: '这个房间有密码' }) + '</div>' : '') +
+          '<div class="gacts"><button type="submit" class="btn btn--primary">加入房间</button>' +
+          '<a class="btn btn--ghost" href="#/games">回娱乐中心</a></div></form>';
+      } else {
+        html += '<div class="gacts"><a class="btn btn--ghost" href="#/games">回娱乐中心</a></div>';
+      }
+      html += '</div>';
+      return html;
+    }
+    var wrapCls = 'gboardwrap' + (room.game === 'doudizhu' ? ' gboardwrap--ddz' : '') + (room.game === 'uno' ? ' gboardwrap--uno' : '');
+    if (room.status === 'waiting') {
+      html += '<h1 class="groomtitle">' + esc(room.name) + '</h1>';
+      html += roomLobbyHTML(room);
+    } else if (room.status === 'playing') {
+      html += gameTopHTML(room);
+      html += '<div class="' + wrapCls + '">' + boardHTML(room) + '</div>';
+    } else if (room.status === 'ended') {
+      html += gameTopHTML(room);
+      html += endedHTML(room);
+      html += '<div class="' + wrapCls + ' gboardwrap--ended">' + boardHTML(room) + '</div>';
+    }
+    /* 成员 / 规则弹窗 */
+    html += TF.ui.modal({
+      id: 'games-members', title: '房间成员',
+      body: '<div class="gmembers">' + (room.members || []).map(function (m) {
+        return '<div class="grow">' + avatarHTML(m, 32) +
+          '<div class="grow__main"><b>' + esc(m.nickname) + '</b>' +
+          '<div class="g-tiny g-muted">第 ' + (m.seat + 1) + ' 位 · ' + (m.ready ? '已准备' : '没准备') +
+          (m.online ? '' : ' · 掉线') + '</div></div>' +
+          (m.isHost ? '<span class="gbadge gbadge--host">房主</span>' : '') + '</div>';
+      }).join('') + '</div>'
+    });
+    var meta = findGame(room.game);
+    html += TF.ui.modal({
+      id: 'games-rules', title: (meta && meta.name ? meta.name : room.gameName) + ' · 规则',
+      body: '<p class="g-body">' + esc((meta && meta.desc) || '') + '</p>' +
+        '<p class="g-tiny g-muted mt-3">规则版本：' + esc(room.ruleName || (meta && meta.ruleName) || '') + '</p>' +
+        '<p class="g-tiny g-muted mt-3">所有牌局由服务器判定，客户端只负责显示和提交操作。不允许现金下注，纯娱乐。</p>'
+    });
+    html += '</div>';
+    return html;
+  }
+
+  /* ============================================================ 数据加载 */
+
+  function loadRoom(id) {
+    if (!api()) return Promise.resolve(false);
+    return api().room(id).then(function (d) {
+      G.room = d.room;
+      G.roomId = id;
+      G.roomSig = roomSignature(d.room);
+      G.error = '';
+      return true;
+    }, function (e) {
+      G.room = null;
+      G.error = key(e);
+      return false;
+    });
+  }
+
+  function loadQueue() {
+    if (!api() || !loggedIn()) return Promise.resolve();
+    return api().queue().then(function (d) {
+      if (d.queue && d.queue.inQueue) {
+        G.picked = d.queue.game;
+        G.pickedName = d.queue.gameName;
+        if (!G.queueStartedAt) G.queueStartedAt = Date.now() - (d.queue.waitedMs || 0);
+      } else {
+        G.queueStartedAt = 0;
+      }
+      G.queue = d.queue;
+      G.queueSig = queueSignature(d.queue);
+      if (d.queue && d.queue.roomId) {
+        var id = d.queue.roomId;
+        G.queue = { inQueue: false };
+        TF.app.go('/games/room/' + id);
+      }
+    }, function () { /* 忽略：下次轮询再试 */ });
+  }
+
+  /* ============================================================ 路由注册 */
+
+  /* ---------------------------------------------------------------- 牌的小动效
+   * 发牌 / 摸牌：新进手的牌从桌面中间飞进手牌（错峰）；
+   * 出牌：这张牌之前在手里（前一帧记了位置），就做一张飞行残影飞进桌面。
+   * 只读 DOM + WAAPI，不改布局、不触发重绘，轮询没变化时什么都不做。
+   */
+  var FX = { rects: {}, playedSig: '', lastDealAt: 0 };
+
+  function reducedMotion() {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
+  function captureCardRects() {
+    FX.rects = {};
+    var nodes = document.querySelectorAll('[data-card]');
+    for (var i = 0; i < nodes.length; i++) {
+      var id = nodes[i].getAttribute('data-card');
+      if (!id) continue;
+      var r = nodes[i].getBoundingClientRect();
+      if (r.width) FX.rects[id] = { x: r.left, y: r.top, w: r.width, h: r.height };
+    }
+  }
+  function deckPoint() {
+    var el = document.querySelector('.gcenter') || document.querySelector('.uno-center') || document.querySelector('.ddz-center') || document.querySelector('.ddz-hand');
+    if (!el) return { x: window.innerWidth / 2, y: window.innerHeight * 0.45 };
+    var r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + Math.min(r.height / 2, 120) };
+  }
+  function flyGhost(target, from, to, delay) {
+    target.style.visibility = 'hidden';
+    var g = target.cloneNode(true);
+    g.classList.add('card-ghost');
+    g.removeAttribute('data-action');
+    g.removeAttribute('data-param');
+    g.removeAttribute('data-card');
+    g.removeAttribute('data-played');
+    g.style.left = to.left + 'px';
+    g.style.top = to.top + 'px';
+    g.style.width = to.width + 'px';
+    g.style.height = to.height + 'px';
+    document.body.appendChild(g);
+    var dx = (from.x + from.w / 2) - (to.left + to.width / 2);
+    var dy = (from.y + from.h / 2) - (to.top + to.height / 2);
+    var sx = Math.max(0.2, from.w / to.width);
+    var sy = Math.max(0.2, from.h / to.height);
+    var anim = g.animate([
+      { transform: 'translate(' + dx + 'px,' + dy + 'px) scale(' + sx + ',' + sy + ')', opacity: .9 },
+      { transform: 'translate(0,0) scale(1,1)', opacity: 1 }
+    ], { duration: 300, delay: delay || 0, easing: 'cubic-bezier(.2,.75,.3,1)', fill: 'backwards' });
+    anim.onfinish = function () {
+      if (g.parentNode) g.parentNode.removeChild(g);
+      target.style.visibility = '';
+      target.animate([{ transform: 'scale(1.09)' }, { transform: 'scale(1)' }], { duration: 170, easing: 'ease-out' });
+    };
+  }
+  function animateCards() {
+    if (reducedMotion()) return;
+    var hand = document.querySelectorAll('[data-card]');
+    var played = document.querySelectorAll('[data-played]');
+    if (!hand.length && !played.length) return;
+    var origin = deckPoint();
+    var i, el, id, to, from, dx, dy;
+
+    var sig = [], n;
+    for (n = 0; n < played.length; n++) sig.push(played[n].getAttribute('data-played') || '');
+    sig = sig.join(',');
+    var playedChanged = sig !== FX.playedSig;
+    FX.playedSig = sig;
+
+    /* 发牌音效：有新牌进手时响一下（节流，避免重绘时连响） */
+    var incoming = 0;
+    for (var hi = 0; hi < hand.length; hi++) {
+      var hid = hand[hi].getAttribute('data-card');
+      if (hid && !FX.rects[hid]) incoming++;
+    }
+    if (incoming && Date.now() - FX.lastDealAt > 260) { FX.lastDealAt = Date.now(); SFX.play('deal', 0.35); }
+
+    /* 新进手的牌：从桌面中间发进来，一张比一张晚一点 */
+    for (i = 0; i < hand.length; i++) {
+      el = hand[i];
+      id = el.getAttribute('data-card');
+      if (!id || FX.rects[id]) continue;
+      to = el.getBoundingClientRect();
+      if (!to.width) continue;
+      dx = origin.x - (to.left + to.width / 2);
+      dy = origin.y - (to.top + to.height / 2);
+      el.animate([
+        { transform: 'translate(' + dx + 'px,' + dy + 'px) scale(.72) rotate(-8deg)', opacity: 0 },
+        { transform: 'translate(0,0) scale(1) rotate(0deg)', opacity: 1 }
+      ], { duration: 300, delay: Math.min(i, 12) * 18, easing: 'cubic-bezier(.2,.75,.3,1)', fill: 'backwards' });
+    }
+
+    /* 出到桌面的牌：手里有旧位置就飞过去，别人的牌就从上方落下来（只在桌面牌变了时做一次） */
+    if (!playedChanged) return;
+    if (played.length) SFX.play('play', 0.55);
+    for (i = 0; i < played.length; i++) {
+      el = played[i];
+      id = el.getAttribute('data-played');
+      if (!id) continue;
+      to = el.getBoundingClientRect();
+      if (!to.width) continue;
+      from = FX.rects[id];
+      if (from) {
+        flyGhost(el, from, to, i * 40);
+      } else {
+        el.animate([
+          { transform: 'translateY(-16px) scale(1.16)', opacity: 0 },
+          { transform: 'translateY(0) scale(1)', opacity: 1 }
+        ], { duration: 260, delay: i * 45, easing: 'cubic-bezier(.2,.8,.3,1)', fill: 'backwards' });
+      }
+    }
+  }
+
+  function renderHub() {
+    ensureLive();
+    G.renders++;
+    G.allowPortrait = false;
+    G.roomId = ''; G.room = null;
+    if (!loggedIn()) G.history = [];
+    var p = loadHub();
+    if (loggedIn()) {
+      p = p.then(function () {
+        return api().history().then(function (d) { G.history = d.list || []; }, function () { G.history = []; });
+      });
+    }
+    return p.then(function () { return { title: '娱乐中心', html: hubHTML() }; });
+  }
+
+  function renderMatch() {
+    ensureLive();
+    G.renders++;
+    return loadQueue().then(function () { return { title: '匹配中', html: matchHTML() }; });
+  }
+
+  function renderRoom(ctx) {
+    ensureLive();
+    G.renders++;
+    captureCardRects();
+    var id = S(ctx.params && ctx.params.id);
+    if (!loggedIn()) return { title: '房间', html: '<div class="page games" data-page="games" data-sub="room">' + loginTip('房间要登录才能进') + '</div>' };
+    /* 刚取过（比如轮询/操作后紧接着重画）就用缓存，别再多发一次请求 */
+    var cached = (G.room && G.roomId === id && Date.now() - G.roomLoadedAt < 900);
+    var p = cached ? Promise.resolve(true) : loadRoom(id).then(function (ok) { G.roomLoadedAt = Date.now(); return ok; });
+    return p.then(function (ok) {
+      if (!ok || !G.room) {
+        return { title: '房间', html: '<div class="page games" data-page="games" data-sub="room">' +
+          errBox(G.error || '房间不存在或已关闭') + '</div>' };
+      }
+      if (G.roomId !== id) { G.roomId = id; }
+      /* 斗地主牌桌在手机上要横屏整屏玩：进房间时给 body 打标记，把站点页头/页脚收起来 */
+      var mount = function () {
+        var cardGame = G.room && G.room.status !== 'waiting' && (G.room.game === 'doudizhu' || G.room.game === 'uno' || G.room.game === 'mahjong');
+        document.body.classList.toggle('g-room-table', !!cardGame);
+        requestAnimationFrame(function () { requestAnimationFrame(function () { animateCards(); }); });
+        startTurnTimer();
+        return function () { stopTurnTimer(); document.body.classList.remove('g-room-table'); };
+      };
+      return { title: G.room.gameName + ' · 房间 ' + G.room.id, html: roomHTML(G.room), onMount: mount };
+    });
+  }
+
+  /* ============================================================ 动作 */
+
+  function goto(path) { TF.app.go(path); }
+
+  function startMatch(gameId) {
+    if (!loggedIn()) { goto('/login'); return; }
+    if (G.busy) return;
+    G.busy = true;
+    var random = !gameId;
+    if (random) {
+      G.rolling = true;
+      G.picked = '';
+      G.pickedName = '';
+      goto('/games/match');
+      var t0 = Date.now();
+      api().match(null).then(function (d) {
+        var wait = Math.max(0, 1100 - (Date.now() - t0));
+        setTimeout(function () {
+          G.rolling = false;
+          G.picked = d.picked;
+          G.pickedName = gameName(d.picked);
+          G.queue = d.queue;
+          G.queueSig = queueSignature(d.queue);
+          G.queueStartedAt = Date.now() - ((d.queue && d.queue.waitedMs) || 0);
+          G.busy = false;
+          TF.app.refresh();
+        }, wait);
+      }, function (e) {
+        G.rolling = false;
+        G.busy = false;
+        toast(key(e), 'error');
+        TF.app.refresh();
+      });
+    } else {
+      api().match(gameId).then(function (d) {
+        G.busy = false;
+        G.picked = d.picked;
+        G.queue = d.queue;
+        G.queueSig = queueSignature(d.queue);
+        G.queueStartedAt = Date.now() - ((d.queue && d.queue.waitedMs) || 0);
+        goto('/games/match');
+        TF.app.refresh();
+      }, function (e) {
+        G.busy = false;
+        toast(key(e), 'error');
+      });
+    }
+  }
+
+  function act(action) {
+    if (!G.roomId || !loggedIn()) return;
+    api().action(G.roomId, action).then(function (d) {
+      if (d.room) {
+        G.room = d.room;
+        G.roomSig = roomSignature(d.room);
+        G.roomLoadedAt = Date.now();
+      }
+      SEL.from = -1;
+      SEL.cards = {};
+      SEL.unoSay = false;
+      SEL.unoColor = 0;
+      TF.app.refresh();
+    }, function (e) {
+      SEL.from = -1;
+      SEL.unoSay = false;
+      SEL.unoColor = 0;
+      toast(key(e), 'error');
+    });
+  }
+
+  /* 随机匹配 */
+  TF.app.on('games.random', function () { startMatch(''); });
+  TF.app.on('games.reload', function () { G.catalog = null; G.rooms = null; G.catalogAt = 0; TF.app.refresh(); });
+  TF.app.on('games.match.game', function (ctx) {
+    startMatch(S(ctx.param && ctx.param.game));
+  });
+  TF.app.on('games.match.cancel', function () {
+    api().cancelMatch().then(function () {
+      G.queue = { inQueue: false };
+      G.queueSig = queueSignature(G.queue);
+      G.queueStartedAt = 0;
+      toast('已取消匹配');
+      goto('/games');
+    }, function (e) { toast(key(e), 'error'); });
+  });
+
+  /* 建房 / 加入 */
+  TF.app.on('games.create.open', function (ctx) {
+    if (!loggedIn()) { goto('/login'); return; }
+    var sel = document.querySelector('#games-create select[name="game"]');
+    if (sel && ctx.param && ctx.param.game) sel.value = S(ctx.param.game);
+    TF.ui.modal.open('games-create');
+  });
+  TF.app.on('games.create.submit', function (ctx) {
+    var v = ctx.values() || {};
+    api().createRoom({
+      game: S(v.game), name: S(v.name), password: S(v.password)
+    }).then(function (d) {
+      TF.ui.modal.close('games-create');
+      G.roomId = d.room.id;
+      G.room = d.room;
+      goto('/games/room/' + d.room.id);
+    }, function (e) { toast(key(e), 'error'); });
+  });
+  TF.app.on('games.join.open', function (ctx) {
+    if (!loggedIn()) { goto('/login'); return; }
+    var p = ctx.param || {};
+    if (!p.hasPassword) {
+      api().join(p.id).then(function (d) {
+        G.room = d.room; G.roomId = p.id;
+        goto('/games/room/' + p.id);
+      }, function (e) { toast(key(e), 'error'); });
+      return;
+    }
+    var form = document.querySelector('#games-join form');
+    if (form) {
+      form.querySelector('input[name="id"]').value = S(p.id);
+      var pw = form.querySelector('[data-pw]');
+      if (pw) pw.style.display = '';
+    }
+    TF.ui.modal.open('games-join');
+  });
+  TF.app.on('games.join.submit', function (ctx) {
+    var v = ctx.values() || {};
+    api().join(S(v.id), S(v.password)).then(function (d) {
+      TF.ui.modal.close('games-join');
+      G.room = d.room; G.roomId = S(v.id);
+      goto('/games/room/' + S(v.id));
+    }, function (e) {
+      if (e && e.code === 'needPassword') { toast('这个房间要密码', 'warn'); return; }
+      toast(key(e), 'error');
+    });
+  });
+
+  /* 邀请链接进来之后点「加入房间」 */
+  TF.app.on('games.room.join', function (ctx) {
+    var v = ctx.values() || {};
+    var id = S(v.id) || G.roomId;
+    api().join(id, S(v.password)).then(function (d) {
+      G.room = d.room; G.roomId = id;
+      toast('进房间了');
+      TF.app.refresh();
+    }, function (e) {
+      if (e && e.code === 'badPassword') { toast('房间密码不对', 'error'); return; }
+      if (e && e.code === 'needPassword') { toast('这个房间要密码', 'warn'); return; }
+      toast(key(e), 'error');
+    });
+  });
+
+  /* 房间操作 */
+  TF.app.on('games.room.ready', function (ctx) {
+    var ready = !!(ctx.param && ctx.param.ready);
+    api().ready(G.roomId, ready).then(function (d) {
+      if (d.room) G.room = d.room;
+      TF.app.refresh();
+    }, function (e) { toast(key(e), 'error'); });
+  });
+  TF.app.on('games.room.start', function () {
+    api().start(G.roomId).then(function (d) {
+      if (d.room) G.room = d.room;
+      SERVER_TIP_START();
+      TF.app.refresh();
+    }, function (e) { toast(key(e), 'error'); });
+  });
+  function SERVER_TIP_START() { toast('开始了'); }
+  TF.app.on('games.room.leave', function () {
+    var back = function () {
+      G.room = null; G.roomId = ''; G.roomSig = ''; G.queueStartedAt = 0;
+      goto('/games');
+    };
+    if (!G.roomId) { back(); return; }
+    var playing = G.room && G.room.status === 'playing';
+    confirmBox({
+      title: playing ? '这局还没结束，确认真要退出？' : '离开房间？',
+      body: playing ? '现在退出会直接判你输（对手算赢），退出后这一局就不能继续了。' : '离开后座位会释放。',
+      okText: playing ? '认输并退出' : '离开', danger: true
+    }).then(function (ok) {
+      if (!ok) return;
+      api().leave(G.roomId).then(back, function (e) { toast(key(e), 'error'); back(); });
+    });
+  });
+  /* 全屏 + 尝试锁定横屏（手机浏览器支持情况不一；不行就提示手动横过来） */
+  TF.app.on('games.room.landscape', function () {
+    var el = document.querySelector('.uno-table') || document.querySelector('.ddz-table') || document.documentElement;
+    var req = el.requestFullscreen || el.webkitRequestFullscreen;
+    var after = function () {
+      try {
+        if (screen.orientation && screen.orientation.lock) {
+          var p = screen.orientation.lock('landscape');
+          if (p && p.catch) p.catch(function () {});
+        }
+      } catch (e) {}
+    };
+    if (req) {
+      try {
+        var p = req.call(el);
+        if (p && p.then) p.then(after, function () { after(); });
+        else after();
+      } catch (e) { after(); }
+    } else {
+      toast('这个浏览器不支持全屏，把手机横过来就行', 'warn');
+    }
+  });
+  TF.app.on('games.rotate.dismiss', function (ctx) {
+    G.allowPortrait = true;
+    var el = document.querySelector('.grotate');
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+    if (ctx && ctx.el) ctx.el.blur && ctx.el.blur();
+  });
+  TF.app.on('games.room.share', function (ctx) {
+    var id = S(ctx.param && ctx.param.id);
+    var url = location.origin + location.pathname + '#/games/room/' + id;
+    TF.util.copy(url).then(function (ok) {
+      toast(ok ? '邀请链接已复制，发给同学吧' : '复制失败，手动复制房间号 ' + id, ok ? 'success' : 'warn');
+    });
+  });
+  TF.app.on('games.sound', function () {
+    var muted = SFX.toggle();
+    toast(muted ? '已静音' : '音效已打开');
+    if (!muted) SFX.play('tick', 0.4);
+  });
+  TF.app.on('games.room.members', function () { TF.ui.modal.open('games-members'); });
+  TF.app.on('games.room.rules', function () { TF.ui.modal.open('games-rules'); });
+  TF.app.on('games.forfeit', function () {
+    confirmBox({ title: '认输？', body: '这一局会判你输。', okText: '认输', danger: true }).then(function (ok) {
+      if (!ok) return;
+      api().forfeit(G.roomId).then(function (d) {
+        if (d.room) G.room = d.room;
+        TF.app.refresh();
+      }, function (e) { toast(key(e), 'error'); });
+    });
+  });
+
+  /* 通用操作提交（各游戏拼好 action 后走这里） */
+  TF.app.on('games.act', function (ctx) {
+    act(ctx.param || {});
+  });
+
+  /* 国际象棋 / 中国象棋：点格子 → 选择/走子 */
+  TF.app.on('games.chess.click', function (ctx) {
+    var v = G.room && G.room.state;
+    if (!v || v.ended || !v.myTurn) return;
+    var i = Number(ctx.param && ctx.param.i);
+    var piece = v.board ? v.board[i] : null;
+    var myColor = v.myColor;
+    if (SEL.from < 0) {
+      if (piece && piece[0] === myColor) { SEL.from = i; TF.app.refresh(); }
+      return;
+    }
+    if (i === SEL.from) { SEL.from = -1; TF.app.refresh(); return; }
+    /* 目标格在合法走法里 → 提交 */
+    var key2 = SEL.from + '-' + i;
+    var legal = v.legal || [];
+    var hit = null;
+    for (var k = 0; k < legal.length; k++) if (legal[k].indexOf(key2) === 0) { hit = legal[k]; break; }
+    if (hit) {
+      var action = { type: 'move', from: SEL.from, to: i };
+      if (G.room.game === 'chess' && hit.length > key2.length) {
+        /* 升变：默认升后，弹窗选 */
+        var prom = hit.slice(key2.length);
+        var choice = window.prompt('升变成什么？Q=后 / R=车 / B=象 / N=马', 'Q');
+        action.promote = (choice || 'Q').toUpperCase();
+        if (['Q', 'R', 'B', 'N'].indexOf(action.promote) < 0) action.promote = 'Q';
+      }
+      act(action);
+      return;
+    }
+    /* 点回自己的另一颗棋子 = 改选 */
+    if (piece && piece[0] === myColor) { SEL.from = i; TF.app.refresh(); return; }
+    SEL.from = -1;
+    TF.app.refresh();
+  });
+
+  /* 斗地主 */
+  /* 选牌只改 DOM：不整页重画，手机上才不会"点了没反应" */
+  function ddzSyncSelection() {
+    var n = Object.keys(SEL.cards).length;
+    var cnt = document.querySelector('[data-sel-count]');
+    if (cnt) cnt.textContent = n ? '已选 ' + n + ' 张' : '';
+    var playBtn = document.querySelector('[data-action="games.ddz.play"]');
+    if (playBtn) playBtn.disabled = n === 0;
+  }
+  TF.app.on('games.ddz.toggle', function (ctx) {
+    var id = Number(ctx.param && ctx.param.id);
+    if (!id && id !== 0) return;
+    if (SEL.cards[id]) delete SEL.cards[id];
+    else SEL.cards[id] = true;
+    var el = ctx.el || (ctx.target && ctx.target.closest ? ctx.target.closest('.ddz-card') : null);
+    if (el && el.classList) el.classList.toggle('is-sel', !!SEL.cards[id]);
+    ddzSyncSelection();
+  });
+  TF.app.on('games.ddz.clear', function () {
+    SEL.cards = {};
+    var els = document.querySelectorAll('.ddz-hand .ddz-card.is-sel');
+    for (var i = 0; i < els.length; i++) els[i].classList.remove('is-sel');
+    ddzSyncSelection();
+  });
+  TF.app.on('games.ddz.play', function () {
+    var cards = Object.keys(SEL.cards).map(Number);
+    if (!cards.length) { toast('先点牌选中', 'warn'); return; }
+    act({ type: 'play', cards: cards });
+  });
+
+  /* UNO：点手牌=出牌；点牌堆=摸牌；摸完能出就出、出不了点「过」；万能牌先选颜色 */
+  function unoHandCount() {
+    return ((G.room && G.room.state && G.room.state.hand) || []).length;
+  }
+  function unoSayFlag() { return unoHandCount() === 2 && !!SEL.unoSay; }
+  TF.app.on('games.uno.play', function (ctx) {
+    var v = (G.room && G.room.state) || {};
+    if (!v.myTurn) { toast('还没轮到你', 'warn'); return; }
+    var p = ctx.param || {};
+    var id = Number(p.id);
+    if (p.wild) { SEL.unoColor = id; TF.app.refresh(); return; }
+    act({ type: 'play', cards: [id], sayUno: unoSayFlag() });
+  });
+  TF.app.on('games.uno.color', function (ctx) {
+    var id = Number(SEL.unoColor) || 0;
+    if (!id) return;
+    SEL.unoColor = 0;
+    var p = ctx.param || {};
+    act({ type: 'play', cards: [id], color: Number(p.color), sayUno: unoSayFlag() });
+  });
+  TF.app.on('games.uno.cancelColor', function () { SEL.unoColor = 0; TF.app.refresh(); });
+  TF.app.on('games.uno.draw', function () {
+    var v = (G.room && G.room.state) || {};
+    if (!v.myTurn || v.drawnThisTurn) return;
+    act({ type: 'draw' });
+  });
+  TF.app.on('games.uno.pass', function () {
+    var v = (G.room && G.room.state) || {};
+    if (!v.myTurn || !v.drawnThisTurn) return;
+    act({ type: 'pass' });
+  });
+  TF.app.on('games.uno.say', function (ctx) {
+    var v = (G.room && G.room.state) || {};
+    var mySeat = typeof v.seat === 'number' ? v.seat : -1;
+    /* 忘了喊：补喊一下，清掉"可抓"标记 */
+    if (v.unoPending && v.unoPending.seat === mySeat) { act({ type: 'say' }); return; }
+    if (!v.myTurn || unoHandCount() !== 2) { toast('出到只剩 1 张之前不用喊 UNO', 'warn'); return; }
+    SEL.unoSay = !SEL.unoSay;
+    var btn = (ctx && ctx.el) || document.querySelector('.uno-btn');
+    if (btn && btn.classList) {
+      btn.classList.toggle('is-armed', SEL.unoSay);
+      var small = btn.querySelector ? btn.querySelector('small') : null;
+      if (small) small.textContent = SEL.unoSay ? '已喊' : '点一下再出牌';
+      else if (SEL.unoSay) {
+        var s = document.createElement('small');
+        s.textContent = '已喊';
+        btn.appendChild(s);
+      }
+    }
+  });
+
+  /* 麻将 */
+  TF.app.on('games.mj.lack', function (ctx) {
+    act({ type: 'lack', suit: Number(ctx.param && ctx.param.suit) });
+  });
+  TF.app.on('games.mj.discard', function (ctx) {
+    act({ type: 'discard', tile: Number(ctx.param && ctx.param.tile) });
+  });
+
+  /* 抽取动画（匹配页 onMount） */
+  function mountRoll(root) {
+    if (!G.rolling || !root) return;
+    var items = root.querySelectorAll('[data-roll]');
+    if (!items.length) return;
+    var idx = 0;
+    var timer = setInterval(function () {
+      for (var i = 0; i < items.length; i++) items[i].classList.remove('is-active');
+      items[idx % items.length].classList.add('is-active');
+      idx++;
+    }, 90);
+    return function () { clearInterval(timer); };
+  }
+
+  /* 注意注册顺序：框架的路由匹配是"前缀命中即返回"，
+     所以更具体的 /games/match、/games/room/:id 必须注册在 /games 前面。 */
+  TF.app.register('/games/match', function () {
+    var out = renderMatch();
+    return Promise.resolve(out).then(function (o) {
+      return { title: o.title, html: o.html, onMount: mountRoll };
+    });
+  });
+  TF.app.register('/games/room/:id', renderRoom);
+  TF.app.register('/games', renderHub);
+})();

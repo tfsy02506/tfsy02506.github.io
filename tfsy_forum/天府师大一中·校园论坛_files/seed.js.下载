@@ -1,0 +1,27 @@
+/* 天府师大一中·校园论坛 — 种子内容（空壳）
+ *
+ * 这里以前放的是演示数据（用户、帖子、公告、日志……）。
+ * 现在站点用服务器 + SQLite 做真源：数据库初始化后只有 6 个版块和站点设置，
+ * 没有任何账号、帖子、公告。第一个注册的人自动成为超级管理员（由服务端判定）。
+ * 因此本文件不再生成任何内容，只保留最小结构，避免页面拿到 undefined。
+ */
+(function () {
+  'use strict';
+  var TF = (window.TF = window.TF || {});
+  TF.extend = TF.extend || function (n, o) { TF[n] = Object.assign(TF[n] || {}, o); return TF[n]; };
+
+  function data() {
+    return {
+      users: [], boards: [], posts: [], comments: [], notices: [],
+      messages: [], reports: [], logs: [], visits: [],
+      settings: {},
+      seq: { user: 0, board: 0, post: 0, comment: 0, notice: 0, msg: 0, report: 0, log: 0 }
+    };
+  }
+
+  TF.extend('seed', {
+    data: data,
+    /* 站点不再提供任何演示账号，这里只留站点信息；页面也不再读演示账号列表 */
+    META: { siteName: '天府师大一中·校园论坛', demo: false }
+  });
+})();

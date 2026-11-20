@@ -1,0 +1,2374 @@
+/* 天府师大一中·校园论坛 — 数据层 TF.store（服务器真源 + 内存快照）
+ *
+ * 架构（SERVER-CONTRACT §5）：
+ *   - 数据真源是服务器（Node + SQLite）。内存里保存一份快照（TF.api.snapshot），
+ *     所有读方法在这份快照上做筛选/排序/分页，同步返回，页面零改动。
+ *   - 写方法两条通道：
+ *       ① 同步通道（浏览器 + XMLHttpRequest 可用）：callSync 立刻拿到服务端真实结果，
+ *          权限错误、重名、间隔限制等中文提示原样返回；成功后顺手拉一次快照。
+ *       ② 乐观通道（Node 桩/harness、无 XHR、或刚发生网络失败）：先改内存 → 异步 call →
+ *          成功后用服务端快照替换内存，失败回滚 + toast 服务端错误。
+ *   - 服务器连不上：online=false，退化成空站但不白屏；写操作直接返回中文错误。
+ *   - localStorage 只清理老业务键 tf.forum.v2；业务数据一律以服务器为准。
+ *
+ * 角色（CONTRACT R5）：student < mod（版主）< admin（超级管理员），teacher 已废除。
+ */
+(function () {
+  'use strict';
+  var TF = (window.TF = window.TF || {});
+  TF.extend = TF.extend || function (n, o) { TF[n] = Object.assign(TF[n] || {}, o); return TF[n]; };
+
+  var LEGACY_KEY = 'tf.forum.v2';                 // 老的 localStorage 业务键：启动时清掉
+  var LEVELS = [0, 50, 150, 350, 700, 1400, 2800];
+  var ROLE_RANK = { student: 1, mod: 2, admin: 3 };
+  var ROLE_LABEL = { student: '学生', mod: '版主', admin: '超级管理员' };
+  var OFFLINE_MSG = '连不上服务器：先运行 node server/index.mjs，再刷新页面';
+  var ADMIN_TTL = 2500;                            // 后台只读接口短缓存（毫秒），避免一次渲染重复请求
+
+  var S = null;                 // 内存快照
+  var subs = [];                // onSync 订阅者
+  var viewSeen = {};            // 同一次会话内已计过阅读的帖子
+  var adminCache = {};          // 后台只读缓存
+  var lastNetFail = 0;          // 最近一次网络失败时间（短期内不再尝试同步请求）
+  var settingsCache = null;
+
+  function now() { return Date.now(); }
+  function str(v) { return v === null || v === undefined ? '' : String(v); }
+  function trim(v) { return str(v).trim(); }
+  function arr(v) { return Array.isArray(v) ? v : []; }
+  function bool(v) { return v === true || v === 1 || v === '1' || v === 'true' || v === 'on'; }
+  function round(n, d) { var v = Number(n); return isFinite(v) ? Math.round(v) : (d || 0); }
+  function api() { return TF.api || null; }
+
+  function toast(msg, type) {
+    try { if (TF.ui && TF.ui.toast) TF.ui.toast(msg, type || 'info'); } catch (e) { /* 无 UI 时忽略 */ }
+  }
+  function uiLoading(on, text) {
+    try { if (TF.ui && TF.ui.loading) TF.ui.loading(on, text); } catch (e) { /* 忽略 */ }
+  }
+
+  function emptySnapshot() {
+    var a = api();
+    return a && a.emptySnapshot ? a.emptySnapshot() : {
+      boards: [], posts: [], comments: [], users: [], notifications: [], reports: [],
+      logs: [], visits: [], notices: [], settings: {},
+      meta: { userId: null, role: '', serverTime: now(), totalPosts: 0, version: 0 }
+    };
+  }
+
+  function levelOf(points) {
+    var p = Math.max(0, round(points, 0));
+    var lv = 1;
+    for (var i = 0; i < LEVELS.length; i++) if (p >= LEVELS[i]) lv = i + 1;
+    return lv;
+  }
+  function levelInfo(points) {
+    var p = Math.max(0, round(points, 0));
+    var lv = levelOf(p);
+    var low = LEVELS[lv - 1], next = LEVELS[lv] === undefined ? null : LEVELS[lv];
+    return {
+      level: lv, points: p, next: next,
+      need: next === null ? 0 : next - p,
+      percent: next === null ? 100 : Math.min(100, Math.round(((p - low) / (next - low)) * 100))
+    };
+  }
+
+  function adopt(src) {
+    var a = api();
+    S = a && a.normalizeSnapshot ? a.normalizeSnapshot(src || a.snapshot || {}) : emptySnapshot();
+    S.users.forEach(function (u) { if (!u.level || u.level < 1) u.level = levelOf(u.points); });
+    settingsCache = null;
+    return S;
+  }
+  function snap() {
+    if (!S) adopt();
+    return S;
+  }
+  function cloneSnapshot() { try { return JSON.parse(JSON.stringify(snap())); } catch (e) { return snap(); } }
+  function online() { return !!(api() && api().online); }
+  function setOffline() { if (api()) api().online = false; }
+
+  function byId(list, id) {
+    var key = str(id);
+    if (!key) return null;
+    for (var i = 0; i < list.length; i++) if (str(list[i].id) === key) return list[i];
+    return null;
+  }
+  function currentUser() {
+    const obj = {"id":"108","username":"tfsy2506","nickname":"初2025级6班","role":"admin","avatar":1,"sex":"","grade":"初二","klass":"6班","bio":"初2025级6班公共账号，发布内容与创建者无关","email":"","realName":"lqs","hasRealName":true,"avatarUrl":"","points":0,"level":1000,"createdAt":1792307115888,"lastLoginAt":1794748064598,"banned":false,"banReason":"","studentStatus":"student","stats":{"posts":12,"comments":8,"likes":7},"favorites":["147","170"]};
+    return obj;
+  }
+  function meId() { var u = currentUser(); return u ? str(u.id) : ''; }
+  function asUser(u) {
+    if (u === undefined) return currentUser();
+    if (typeof u === 'string') return byId(snap().users, u);
+    return u || null;
+  }
+  function isAdmin(u) { var x = asUser(u); return !!x && str(x.role) === 'admin'; }
+  function isMod(u) { var x = asUser(u); return !!x && str(x.role) === 'mod'; }
+  /* 学生认证：老账号 / 旧版接口没有 studentStatus 字段时按「已认证」处理（服务端默认也是 student），
+     只有明确返回 external / pending / rejected 才拦。这样即使浏览器缓存混用了旧文件，
+     也不会把老用户误判成校外访客。 */
+  function studentStatus(u) {
+    var x = asUser(u);
+    if (!x) return 'guest';
+    if (str(x.role) === 'admin' || str(x.role) === 'mod') return 'student';
+    var s = str(x.studentStatus);
+    if (s === 'external' || s === 'pending' || s === 'rejected') return s;
+    return 'student';
+  }
+  function isVerified(u) { return studentStatus(u) === 'student'; }
+  function canManage(u) { var x = asUser(u); return !!x && ROLE_RANK[normRole(x.role)] >= 2; }
+  function normRole(r) {
+    var role = str(r);
+    if (role === 'teacher') return 'mod';           // 老数据归一化（R5）
+    return ROLE_RANK[role] ? role : 'student';
+  }
+
+  function paginate(list, page, size) {
+    size = Math.min(1000, Math.max(1, round(size, 20) || 20));
+    var total = list.length;
+    var pages = Math.max(1, Math.ceil(total / size));
+    page = Math.min(Math.max(1, round(page, 1) || 1), pages);
+    var start = (page - 1) * size;
+    return { list: list.slice(start, start + size), total: total, page: page, size: size, pages: pages };
+  }
+  function kwMatch(hay, kw) { return str(hay).toLowerCase().indexOf(str(kw).toLowerCase()) >= 0; }
+
+  /* ------------------------------------------------------- 同步 / 乐观写通道 */
+  function canSync() {
+    if (typeof XMLHttpRequest !== 'function') return false;
+    if (lastNetFail && now() - lastNetFail < 4000) return false;
+    return !!(api() && typeof api().callSync === 'function');
+  }
+
+  /* 同步请求：{ok:true,data} / {ok:false,error} / null（环境不支持） */
+  function syncCall(method, path, body, busy) {
+    if (!canSync()) return null;
+    if (busy) uiLoading(true, busy);
+    var r = null;
+    try { r = api().callSync(method, path, body); }
+    catch (e) { r = { __net: true, error: e && e.message }; }
+    finally { if (busy) uiLoading(false); }
+    if (!r) return null;
+    if (r.__net) { lastNetFail = now(); setOffline(); return { ok: false, error: r.error || OFFLINE_MSG, offline: true }; }
+    if (!r.ok) return { ok: false, error: r.error || '操作没成功', status: r.status, code: r.code };
+    return { ok: true, data: r.data };
+  }
+
+  function bumpCache() { adminCache = {}; }
+
+  /* 写操作收尾：拉最新快照 → 替换内存 → 通知 UI */
+  function afterWrite(kind) {
+    bumpCache();
+    var a = api();
+    if (!a || !a.refresh) return;
+    var p = a.refresh();
+    if (!p || !p.then) return;
+    p.then(function () { adopt(); notifySync(kind || 'major'); },
+      function () { notifySync(kind || 'major'); });
+  }
+
+  /* 同步拉快照（写后立刻需要新数据，例如发帖后跳详情页） */
+  function syncAdopt() {
+    bumpCache();
+    var a = api();
+    if (a && a.refreshSync && canSync()) { a.refreshSync(); adopt(); return true; }
+    return false;
+  }
+
+  function notifySync(kind) {
+    var list = subs.slice();
+    for (var i = 0; i < list.length; i++) {
+      try { list[i](kind || 'major', snap()); } catch (e) { /* 订阅者异常不影响主流程 */ }
+    }
+    if (!list.length && kind === 'major') {
+      try { if (TF.app && TF.app.refresh) TF.app.refresh(); } catch (e) { /* 忽略 */ }
+    }
+  }
+
+  /* 乐观写：apply 先改内存（返回同步结果），request 发异步请求；失败回滚 */
+  function optimistic(apply, request, kind) {
+    var backup = cloneSnapshot();
+    var res;
+    try { res = apply(); } catch (e) { return { ok: false, error: '操作出错了，刷新一下再试' }; }
+    if (res && res.ok === false) return res;
+    var out = res && typeof res === 'object' ? res : { ok: true };
+    var a = api();
+    if (!a || !a.call) return out;
+    var p = null;
+    try { p = request(); } catch (e) { p = null; }
+    if (!p || !p.then) return out;
+    p.then(function () { afterWrite(kind || 'minor'); }, function (e) {
+      S = backup;                       // 回滚到操作前
+      bumpCache();
+      toast((e && (e.error || e.message)) || '操作没成功，再试一次', 'error');
+      notifySync('major');
+    });
+    return out;
+  }
+
+  function offlineResult() { return { ok: false, error: OFFLINE_MSG, offline: true }; }
+  function syncDone(res, kind) {
+    if (res && res.ok) { if (!syncAdopt()) afterWrite(kind || 'major'); }
+    return res;
+  }
+
+  /* ------------------------------------------------------------- 设置归一化 */
+  function settingsDefaults() {
+    return {
+      siteName: '天府师大一中·校园论坛', subtitle: '', schoolName: '四川天府新区师一学校',
+      address: '', motto: '', slogan: '', icp: '', footerText: '', contact: '', announcement: '',
+      registerOpen: true, needAudit: false, needEmail: false, allowGuest: true,
+      postInterval: 30, sensitiveWords: [], themeDefault: 'light'
+    };
+  }
+  function normSettings(raw) {
+    var out = settingsDefaults();
+    raw = raw && typeof raw === 'object' ? raw : {};
+    Object.keys(out).forEach(function (k) { if (raw[k] !== undefined && raw[k] !== null) out[k] = raw[k]; });
+    out.registerOpen = bool(raw.registerOpen);
+    out.needAudit = bool(raw.needAudit);
+    out.needEmail = bool(raw.needEmail);
+    out.allowGuest = bool(raw.allowGuest);
+    out.postInterval = Math.max(0, Math.min(600, round(raw.postInterval, 30)));
+    out.sensitiveWords = Array.isArray(raw.sensitiveWords)
+      ? raw.sensitiveWords.map(str).filter(Boolean)
+      : str(raw.sensitiveWords).split(/[,，、\s]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+    if (out.themeDefault !== 'dark') out.themeDefault = 'light';
+    if (!out.siteName) out.siteName = settingsDefaults().siteName;
+    return out;
+  }
+  function getSettings() {
+    if (!settingsCache) settingsCache = normSettings(snap().settings);
+    return settingsCache;
+  }
+
+  /* ---------------------------------------------------------------- 初始化 */
+  function init() {
+    try { window.localStorage.removeItem(LEGACY_KEY); } catch (e) { /* 隐私模式等忽略 */ }
+    adopt();
+    return snap();
+  }
+  function save() { /* 数据以服务器为准，本方法保留仅为兼容旧调用 */ }
+  /* 清空论坛内容（**服务器端执行**，账号和版块保留）。只有超管能调。 */
+  function reset() {
+    var r = syncCall('POST', '/admin/reset', {}, '正在清空…');
+    if (r && r.ok) {
+      bumpCache();
+      adopt();
+      afterWrite('major');
+      return { ok: true };
+    }
+    return { ok: false, error: (r && r.error) || '清空失败，稍后再试' };
+  }
+  function state() {
+    var u = currentUser();
+    var out = snap();
+    out.session = u ? { userId: u.id, role: u.role, at: round(out.meta && out.meta.serverTime, now()), expiresAt: 0 } : null;
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ 鉴权 */
+  function canPost() {
+    var me = currentUser();
+    if (!me) return { ok: false, msg: '先登录再发帖' };
+    if (me.banned) return { ok: false, msg: '账号被封了：' + (me.banReason || '违反版规') };
+    var st = getSettings();
+    var iv = round(st.postInterval, 30);
+    if (normRole(me.role) === 'student' && iv > 0) {
+      var last = 0;
+      snap().posts.forEach(function (p) { if (p.authorId === str(me.id)) last = Math.max(last, round(p.createdAt, 0)); });
+      var left = Math.ceil((last + iv * 1000 - now()) / 1000);
+      if (last && left > 0) return { ok: false, msg: '发帖太快了，等 ' + left + ' 秒再发' };
+    }
+    return { ok: true, msg: '' };
+  }
+
+  /* 会话只能由服务器建立：只在「目标就是当前登录用户」时返回 user，杜绝免密登录 */
+  function setSession(userId) {
+    var me = currentUser();
+    if (!me || str(me.id) !== str(userId)) return null;
+    return me;
+  }
+
+  function finishAuth(user) {
+    var a = api();
+    if (a && user) a.user = user;
+    syncAdopt();
+    adopt();
+    notifySync('auth');
+  }
+
+  function login(username, password) {
+    var name = trim(username), pwd = str(password);
+    if (!name || !pwd) return { ok: false, error: '用户名和密码都要填' };
+    var r = syncCall('POST', '/auth/login', { username: name, password: pwd }, '正在登录…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      var u = (r.data && r.data.user) || null;
+      finishAuth(u);
+      return { ok: true, user: currentUser() || u };
+    }
+    if (!online()) return offlineResult();
+    api().login(name, pwd).then(function () { adopt(); notifySync('auth'); }, function (e) {
+      toast((e && e.error) || '登录没成功', 'error');
+    });
+    return { ok: true, pending: true };
+  }
+
+  function register(d) {
+    d = d || {};
+    var username = trim(d.username), nickname = trim(d.nickname);
+    var pwd = str(d.password), pwd2 = str(d.password2);
+    var realName = trim(d.realName), klass = trim(d.klass), studentNo = trim(d.studentNo);
+    if (!/^[a-zA-Z0-9_]{3,16}$/.test(username)) return { ok: false, error: '用户名 3-16 位，只能用字母、数字和下划线' };
+    if (nickname.length < 2 || nickname.length > 16) return { ok: false, error: '昵称 2-16 个字' };
+    if (pwd.length < 6) return { ok: false, error: '密码至少 6 位' };
+    if (pwd !== pwd2) return { ok: false, error: '两次密码不一样' };
+    /* 真实姓名 / 班级 / 学号：不再是注册必填项（新账号默认是校外访客，
+       这些资料在「学生认证」时随校卡照片一起填，也可以留空）。 */
+    if (realName && (realName.length < 2 || realName.length > 20)) return { ok: false, error: '真实姓名填 2~20 个字' };
+    if (klass && !/^([1-9]|10)班$/.test(klass)) return { ok: false, error: '班级只能选 1~10 班' };
+    if (studentNo && !/^\d{4,12}$/.test(studentNo)) return { ok: false, error: '学号填 4~12 位数字' };
+    var payload = {
+      username: username, nickname: nickname, password: pwd, password2: pwd2,
+      email: trim(d.email), grade: trim(d.grade), klass: klass, sex: trim(d.sex),
+      realName: realName, studentNo: studentNo
+    };
+    var r = syncCall('POST', '/auth/register', payload, '正在注册…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      var u = (r.data && r.data.user) || null;
+      finishAuth(u);
+      return { ok: true, user: currentUser() || u };
+    }
+    if (!online()) return offlineResult();
+    api().register(payload).then(function () { adopt(); notifySync('auth'); }, function (e) {
+      toast((e && e.error) || '注册没成功', 'error');
+    });
+    return { ok: true, pending: true };
+  }
+
+  function logout() {
+    var a = api();
+    var r = syncCall('POST', '/auth/logout', {}, '正在退出…');
+    if (a) a.user = null;
+    if (r && r.ok) { syncAdopt(); adopt(); }
+    else if (a && a.logout) {
+      a.logout().then(function () { adopt(); notifySync('auth'); }, function () { adopt(); notifySync('auth'); });
+    } else adopt();
+    viewSeen = {};
+    songCache = {};               // 票数/canManage 跟登录态有关，登出后清掉
+    notifySync('auth');
+  }
+
+  function changePassword(oldPwd, newPwd, newPwd2) {
+    if (str(newPwd).length < 6) return { ok: false, error: '新密码至少 6 位' };
+    if (str(newPwd) !== str(newPwd2)) return { ok: false, error: '两次输入的新密码不一样' };
+    var r = syncCall('POST', '/auth/password', { oldPwd: str(oldPwd), newPwd: str(newPwd), newPwd2: str(newPwd2) }, '正在改密码…');
+    if (r) return r.ok ? { ok: true } : { ok: false, error: r.error };
+    if (!online()) return offlineResult();
+    api().changePassword(str(oldPwd), str(newPwd), str(newPwd2)).then(null, function (e) {
+      toast((e && e.error) || '改密码没成功', 'error');
+    });
+    return { ok: true, pending: true };
+  }
+
+  /* 找回密码：安全问答（服务端只回问题，不回答案） */
+  function getSecurityQuestion(username) {
+    var name = trim(username);
+    if (!name) return { ok: false, error: '用户名填一下' };
+    var r = syncCall('GET', '/auth/question?username=' + encodeURIComponent(name), null, '正在查…');
+    if (r) {
+      if (!r.ok) {
+        if (r.code === 'noSecurity' || r.status === 400) {
+          return { ok: false, error: r.error || '这个账号没设安全问答，找管理员在后台重置', code: 'noSecurity' };
+        }
+        return { ok: false, error: r.error };
+      }
+      var d = r.data || {};
+      return { ok: true, question: str(d.question), nickname: str(d.nickname) };
+    }
+    if (!online()) return offlineResult();
+    return { ok: false, error: '找回密码要在浏览器里用，连上服务器再试' };
+  }
+
+  function resetPasswordByAnswer(d) {
+    d = d || {};
+    var username = trim(d.username), answer = trim(d.answer);
+    var pwd = str(d.newPwd), pwd2 = str(d.newPwd2);
+    if (!username) return { ok: false, error: '用户名填一下' };
+    if (!answer) return { ok: false, error: '安全问题的答案填一下' };
+    if (pwd.length < 6) return { ok: false, error: '新密码至少 6 位' };
+    if (pwd !== pwd2) return { ok: false, error: '两次密码不一样' };
+    var r = syncCall('POST', '/auth/reset', { username: username, answer: answer, newPwd: pwd, newPwd2: pwd2 }, '正在重置…');
+    if (r) return r.ok ? { ok: true } : { ok: false, error: r.error };
+    if (!online()) return offlineResult();
+    return { ok: false, error: '重置密码要在浏览器里用，连上服务器再试' };
+  }
+
+  /* 设置自己的安全问题（登录后用）。设了之后"忘记密码"才能自助重置；
+     传空字符串 = 取消设置。 */
+  function setSecurityQuestion(question, answer) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录' };
+    var q = trim(question), a = trim(answer);
+    if (!q && !a) {
+      var r0 = syncCall('POST', '/auth/security', { question: '', answer: '' }, '正在取消…');
+      if (r0) return r0.ok ? { ok: true, hasSecurity: false } : { ok: false, error: r0.error };
+      if (!online()) return offlineResult();
+      return { ok: false, error: '没成功，再试一次' };
+    }
+    if (q.length < 2) return { ok: false, error: '问题写清楚一点（至少 2 个字）' };
+    if (!a) return { ok: false, error: '答案填一下（忘了密码时靠它找回）' };
+    var r = syncCall('POST', '/auth/security', { question: q, answer: a }, '正在保存…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      if (syncAdopt) syncAdopt();
+      return { ok: true, hasSecurity: true };
+    }
+    if (!online()) return offlineResult();
+    return { ok: false, error: '没存上，再试一次' };
+  }
+
+  function findUserByUsername(username) {
+    var u = trim(username).toLowerCase();
+    if (!u) return null;
+    var list = snap().users;
+    for (var i = 0; i < list.length; i++) if (str(list[i].username).toLowerCase() === u) return list[i];
+    return null;
+  }
+  function getUser(id) { return byId(snap().users, id); }
+
+  /* 头像地址只允许站内上传目录（服务器强校验，这里先拦一道给同样的中文提示） */
+  function normAvatarUrl(v) {
+    var val = trim(v);
+    if (!val) return '';
+    if (!/^\/uploads\/[A-Za-z0-9._-]+$/.test(val)) return null;
+    return val;
+  }
+
+  function updateProfile(patch) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录' };
+    patch = patch || {};
+    var nick = patch.nickname === undefined ? me.nickname : trim(patch.nickname);
+    if (nick.length < 2 || nick.length > 16) return { ok: false, error: '昵称 2-16 个字' };
+    var payload = {
+      nickname: nick,
+      bio: patch.bio === undefined ? me.bio : trim(patch.bio).slice(0, 120),
+      grade: patch.grade === undefined ? me.grade : trim(patch.grade),
+      sex: patch.sex === undefined ? me.sex : trim(patch.sex)
+    };
+    /* 班级：只允许 1~10 班；改了就传新的，没改但账号里已经有了就带上（服务端对老账号要求必填） */
+    if (patch.klass !== undefined) {
+      var kl = trim(patch.klass);
+      if (!/^([1-9]|10)班$/.test(kl)) return { ok: false, error: '班级请选 1~10 班' };
+      payload.klass = kl;
+    } else if (trim(me.klass)) {
+      payload.klass = trim(me.klass);
+    }
+    /* 学号：4~12 位数字（只有超管和本人能看到） */
+    if (patch.studentNo !== undefined) {
+      var sn = trim(patch.studentNo);
+      if (!/^\d{4,12}$/.test(sn)) return { ok: false, error: '学号填 4~12 位数字' };
+      payload.studentNo = sn;
+    } else if (trim(me.studentNo)) {
+      payload.studentNo = trim(me.studentNo);
+    }
+    /* 真实姓名：同上（只有超管和本人能看到） */
+    if (patch.realName !== undefined) {
+      var rn = trim(patch.realName);
+      if (rn.length < 2 || rn.length > 20) return { ok: false, error: '真实姓名要填 2~20 个字' };
+      payload.realName = rn;
+    } else if (trim(me.realName)) {
+      payload.realName = trim(me.realName);
+    }
+    /* 头像支持三种写法：
+     *   avatarUrl: '/uploads/x.png'  上传的图片（页面先 uploadAvatar 拿 url）
+     *   avatar:    '/uploads/x.png'  同上（老写法，别再被 Number() 强转成 0）
+     *   avatar:    0~7               预设头像
+     * 不传就完全不动头像字段（服务端是增量更新）。 */
+    if (patch.avatarUrl !== undefined) {
+      var au = normAvatarUrl(patch.avatarUrl);
+      if (au === null) return { ok: false, error: '头像地址不对' };
+      payload.avatarUrl = au;
+    } else if (patch.avatar !== undefined) {
+      if (typeof patch.avatar === 'string') {
+        var s = trim(patch.avatar);
+        if (/^\d+$/.test(s)) payload.avatar = Math.max(0, Math.min(7, round(s, 0)));
+        else {
+          var au2 = normAvatarUrl(s);
+          if (au2 === null) return { ok: false, error: '头像地址不对' };
+          payload.avatarUrl = au2;
+        }
+      } else {
+        payload.avatar = Math.max(0, Math.min(7, round(patch.avatar, 0)));
+      }
+    }
+    return optimistic(function () {
+      var u = getUser(me.id);
+      if (u) {
+        Object.keys(payload).forEach(function (k) {
+          if (k === 'avatarUrl') { u.avatarUrl = payload[k]; return; }
+          u[k] = payload[k];
+        });
+        if (payload.realName) u.hasRealName = true;
+      }
+      return { ok: true, user: u || me };
+    }, function () { return api().put('/me', payload); }, 'major');
+  }
+
+  /* 换头像：走服务器上传（POST /api/upload），拿到 /uploads/xxx.png 再 updateProfile({avatarUrl:url})。
+   * 返回的是 thenable 结果对象：`await TF.store.uploadAvatar(file)` 或 `.then(function (r) {...})`
+   * 都会拿到最终 {ok, url, error}（r.url 与 r.avatarUrl 等价）。 */
+  function uploadAvatar(file) {
+    var me = currentUser();
+    var p = null;
+    if (!me) p = Promise.resolve({ ok: false, error: '先登录再换头像' });
+    else if (!file) p = Promise.resolve({ ok: false, error: '先选一张图片' });
+    else if (!online()) p = Promise.resolve({ ok: false, error: OFFLINE_MSG });
+    else {
+      var a = api();
+      p = (a && a.upload) ? a.upload(file) : Promise.reject(new Error('这个环境不支持上传'));
+      p = p.then(function (url) {
+        var clean = normAvatarUrl(url);
+        if (!clean) throw Object.assign(new Error('上传返回的地址不对，刷新后再试'), { status: 0 });
+        return { ok: true, url: clean, avatarUrl: clean, error: '' };
+      }, function (e) {
+        var msg = (e && (e.error || e.message)) || '上传没成功，换张图再试';
+        toast(msg, 'error');
+        return { ok: false, error: msg, url: '', avatarUrl: '' };
+      });
+    }
+    var out = { ok: true, pending: true, url: '', avatarUrl: '', error: '' };
+    out.then = function (onOk, onErr) {
+      return p.then(function (r) {
+        out.ok = r.ok; out.url = r.url || ''; out.avatarUrl = r.avatarUrl || ''; out.error = r.error || '';
+        out.pending = false;
+        /* 注意：必须 resolve 一个普通对象，不能把 out（thenable）自己交出去，
+           否则 await 会反复同化它 → 死循环 */
+        var plain = { ok: out.ok, url: out.url, avatarUrl: out.avatarUrl, error: out.error };
+        return onOk ? onOk(plain) : plain;
+      }, onErr);
+    };
+    out.catch = function (fn) { return p.then(null, fn); };
+    return out;
+  }
+
+  function listUsers(o) {
+    o = o || {};
+    var kw = trim(o.keyword), role = trim(o.role), status = trim(o.status);
+    var list = snap().users.filter(function (u) {
+      if (role && normRole(u.role) !== role) return false;
+      if (status === 'banned' && !u.banned) return false;
+      if ((status === 'active' || status === 'normal') && u.banned) return false;
+      if (kw && !(kwMatch(u.username, kw) || kwMatch(u.nickname, kw) || kwMatch(u.grade, kw) || kwMatch(u.klass, kw) || kwMatch(u.bio, kw))) return false;
+      return true;
+    });
+    var sort = trim(o.sort) || 'points';
+    list.sort(function (a, b) {
+      if (sort === 'new') return round(b.createdAt, 0) - round(a.createdAt, 0);
+      if (sort === 'posts') return round(b.stats.posts, 0) - round(a.stats.posts, 0);
+      if (sort === 'name') return str(a.username) < str(b.username) ? -1 : 1;
+      if (sort === 'active') return round(b.lastLoginAt, 0) - round(a.lastLoginAt, 0);
+      return round(b.points, 0) - round(a.points, 0);
+    });
+    return paginate(list, o.page, o.size === undefined ? 20 : o.size);
+  }
+
+  /* ------------------------------------------------------------------ 版块 */
+  function listBoards() {
+    return snap().boards.slice().sort(function (a, b) {
+      var d = round(a.order, 99) - round(b.order, 99);
+      if (d) return d;
+      return str(a.group) < str(b.group) ? -1 : (str(a.group) > str(b.group) ? 1 : 0);
+    });
+  }
+  function getBoard(id) { return byId(snap().boards, id); }
+
+  function boardFeed(boardId) {
+    var b = getBoard(boardId);
+    if (!b) return { board: null, posts: [], hotTags: [] };
+    var list = snap().posts.filter(function (p) { return p.boardId === b.id && p.status === 'published'; });
+    list.sort(function (a, c) {
+      if (!!c.pinned !== !!a.pinned) return c.pinned ? 1 : -1;
+      return round(c.lastReplyAt, round(c.createdAt, 0)) - round(a.lastReplyAt, round(a.createdAt, 0));
+    });
+    var tags = {};
+    list.forEach(function (p) { arr(p.tags).forEach(function (t) { tags[t] = (tags[t] || 0) + 1; }); });
+    var hotTags = Object.keys(tags).map(function (t) { return { tag: t, count: tags[t] }; })
+      .sort(function (x, y) { return y.count - x.count; }).slice(0, 10);
+    return { board: b, posts: list.slice(0, 60), hotTags: hotTags };
+  }
+
+  function saveBoard(data) {
+    data = data || {};
+    var name = trim(data.name);
+    if (!name) return { ok: false, error: '版块名不能空着' };
+    if (name.length > 12) return { ok: false, error: '版块名最多 12 个字' };
+    if (!canManage()) return { ok: false, error: '只有版主和管理员能改版块' };
+    var r = syncCall('POST', '/admin/save', { type: 'board', data: data }, '正在保存…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      var item = (r.data && (r.data.item || r.data.board)) || null;
+      return { ok: true, board: item ? api().norm.board(item) : getBoard(data.id) };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var b = data.id ? getBoard(data.id) : null;
+      if (b) {
+        ['name', 'desc', 'icon', 'group', 'minRole'].forEach(function (k) { if (data[k] !== undefined) b[k] = trim(data[k]) || b[k]; });
+        if (data.order !== undefined) b.order = round(data.order, b.order);
+        if (data.locked !== undefined) b.locked = !!data.locked;
+      } else {
+        b = {
+          id: 'tmp-b' + now().toString(36), slug: '', name: name, desc: trim(data.desc),
+          icon: trim(data.icon) || 'comment', color: round(data.color, 0), group: trim(data.group) || '校园',
+          order: round(data.order, snap().boards.length + 1), minRole: trim(data.minRole) || 'student',
+          locked: !!data.locked, stats: { posts: 0, today: 0, followers: 0 }, createdAt: now()
+        };
+        snap().boards.push(b);
+      }
+      return { ok: true, board: b };
+    }, function () { return api().post('/admin/save', { type: 'board', data: data }); }, 'major');
+  }
+
+  function deleteBoard(id) {
+    var b = getBoard(id);
+    if (!b) return { ok: false, error: '版块不存在' };
+    var n = snap().posts.filter(function (p) { return p.boardId === str(id) && p.status !== 'deleted'; }).length;
+    if (n) return { ok: false, error: '「' + b.name + '」里还有 ' + n + ' 篇帖子，先搬走或删掉再删版块' };
+    if (!isAdmin()) return { ok: false, error: '只有超级管理员能删版块' };
+    var r = syncCall('POST', '/admin/delete', { type: 'board', id: str(id) }, '正在删除…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      S.boards = snap().boards.filter(function (x) { return x.id !== str(id); });
+      return { ok: true };
+    }, function () { return api().post('/admin/delete', { type: 'board', id: str(id) }); }, 'major');
+  }
+
+  function ensureBoard(name) {
+    var n = trim(name);
+    if (!n) return '';
+    var hit = snap().boards.filter(function (b) { return b.name === n; })[0];
+    if (hit) return hit.id;
+    var r = saveBoard({ name: n, desc: '新开的版块，还没写简介', icon: 'comment', group: '校园' });
+    return r.ok && r.board ? r.board.id : '';
+  }
+
+  /* ------------------------------------------------------------------ 帖子 */
+  function score(p) {
+    return round(p.likes, 0) * 4 + round(p.commentCount, 0) * 6 + Math.round(round(p.views, 0) / 8) + (p.featured ? 20 : 0);
+  }
+
+  function listPosts(o) {
+    o = o || {};
+    var status = o.status === undefined ? 'published' : trim(o.status);
+    var includeAll = status === '' || status === 'all';
+    var includeDeleted = !!o.includeDeleted;
+    var list = snap().posts.filter(function (p) {
+      if (p.status === 'deleted') { if (!includeDeleted) return false; }
+      else if (!includeAll && p.status !== status) return false;
+      if (o.boardId && p.boardId !== str(o.boardId)) return false;
+      if (o.authorId && p.authorId !== str(o.authorId)) return false;
+      if (o.tag && arr(p.tags).indexOf(o.tag) < 0) return false;
+      if (o.keyword) {
+        var kw = o.keyword;
+        if (!(kwMatch(p.title, kw) || kwMatch(p.content, kw) || arr(p.tags).join(' ').toLowerCase().indexOf(str(kw).toLowerCase()) >= 0)) return false;
+      }
+      return true;
+    });
+    var sort = trim(o.sort) || 'latest';
+    if (sort === 'essence') list = list.filter(function (p) { return p.featured; });
+    if (sort === 'unanswered') list = list.filter(function (p) { return round(p.commentCount, 0) === 0; });
+    list.sort(function (a, b) {
+      if (sort === 'hot') return score(b) - score(a);
+      if (sort === 'essence' || sort === 'unanswered') return round(b.createdAt, 0) - round(a.createdAt, 0);
+      if (!!b.pinned !== !!a.pinned) return b.pinned ? 1 : -1;
+      return round(b.lastReplyAt, round(b.createdAt, 0)) - round(a.lastReplyAt, round(a.createdAt, 0));
+    });
+    return paginate(list, o.page, o.size === undefined ? 12 : o.size);
+  }
+
+  /* 阅读计数由服务端负责：首次访问某帖时同步取一次详情（也顺带刷新技术字段） */
+  function getPost(id, opts) {
+    opts = opts || {};
+    var key = str(id);
+    if (!key) return null;
+    var wantView = opts.view !== false && !viewSeen[key];
+    if (wantView) {
+      viewSeen[key] = 1;
+      var r = syncCall('GET', '/posts/' + encodeURIComponent(key), null, '');
+      if (r && r.ok) {
+        var raw = (r.data && (r.data.post || r.data)) || null;
+        var remote = raw && raw.id !== undefined && api().norm ? api().norm.post(raw) : null;
+        if (remote) {
+          var i = -1;
+          for (var k = 0; k < snap().posts.length; k++) if (snap().posts[k].id === remote.id) i = k;
+          if (i >= 0) snap().posts[i] = remote; else snap().posts.push(remote);
+        }
+      } else if (!r || r.offline) {
+        var a = api();
+        if (a && a.get && online()) {
+          a.get('/posts/' + encodeURIComponent(key)).then(function (data) {
+            var raw2 = data && (data.post || data);
+            if (!raw2 || raw2.id === undefined || !api().norm) return;
+            var remote2 = api().norm.post(raw2);
+            var idx = -1;
+            for (var m = 0; m < snap().posts.length; m++) if (snap().posts[m].id === remote2.id) idx = m;
+            if (idx >= 0) snap().posts[idx] = remote2; else snap().posts.push(remote2);
+          }, function () { /* 计数失败不影响阅读 */ });
+        }
+      }
+    }
+    return byId(snap().posts, key);
+  }
+
+  function counts() {
+    var d = new Date(); d.setHours(0, 0, 0, 0);
+    var dayStart = d.getTime();
+    var total = 0, today = 0, tags = {};
+    snap().posts.forEach(function (p) {
+      if (p.status !== 'published') return;
+      total++;
+      if (round(p.createdAt, 0) >= dayStart) today++;
+      arr(p.tags).forEach(function (t) { tags[t] = (tags[t] || 0) + 1; });
+    });
+    var tagList = Object.keys(tags).map(function (t) { return { tag: t, count: tags[t] }; })
+      .sort(function (a, b) { return b.count - a.count; }).slice(0, 12);
+    return { total: Math.max(total, round(snap().meta && snap().meta.totalPosts, 0)), today: today, tags: tagList };
+  }
+
+  function hotPosts(n) {
+    n = n === undefined ? 6 : n;
+    return snap().posts.filter(function (p) { return p.status === 'published'; })
+      .sort(function (a, b) { return score(b) - score(a); }).slice(0, n);
+  }
+  function featuredPosts(n) {
+    n = n === undefined ? 3 : n;
+    return snap().posts.filter(function (p) { return p.status === 'published' && p.featured; })
+      .sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); }).slice(0, n);
+  }
+
+  function normTags(tags) {
+    var out = [];
+    arr(tags).forEach(function (t) {
+      var x = trim(t).replace(/^#/, '').slice(0, 8);
+      if (x && out.indexOf(x) < 0 && out.length < 5) out.push(x);
+    });
+    return out;
+  }
+  function sensitiveHit(text) {
+    var words = getSettings().sensitiveWords || [];
+    var s = str(text);
+    for (var i = 0; i < words.length; i++) {
+      if (words[i] && s.toLowerCase().indexOf(str(words[i]).toLowerCase()) >= 0) return words[i];
+    }
+    return '';
+  }
+
+  /* 给"会造成重复内容"的写操作加防重：**发帖 / 发评论**。
+     只在这两处加锁的原因：
+       · 用户实测报过"点一次发布 → 帖子发了两篇"，这是必须修的。
+       · 其它写操作（保存资料 / 点歌 / 收藏 / 私信）要么是幂等的，要么
+         "重复调用"本身就是正常业务（例如同一首歌再点一次应当由服务端
+         返回 409 中文提示），加锁反而会把正确的错误提示吞掉。
+     重复调用返回一个明确的失败结果：既不会重复写服务器，也不骗调用方。 */
+  var inFlight = {};
+  function dupGuard(key) {
+    if (Object.prototype.hasOwnProperty.call(inFlight, key)) return true;
+    inFlight[key] = true;
+    setTimeout(function () { delete inFlight[key]; }, 0);
+    return false;
+  }
+  var DUP_KEYS = {
+    createPost: function (d) { d = d || {}; return 'post:' + String(d.boardId || '') + ':' + String(d.title || '') + ':' + String(d.content || '').slice(0, 60); },
+    addComment: function (d) { d = d || {}; return 'comment:' + String(d.postId || d.post || '') + ':' + String(d.content || '').slice(0, 80); }
+  };
+  function guardWrites(obj) {
+    Object.keys(DUP_KEYS).forEach(function (name) {
+      var orig = obj[name];
+      if (typeof orig !== 'function') return;
+      obj[name] = function (d) {
+        if (dupGuard(DUP_KEYS[name](d))) {
+          return { ok: false, duplicate: true, error: '刚提交过一次，别重复点' };
+        }
+        return orig.apply(this, arguments);
+      };
+    });
+  }
+
+  function createPost(d) {
+    d = d || {};
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录再发帖' };
+    if (me.banned) return { ok: false, error: '账号被封了，先找管理员' };
+    var title = trim(d.title), content = trim(d.content);
+    if (title.length < 4) return { ok: false, error: '标题至少 4 个字' };
+    if (title.length > 60) return { ok: false, error: '标题最多 60 个字' };
+    if (content.length < 10) return { ok: false, error: '正文至少 10 个字' };
+    var hit = sensitiveHit(title + ' ' + content);
+    if (hit) return { ok: false, error: '有敏感词「' + hit + '」，改一下再发' };
+    var ck = canPost();
+    if (!ck.ok) return { ok: false, error: ck.msg };
+    var boardId = trim(d.boardId);
+    if (!boardId && trim(d.boardName)) boardId = ensureBoard(d.boardName);
+    if (!boardId) return { ok: false, error: '选一个版块' };
+    var board = getBoard(boardId);
+    if (!board) return { ok: false, error: '这个版块没了，刷新一下' };
+    if (board.locked && !canManage()) return { ok: false, error: '「' + board.name + '」是只读版块，只有版主能发' };
+    var payload = { boardId: boardId, title: title, content: content, tags: normTags(d.tags), images: arr(d.images).slice(0, 9) };
+
+    /* 防重：同一个人、同一个标题+正文，1.2 秒内只发一次 */
+    if (dupGuard('post:' + me.id + ':' + title + '\u0000' + content)) {
+      var dup = snap().posts.filter(function (p) { return p.authorId === str(me.id) && p.title === title; })[0];
+      return dup ? { ok: true, post: dup, pending: dup.status === 'pending' } : { ok: false, error: '刚发过一次了，别重复点' };
+    }
+
+    var r = syncCall('POST', '/posts', payload, '正在发布…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      var res = syncDone(r, 'major');
+      var item = (r.data && (r.data.post || r.data)) || null;
+      var post = item && item.id !== undefined && api().norm ? api().norm.post(item) : null;
+      if (post) {
+        var exist = byId(snap().posts, post.id);
+        if (exist) post = exist; else snap().posts.unshift(post);
+      } else {
+        post = snap().posts.filter(function (p) { return p.authorId === str(me.id); })
+          .sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); })[0] || null;
+      }
+      if (!post) return { ok: false, error: '发出去了，但没读到这篇帖子，刷新一下看看' };
+      return { ok: true, post: post, pending: post.status === 'pending' };
+    }
+    if (!online()) return offlineResult();
+
+    /* 乐观通道：先插到内存，再异步发，失败回滚 */
+    var status = getSettings().needAudit && !canManage() ? 'pending' : 'published';
+    var ghost = {
+      id: 'tmp-p' + now().toString(36), boardId: boardId, authorId: str(me.id), title: title, content: content,
+      tags: payload.tags, images: payload.images, createdAt: now(), updatedAt: now(),
+      pinned: false, featured: false, locked: false, status: status, rejectReason: '',
+      views: 0, likes: 0, favorites: 0, commentCount: 0, lastReplyAt: now(), likedBy: [], favBy: []
+    };
+    return optimistic(function () {
+      snap().posts.unshift(ghost);
+      var b = getBoard(boardId);
+      if (b && status === 'published') { b.stats.posts = round(b.stats.posts, 0) + 1; b.stats.today = round(b.stats.today, 0) + 1; }
+      return { ok: true, post: ghost, pending: status === 'pending' };
+    }, function () { return api().post('/posts', payload); }, 'major');
+  }
+
+  function updatePost(id, patch) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录' };
+    var p = byId(snap().posts, id);
+    if (!p) return { ok: false, error: '帖子不存在' };
+    if (p.authorId !== str(me.id) && !canManage()) return { ok: false, error: '只有作者本人或版主能改' };
+    patch = patch || {};
+    var title = patch.title === undefined ? p.title : trim(patch.title);
+    var content = patch.content === undefined ? p.content : trim(patch.content);
+    if (title.length < 4) return { ok: false, error: '标题至少 4 个字' };
+    if (content.length < 10) return { ok: false, error: '正文至少 10 个字' };
+    var hit = sensitiveHit(title + ' ' + content);
+    if (hit) return { ok: false, error: '有敏感词「' + hit + '」，改一下再提交' };
+    var payload = {
+      title: title, content: content,
+      tags: patch.tags === undefined ? p.tags : normTags(patch.tags),
+      images: patch.images === undefined ? p.images : arr(patch.images).slice(0, 9),
+      boardId: patch.boardId === undefined ? p.boardId : trim(patch.boardId)
+    };
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var t = byId(snap().posts, id);
+      if (t) { Object.keys(payload).forEach(function (k) { t[k] = payload[k]; }); t.updatedAt = now(); }
+      return { ok: true, post: t };
+    }, function () { return api().put('/posts/' + encodeURIComponent(str(id)), payload); }, 'major');
+  }
+
+  function deletePost(id) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录' };
+    var p = byId(snap().posts, id);
+    if (!p) return { ok: false, error: '帖子不存在' };
+    if (p.authorId !== str(me.id) && !canManage()) return { ok: false, error: '只有作者本人或版主能删' };
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var t = byId(snap().posts, id);
+      if (t) t.status = 'deleted';
+      snap().comments.forEach(function (c) { if (c.postId === str(id) && c.status === 'published') c.status = 'hidden'; });
+      return { ok: true };
+    }, function () { return api().del('/posts/' + encodeURIComponent(str(id))); }, 'major');
+  }
+
+  function toggleLike(postId) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录再点赞' };
+    var p = byId(snap().posts, postId);
+    if (!p) return { ok: false, error: '帖子不存在' };
+    var liked = arr(p.likedBy).indexOf(str(me.id)) >= 0;
+    return optimistic(function () {
+      var t = byId(snap().posts, postId);
+      t.likedByMe = !liked;
+      t.likedBy = liked ? [] : [str(me.id)];
+      t.likes = Math.max(0, round(t.likes, 0) + (liked ? -1 : 1));
+      return { ok: true, liked: !liked, likes: t.likes };
+    }, function () { return api().post('/posts/' + encodeURIComponent(str(postId)) + '/like', {}); }, 'minor');
+  }
+
+  function toggleFavorite(postId) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录再收藏' };
+    var p = byId(snap().posts, postId);
+    if (!p) return { ok: false, error: '帖子不存在' };
+    var faved = arr(p.favBy).indexOf(str(me.id)) >= 0;
+    return optimistic(function () {
+      var t = byId(snap().posts, postId);
+      var u = getUser(me.id);
+      t.favedByMe = !faved;
+      t.favBy = faved ? [] : [str(me.id)];
+      t.favorites = Math.max(0, round(t.favorites, 0) + (faved ? -1 : 1));
+      if (u) {
+        u.favorites = arr(u.favorites).filter(function (x) { return x !== str(postId); });
+        if (!faved) u.favorites.push(str(postId));
+      }
+      return { ok: true, faved: !faved, favorites: t.favorites };
+    }, function () { return api().post('/posts/' + encodeURIComponent(str(postId)) + '/favorite', {}); }, 'minor');
+  }
+
+  function favoritePosts(userId) {
+    var u = userId ? getUser(userId) : currentUser();
+    if (!u) return [];
+    var ids = arr(u.favorites);
+    return snap().posts.filter(function (p) { return ids.indexOf(p.id) >= 0 && p.status === 'published'; })
+      .sort(function (a, b) { return ids.indexOf(a.id) - ids.indexOf(b.id); });
+  }
+
+  /* ------------------------------------------------------------------ 评论 */
+  function countComments(postId) {
+    var key = str(postId);
+    var n = 0;
+    snap().comments.forEach(function (c) {
+      if (c.postId === key && c.status !== 'deleted' && c.status !== 'hidden') n++;
+    });
+    return n;
+  }
+
+  function listComments(postId, o) {
+    o = o || {};
+    var key = str(postId);
+    var me = currentUser();
+    var list = snap().comments.filter(function (c) {
+      if (c.postId !== key || c.parentId) return false;
+      if (c.status === 'deleted') return false;
+      if (c.status === 'hidden' && !(canManage() || (me && c.authorId === str(me.id)))) return false;
+      return true;
+    });
+    var sort = trim(o.sort) || 'old';
+    list.sort(function (a, b) {
+      if (sort === 'hot') {
+        if (round(b.likes, 0) !== round(a.likes, 0)) return round(b.likes, 0) - round(a.likes, 0);
+        return round(a.createdAt, 0) - round(b.createdAt, 0);
+      }
+      return round(a.createdAt, 0) - round(b.createdAt, 0);
+    });
+    return paginate(list, o.page, o.size === undefined ? 50 : o.size);
+  }
+
+  function listReplies(parentId) {
+    var key = str(parentId);
+    return snap().comments.filter(function (c) { return c.parentId === key && c.status === 'published'; })
+      .sort(function (a, b) { return round(a.createdAt, 0) - round(b.createdAt, 0); });
+  }
+
+  function getComment(id) { return byId(snap().comments, id); }
+
+  function addComment(d) {
+    d = d || {};
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录再回复' };
+    if (me.banned) return { ok: false, error: '账号被封了，没法回复' };
+    var postId = str(d.postId);
+    var p = byId(snap().posts, postId);
+    if (!p || p.status === 'deleted') return { ok: false, error: '帖子不见了' };
+    if (p.locked && !canManage()) return { ok: false, error: '这帖锁了，暂时不能回复' };
+    var content = trim(d.content);
+    if (content.length < 2) return { ok: false, error: '至少写 2 个字' };
+    if (content.length > 500) return { ok: false, error: '一条评论最多 500 字' };
+    var hit = sensitiveHit(content);
+    if (hit) return { ok: false, error: '有敏感词「' + hit + '」，改一下再发' };
+    var parentId = d.parentId ? str(d.parentId) : '';
+    var parent = parentId ? byId(snap().comments, parentId) : null;
+    if (parentId && !parent) return { ok: false, error: '要回复的那条评论没了' };
+    var payload = { content: content, parentId: parentId || null };
+
+    var r = syncCall('POST', '/posts/' + encodeURIComponent(postId) + '/comments', payload, '正在发送…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncDone(r, 'major');
+      var raw = (r.data && (r.data.comment || r.data)) || null;
+      var c = raw && raw.id !== undefined && api().norm ? api().norm.comment(raw) : null;
+      if (c) {
+        var exist = byId(snap().comments, c.id);
+        if (exist) c = exist; else snap().comments.push(c);
+      } else {
+        c = snap().comments.filter(function (x) { return x.postId === postId && x.authorId === str(me.id); })
+          .sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); })[0] || null;
+      }
+      if (!c) return { ok: false, error: '发出去了，但没读到这条评论，刷新一下' };
+      return { ok: true, comment: c };
+    }
+    if (!online()) return offlineResult();
+
+    var ghost = {
+      id: 'tmp-c' + now().toString(36), postId: postId, parentId: parent ? parent.id : null,
+      authorId: str(me.id), content: content, createdAt: now(), status: 'published',
+      likes: 0, likedBy: [], likedByMe: false,
+      replyToName: parent ? ((getUser(parent.authorId) || {}).nickname || '') : '', isAdmin: isAdmin()
+    };
+    return optimistic(function () {
+      snap().comments.push(ghost);
+      var t = byId(snap().posts, postId);
+      if (t) { t.commentCount = round(t.commentCount, 0) + 1; t.lastReplyAt = now(); }
+      return { ok: true, comment: ghost };
+    }, function () { return api().post('/posts/' + encodeURIComponent(postId) + '/comments', payload); }, 'major');
+  }
+
+  function deleteComment(id) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录' };
+    var c = byId(snap().comments, id);
+    if (!c) return { ok: false, error: '评论不存在' };
+    if (c.authorId !== str(me.id) && !canManage()) return { ok: false, error: '只有本人或版主能删' };
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var t = byId(snap().comments, id);
+      if (t) t.status = 'deleted';
+      snap().comments.forEach(function (x) { if (x.parentId === str(id) && x.status === 'published') x.status = 'hidden'; });
+      var p = byId(snap().posts, c.postId);
+      if (p) p.commentCount = countComments(c.postId);
+      return { ok: true };
+    }, function () { return api().del('/comments/' + encodeURIComponent(str(id))); }, 'major');
+  }
+
+  function toggleCommentLike(id) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录再点赞' };
+    var c = byId(snap().comments, id);
+    if (!c) return { ok: false, error: '评论不存在' };
+    var liked = arr(c.likedBy).indexOf(str(me.id)) >= 0;
+    return optimistic(function () {
+      var t = byId(snap().comments, id);
+      t.likedByMe = !liked;
+      t.likedBy = liked ? [] : [str(me.id)];
+      t.likes = Math.max(0, round(t.likes, 0) + (liked ? -1 : 1));
+      return { ok: true, liked: !liked, likes: t.likes };
+    }, function () { return api().post('/comments/' + encodeURIComponent(str(id)) + '/like', {}); }, 'minor');
+  }
+
+  /* ------------------------------------------------------------ 通知 / 私信 */
+  function myMessages() {
+    var id = meId();
+    if (!id) return [];
+    return snap().notifications.filter(function (m) { return m.userId === id; });
+  }
+
+  function listMessages(o) {
+    o = o || {};
+    var box = trim(o.box) || 'inbox';
+    var list = myMessages().filter(function (m) {
+      if (box === 'system') return m.type === 'system';
+      return m.type !== 'system';
+    });
+    var rd = o.read;
+    if (rd === true || rd === 'true' || rd === 'read') list = list.filter(function (m) { return !!m.read; });
+    else if (rd === false || rd === 'false' || rd === 'unread') list = list.filter(function (m) { return !m.read; });
+    list.sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); });
+    return paginate(list, o.page, o.size === undefined ? 20 : o.size);
+  }
+
+  function unreadCount() { return myMessages().filter(function (m) { return !m.read; }).length; }
+
+  function markRead(id) {
+    var me = currentUser();
+    if (!me) return;
+    var target = (id === undefined || id === null || id === '') ? '' : str(id);
+    if (target && !byId(snap().notifications, target)) return;
+    optimistic(function () {
+      snap().notifications.forEach(function (m) {
+        if (m.userId !== str(me.id)) return;
+        if (!target || m.id === target) m.read = true;
+      });
+      return { ok: true };
+    }, function () { return api().post('/notifications/read', target ? { id: target } : {}); }, 'minor');
+  }
+
+  function sendMessage(d) {
+    d = d || {};
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录再发私信' };
+    var raw = trim(d.to);
+    var rawId = trim(d.toId);
+    if (!raw && !rawId) return { ok: false, error: '选一位同学，或者填上用户名/昵称' };
+    /* 收件人只在本地做"别发给自己"这一道提示；**存在性一律交给服务端**。
+       原因：内存快照里通常没有别的同学（快照只带一部分人），
+       以前在这里 get 不到就直接说"找不到这个人"，导致私信看起来完全不能发。 */
+    var local = rawId ? getUser(rawId) : (raw ? (getUser(raw) || findUserByUsername(raw)) : null);
+    if (local && str(local.id) === str(me.id)) return { ok: false, error: '不能给自己发私信' };
+    var title = trim(d.title), body = trim(d.body);
+    if (!title && !body) return { ok: false, error: '写点内容再发' };
+    var payload = { to: raw, toId: rawId, title: title || '（没有主题）', body: body };
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      snap().notifications.unshift({
+        id: 'tmp-m' + now().toString(36), userId: (local && local.id) || rawId, type: 'pm', fromId: str(me.id),
+        title: payload.title, body: body, link: '#/messages', read: true, createdAt: now()
+      });
+      return { ok: true };
+    }, function () { return api().post('/notifications/send', payload); }, 'minor');
+  }
+
+  function conversations() {
+    var id = meId();
+    if (!id) return [];
+    var map = {};
+    snap().notifications.forEach(function (m) {
+      if (m.type !== 'pm') return;
+      var other = m.userId === id ? m.fromId : (m.fromId === id ? m.userId : '');
+      if (!other || other === id) return;
+      if (!map[other]) map[other] = { userId: other, last: m, unread: 0 };
+      if (round(m.createdAt, 0) > round(map[other].last.createdAt, 0)) map[other].last = m;
+      if (m.userId === id && !m.read) map[other].unread++;
+    });
+    return Object.keys(map).map(function (k) {
+      return { userId: k, user: getUser(k), last: map[k].last, unread: map[k].unread };
+    }).sort(function (a, b) { return round(b.last.createdAt, 0) - round(a.last.createdAt, 0); });
+  }
+
+  /* 本地通知（没有服务端接口，仅用于本地即时提示，不落库） */
+  function notify(o) {
+    o = o || {};
+    var m = {
+      id: 'local-m' + now().toString(36), userId: str(o.userId), type: str(o.type) || 'system',
+      fromId: str(o.fromId) || meId(), title: str(o.title) || '通知', body: str(o.body) || '',
+      link: str(o.link), read: false, createdAt: now()
+    };
+    if (o.userId) snap().notifications.unshift(m);
+    return m;
+  }
+
+  /* ------------------------------------------------------ 公告 / 举报 / 站务 */
+  function listNotices(limit) {
+    var list = snap().notices.slice().sort(function (a, b) {
+      if (!!b.top !== !!a.top) return b.top ? 1 : -1;
+      return round(b.createdAt, 0) - round(a.createdAt, 0);
+    });
+    return limit === undefined ? list : list.slice(0, Math.max(0, round(limit, 0)));
+  }
+  function getNotice(id) { return byId(snap().notices, id); }
+
+  function saveNotice(d) {
+    d = d || {};
+    var title = trim(d.title), content = trim(d.content);
+    if (title.length < 4) return { ok: false, error: '公告标题至少 4 个字' };
+    if (content.length < 10) return { ok: false, error: '公告正文至少 10 个字' };
+    if (!canManage()) return { ok: false, error: '只有版主和管理员能发公告' };
+    var data = { title: title, content: content, level: trim(d.level) || 'info', top: !!d.top };
+    if (d.id) data.id = d.id;
+    var r = syncCall('POST', '/admin/save', { type: 'notice', data: data }, '正在保存…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      var item = (r.data && r.data.item) || null;
+      return { ok: true, notice: item && api().norm ? api().norm.notice(item) : getNotice(data.id) };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var list = snap().notices;
+      if (data.id) {
+        var n = byId(list, data.id);
+        if (n) { n.title = data.title; n.content = data.content; n.level = data.level; n.top = data.top; }
+        return { ok: true, notice: n };
+      }
+      var fresh = {
+        id: 'tmp-n' + now().toString(36), title: data.title, content: data.content,
+        level: data.level, top: data.top, authorId: meId(), createdAt: now()
+      };
+      list.unshift(fresh);
+      return { ok: true, notice: fresh };
+    }, function () { return api().post('/admin/save', { type: 'notice', data: data }); }, 'major');
+  }
+
+  function deleteNotice(id) {
+    if (!canManage()) return { ok: false, error: '只有版主和管理员能删公告' };
+    var r = syncCall('POST', '/admin/delete', { type: 'notice', id: str(id) }, '正在删除…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      S.notices = snap().notices.filter(function (x) { return x.id !== str(id); });
+      return { ok: true };
+    }, function () { return api().post('/admin/delete', { type: 'notice', id: str(id) }); }, 'major');
+  }
+
+  function addReport(d) {
+    d = d || {};
+    var me = currentUser();
+    if (!me) return { ok: false, error: '先登录再举报' };
+    var type = trim(d.targetType) || 'post';
+    if (['post', 'comment', 'user'].indexOf(type) < 0) return { ok: false, error: '举报对象类型不对' };
+    var targetId = str(d.targetId);
+    var reason = trim(d.reason);
+    if (!targetId) return { ok: false, error: '举报对象不见了' };
+    if (!reason) return { ok: false, error: '写一下举报理由' };
+    var dup = snap().reports.filter(function (r) { return r.reporterId === str(me.id) && r.targetId === targetId && r.status === 'pending'; });
+    if (dup.length) return { ok: false, error: '这条你已经举报过了，我们在处理' };
+    var payload = { targetType: type, targetId: targetId, reason: reason, detail: trim(d.detail) };
+    var r = syncCall('POST', '/reports', payload, '正在提交…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      afterWrite('minor');
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      snap().reports.unshift({
+        id: 'tmp-r' + now().toString(36), targetType: type, targetId: targetId, reporterId: str(me.id),
+        reason: reason, detail: trim(d.detail), status: 'pending', createdAt: now(),
+        handledBy: '', handledAt: 0, handleNote: ''
+      });
+      return { ok: true };
+    }, function () { return api().post('/reports', payload); }, 'minor');
+  }
+
+  function listReports(o) {
+    o = o || {};
+    var status = trim(o.status);
+    var list = snap().reports.filter(function (r) { return !status || r.status === status; })
+      .sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); });
+    return paginate(list, o.page, o.size === undefined ? 20 : o.size);
+  }
+
+  function handleReport(id, status, note) {
+    if (!canManage()) return { ok: false, error: '只有版主和管理员能处理举报' };
+    var st = trim(status);
+    if (st !== 'resolved' && st !== 'rejected') return { ok: false, error: '处理结果只能是 resolved 或 rejected' };
+    var r0 = byId(snap().reports, id);
+    if (!r0) return { ok: false, error: '这条举报不存在' };
+    var action = st === 'resolved' ? 'resolve' : 'reject';
+    var payload = { type: 'report', ids: [str(id)], action: action, note: trim(note), handleNote: trim(note) };
+    var r = syncCall('POST', '/admin/batch', payload, '正在处理…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var t = byId(snap().reports, id);
+      if (t) { t.status = st; t.handledBy = meId(); t.handledAt = now(); t.handleNote = trim(note); }
+      return { ok: true };
+    }, function () { return api().post('/admin/batch', payload); }, 'major');
+  }
+
+  function saveSettings(patch) {
+    patch = patch || {};
+    if (!isAdmin()) return { ok: false, error: '只有超级管理员能改站点设置' };
+    var payload = {};
+    Object.keys(patch).forEach(function (k) {
+      var v = patch[k];
+      if (v === undefined) return;
+      if (k === 'sensitiveWords') payload[k] = Array.isArray(v) ? v.join(',') : str(v);
+      else if (v === true || v === false) payload[k] = v ? '1' : '0';
+      else payload[k] = v;
+    });
+    var r = syncCall('POST', '/admin/settings', { patch: payload }, '正在保存…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      settingsCache = null;
+      return { ok: true, settings: getSettings() };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var cur = Object.assign({}, snap().settings);
+      Object.keys(payload).forEach(function (k) { cur[k] = payload[k]; });
+      S.settings = cur;
+      settingsCache = null;
+      return { ok: true, settings: getSettings() };
+    }, function () { return api().post('/admin/settings', { patch: payload }); }, 'major');
+  }
+
+  function search(keyword, type) {
+    type = trim(type) || 'all';
+    var kw = trim(keyword);
+    var out = { posts: [], users: [], boards: [] };
+    if (!kw) return out;
+    if (type === 'all' || type === 'post') {
+      out.posts = snap().posts.filter(function (p) {
+        return p.status === 'published' && (kwMatch(p.title, kw) || kwMatch(p.content, kw) || arr(p.tags).join(' ').indexOf(kw) >= 0);
+      }).sort(function (a, b) { return score(b) - score(a); }).slice(0, 30);
+    }
+    if (type === 'all' || type === 'user') {
+      out.users = snap().users.filter(function (u) {
+        return !u.banned && (kwMatch(u.username, kw) || kwMatch(u.nickname, kw) || kwMatch(u.bio, kw) || kwMatch(u.grade, kw) || kwMatch(u.klass, kw));
+      }).sort(function (a, b) { return round(b.points, 0) - round(a.points, 0); }).slice(0, 30);
+    }
+    if (type === 'all' || type === 'board') {
+      out.boards = snap().boards.filter(function (b) { return kwMatch(b.name, kw) || kwMatch(b.desc, kw) || kwMatch(b.group, kw); }).slice(0, 30);
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------------ 每周点歌投票
+   * 规则（服务端已生效，前端照抄提示语）：中午 3 首 / 晚上 3 首；每人每天每时段最多 3 票；
+   * 同一周同一时段同名同歌手只能点一次；点歌会自动在「听歌点歌」版块生成一篇帖子。
+   * 缓存按 slot 各存一份（一周内够用），songsWeek 同步返回缓存 + 后台刷新。 */
+  var songCache = {};        // slot -> 归一化后的后端 data（多了 at 字段：最后一次刷新时间）
+  var songSubs = [];         // onSongsChange 订阅者
+  var songInflight = {};     // 去重：同一 slot 同时只拉一次
+  var songSeq = {};          // slot -> 已发出的请求序号
+  var songApplied = {};      // slot -> 已落地的最新序号（防止旧响应盖掉新数据）
+  var SONG_FRESH_MS = 3000;
+
+  /* 请求序号：后发的赢。写操作（点歌/投票/定歌单）用 claimSongsLocal 直接占住最新，
+     这样「投票前发出的那次 GET」回来时不会把票数又抹回去。 */
+  function claimSongs(key) {
+    songSeq[key] = (songSeq[key] || 0) + 1;
+    return songSeq[key];
+  }
+  function claimSongsLocal(key) {
+    songSeq[key] = (songSeq[key] || 0) + 1;
+    songApplied[key] = songSeq[key];
+    return songSeq[key];
+  }
+  function acceptSongs(key, my) {
+    if (my < (songApplied[key] || 0)) return false;
+    songApplied[key] = my;
+    return true;
+  }
+
+  function normSlot(s) { return trim(s) === 'evening' ? 'evening' : 'noon'; }
+  function slotLabel(s) { return normSlot(s) === 'evening' ? '晚上' : '中午'; }
+
+  function emptySongs(slot, week) {
+    return {
+      weekKey: trim(week), slot: normSlot(slot), list: [], top: [],
+      myVotesUsed: 0, votesLeft: 0, limitPerDay: 3, pickCount: 3,
+      /* 投稿窗口默认值：开着，但没有截止时间（页面会显示"稍后刷新"而不是空括号） */
+      submitOpen: true, submitCloseAt: 0, submitLeftMs: 0, submitEndedEarly: false, closedAt: 0,
+      weekStart: 0, weekEnd: 0,
+      canManage: canManage(), at: 0, error: ''
+    };
+  }
+
+  function normSong(s) {
+    if (!s || typeof s !== 'object') return null;
+    return {
+      id: str(s.id), weekKey: str(s.weekKey), slot: normSlot(s.slot),
+      title: str(s.title), artist: str(s.artist), link: str(s.link), note: str(s.note),
+      userId: str(s.userId), nickname: str(s.nickname),
+      votes: round(s.votes, 0), picked: !!s.picked, createdAt: round(s.createdAt, 0),
+      dayOfWeek: round(s.dayOfWeek, 0),          /* 0=都行，1~5=周一~周五 */
+      postId: str(s.postId), votedByMe: !!s.votedByMe
+    };
+  }
+  function sortSongs(list) {
+    return list.slice().sort(function (a, b) {
+      if (round(b.votes, 0) !== round(a.votes, 0)) return round(b.votes, 0) - round(a.votes, 0);
+      return round(a.createdAt, 0) - round(b.createdAt, 0);
+    });
+  }
+  function normSongsData(d, slot, week) {
+    d = d && typeof d === 'object' ? d : {};
+    var out = emptySongs(d.slot || slot, d.weekKey || week);
+    var list = sortSongs(arr(d.list).map(normSong).filter(Boolean));
+    out.weekKey = str(d.weekKey || week);
+    out.list = list;
+    out.top = arr(d.top).map(normSong).filter(Boolean);
+    if (!out.top.length) out.top = list.slice(0, out.pickCount);
+    out.myVotesUsed = round(d.myVotesUsed, 0);
+    out.votesLeft = round(d.votesLeft, 0);
+    out.limitPerDay = round(d.limitPerDay, 3) || 3;
+    out.pickCount = round(d.pickCount, 3) || 3;
+    out.canManage = d.canManage !== undefined ? !!d.canManage : canManage();
+    /* 投稿窗口：周日中午 12:00 截止；管理员可以提前结束。
+       这几个字段必须原样带出去，否则页面上的"还剩多久 / 已截止"就是空的。 */
+    out.submitOpen = d.submitOpen !== undefined ? !!d.submitOpen : true;
+    out.submitCloseAt = round(d.submitCloseAt, 0);
+    out.submitLeftMs = round(d.submitLeftMs, 0);
+    out.submitEndedEarly = !!d.submitEndedEarly;
+    out.closedAt = round(d.closedAt, 0);
+    /* 这一轮对应哪个周的周一到周五（页面显示"本周 10月5日–10月9日"） */
+    out.weekStart = round(d.weekStart, 0);
+    out.weekEnd = round(d.weekEnd, 0);
+    out.at = now();
+    out.error = '';
+    return out;
+  }
+  function putSongs(slot, data) {
+    var key = normSlot(slot);
+    songCache[key] = data;
+    return songCache[key];
+  }
+  function putSongsLocal(slot, data) {
+    claimSongsLocal(normSlot(slot));
+    return putSongs(slot, data);
+  }
+
+  function notifySongs(slot, data) {
+    var list = songSubs.slice();
+    for (var i = 0; i < list.length; i++) {
+      try { list[i](slot, data); } catch (e) { /* 订阅者异常不影响主流程 */ }
+    }
+    if (!list.length) {
+      try { if (TF.app && TF.app.refresh) TF.app.refresh(); } catch (e) { /* 忽略 */ }
+    }
+  }
+
+  /* 后台拉一次（异步，不阻塞渲染）；失败保留旧缓存并打标，避免「失败→重渲染→再拉」死循环 */
+  function fetchSongs(slot, week, force, cb) {
+    var key = normSlot(slot);
+    var hit = songCache[key];
+    if (!force && hit && now() - round(hit.at, 0) < SONG_FRESH_MS) return;
+    if (songInflight[key]) return;
+    var a = api();
+    if (!a || !a.songs || !a.songs.get) return;
+    songInflight[key] = 1;
+    var my = claimSongs(key);
+    var p = null;
+    try { p = a.songs.get({ slot: key, week: trim(week) }); } catch (e) { p = null; }
+    if (!p || !p.then) { songInflight[key] = 0; return; }
+    p.then(function (data) {
+      songInflight[key] = 0;
+      if (!acceptSongs(key, my)) return;        // 期间有更新的数据落地了，丢弃这次旧响应
+      var out = putSongs(key, normSongsData(data, key, week));
+      notifySongs(key, out);
+      if (cb) cb(out);
+    }, function (e) {
+      songInflight[key] = 0;
+      if (my < (songApplied[key] || 0)) return;
+      var fallback = songCache[key] || emptySongs(key, week);
+      fallback.error = (e && (e.error || e.message)) || '点歌数据没拉到';
+      fallback.at = now();                      // 记时间，避免反复重试打转
+      putSongs(key, fallback);
+      notifySongs(key, fallback);
+      if (cb) cb(fallback);
+    });
+  }
+
+  /* 同步刷一次（点歌成功后立刻要新歌单；浏览器同步通道可用时） */
+  function refreshSongsSync(slot, week) {
+    var a = api();
+    if (!a || !a.songs || !canSync()) return null;
+    var key = normSlot(slot);
+    var my = claimSongs(key);
+    var r = syncCall('GET', '/songs' + a.buildQuery({ slot: key, week: trim(week) }), null, '');
+    if (!r || !r.ok) return null;
+    if (!acceptSongs(key, my)) return songCache[key] || null;
+    return putSongs(key, normSongsData(r.data, key, week));
+  }
+
+  /* 读：同步返回缓存（无缓存则空结构），同时在后台刷新一次 */
+  function songsWeek(o) {
+    o = o || {};
+    var key = normSlot(o.slot);
+    var week = trim(o.week);
+    fetchSongs(key, week, false);
+    var hit = songCache[key];
+    if (hit && (!week || !hit.weekKey || hit.weekKey === week)) return hit;
+    return hit || emptySongs(key, week);
+  }
+
+  /* 点歌：同步通道（页面要立刻拿到 song/postId 和中文错误） */
+  /* 删一首点歌（管理员及以上；负责该版块的版主也可以）。服务端校验权限。 */
+  function deleteSong(id) {
+    var a = api();
+    if (!a || !a.deleteSong) return { ok: false, error: '这个功能还没上线' };
+    var me = currentUser();
+    if (!me) return { ok: false, error: '登录之后才能操作' };
+    var r = syncCall('DELETE', '/songs/' + encodeURIComponent(str(id)), null, '正在删除…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      refreshSongsSync('noon', '');
+      refreshSongsSync('evening', '');
+      syncDone(r, 'major');
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return { ok: false, error: '没删掉，再试一次' };
+  }
+
+  /* 管理员 / 版主：提前结束（或重新开放）本周投稿 */
+  function closeSongWeek(reopen) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '登录之后才能操作' };
+    if (!(me.role === 'admin' || me.role === 'mod')) return { ok: false, error: '只有管理员和版主能结束本周投稿' };
+    var r = syncCall('POST', '/admin/songs/close', { reopen: !!reopen }, reopen ? '正在重新开放…' : '正在结束投稿…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      /* 榜单上两个时段都要重拉，因为"是否已结束"是整周共享的 */
+      refreshSongsSync('noon', '');
+      refreshSongsSync('evening', '');
+      syncDone(r, 'minor');
+      return { ok: true, closed: !!(r.data && r.data.closed) };
+    }
+    if (!online()) return offlineResult();
+    return { ok: false, error: '没成功，再试一次' };
+  }
+
+  /* ============================================================ 当周歌单
+   * 排歌单要走外部大模型，可能十几秒，所以**不**放在同步通道里：
+   * 页面用 store.generatePlaylist(cb) 拿异步结果。 */
+  var playlistCache = { at: 0, week: '', data: null };
+  function playlistData() { return playlistCache.data; }
+  function refreshPlaylist(cb) {
+    var a = api();
+    if (!a || !a.playlist || !canSync()) { if (cb) cb(null); return null; }
+    a.playlist.get({}).then(function (d) {
+      if (d && d.playlist !== undefined) {
+        playlistCache = { at: now(), data: d };
+        notifySync('songs');
+        if (cb) cb(d);
+      } else if (cb) cb(null);
+    }, function () { if (cb) cb(null); });
+    return playlistCache.data;
+  }
+  function generatePlaylist(opts, cb) {
+    var a = api();
+    opts = opts || {};
+    if (typeof opts === 'function') { cb = opts; opts = {}; }
+    if (!a || !a.playlist) { if (cb) cb({ ok: false, error: '这个功能还没上线' }); return; }
+    var me = currentUser();
+    if (!me) { if (cb) cb({ ok: false, error: '登录之后才能操作' }); return; }
+    if (!(me.role === 'admin' || me.role === 'mod')) { if (cb) cb({ ok: false, error: '只有管理员和版主能排歌单' }); return; }
+    /* 注意：api-client 会把响应里的 data 解包出来，所以这里拿到的**就是数据本身**
+       （{weekKey, playlist, source, model, warn, planned}），不是 {ok,data} 包裹层。 */
+    a.playlist.generate('', opts.publish !== false).then(function (d) {
+      if (d && d.playlist) {
+        playlistCache = { at: now(), data: d };
+        notifySync('songs');
+      }
+      if (cb) cb(d && d.playlist ? d : { ok: false, error: '没排成功' });
+    }, function (e) {
+      if (cb) cb({ ok: false, error: (e && (e.error || e.message)) || '排歌单失败了（网络或服务器问题）' });
+    });
+  }
+  function publishPlaylist(published, cb) {
+    var a = api();
+    if (!a || !a.playlist) { if (cb) cb({ ok: false, error: '这个功能还没上线' }); return; }
+    a.playlist.publish('', published !== false).then(function (d) {
+      if (d && d.playlist) { playlistCache = { at: now(), data: d }; notifySync('songs'); }
+      if (cb) cb(d && d.playlist ? d : { ok: false, error: '没成功' });
+    }, function (e) { if (cb) cb({ ok: false, error: (e && (e.error || e.message)) || '没成功' }); });
+  }
+
+  function addSong(d) {
+    d = d || {};
+    var me = currentUser();
+    if (!me) return { ok: false, error: '登录之后才能点歌' };
+    if (me.banned) return { ok: false, error: '账号已被封禁：' + (me.banReason || '违反版规') };
+    var key = normSlot(d.slot);
+    var title = trim(d.title), artist = trim(d.artist), link = trim(d.link), note = trim(d.note);
+    if (!title) return { ok: false, error: '歌名不能为空' };
+    if (title.length > 60) return { ok: false, error: '歌名太长了' };
+    if (link && !/^https?:\/\//i.test(link)) return { ok: false, error: '链接要以 http 或 https 开头' };
+    var day = round(d.day, 0);
+    if (day && (day < 1 || day > 5)) return { ok: false, error: '想在哪天放请选周一到周五（或者不选，表示都行）' };
+    var payload = { slot: key, title: title, artist: artist, link: link, note: note, day: day };
+
+    var r = syncCall('POST', '/songs', payload, '正在点歌…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      var song = normSong((r.data || {}).song);
+      var postId = str((r.data || {}).postId);
+      refreshSongsSync(key, '');
+      syncDone(r, 'major');                     // 版块里多了一篇帖子：同步刷新快照，页面立刻能看到
+      return { ok: true, song: song, postId: postId };
+    }
+    if (!online()) return offlineResult();
+
+    /* 乐观通道：先插一首进缓存，异步发，失败回滚 */
+    var backup = songCache[key];
+    var cur = songsWeekCached(key, '');
+    var ghost = {
+      id: 'tmp-s' + now().toString(36), weekKey: cur.weekKey, slot: key, title: title, artist: artist,
+      link: link, note: note, userId: meId(), nickname: me.nickname || '',
+      votes: 0, picked: false, createdAt: now(), postId: '', votedByMe: false
+    };
+    var list = sortSongs(cur.list.concat([ghost]));
+    putSongsLocal(key, Object.assign({}, cur, {
+      list: list, top: list.slice(0, round(cur.pickCount, 3) || 3), at: round(cur.at, 0)
+    }));
+    var a = api();
+    if (!a || !a.songs || !a.songs.add) return { ok: true, song: ghost, postId: '' };
+    a.songs.add(payload).then(function (data) {
+      var real = normSong((data || {}).song);
+      var bucket = songCache[key] || emptySongs(key, '');
+      var next = bucket.list.filter(function (s) { return s.id !== ghost.id; });
+      if (real) next.push(real);
+      var sorted = sortSongs(next);
+      putSongsLocal(key, Object.assign({}, bucket, {
+        list: sorted, top: sorted.slice(0, round(bucket.pickCount, 3) || 3), at: now()
+      }));
+      notifySongs(key, songCache[key]);
+      fetchSongs(key, '', true, null);          // 再补一次服务器数据（票数/剩余票数/真实 postId）
+      afterWrite('major');
+    }, function (e) {
+      songCache[key] = backup || emptySongs(key, '');
+      toast((e && e.error) || '点歌没成功，再试一次', 'error');
+      notifySongs(key, songCache[key]);
+      fetchSongs(key, '', true, null);          // 失败后也跟服务器对齐一次
+    });
+    return { ok: true, song: ghost, postId: '', pending: true };
+  }
+
+  function songsWeekCached(slot, week) {
+    var key = normSlot(slot);
+    var hit = songCache[key];
+    if (hit && (!week || !hit.weekKey || hit.weekKey === week)) return hit;
+    return hit || emptySongs(key, week);
+  }
+
+  /* 投票：乐观 + 回滚（失败 toast 服务端中文错误，例如「今天这个时段已经投满 3 票了」） */
+  function toggleSongVote(id) {
+    var me = currentUser();
+    if (!me) return { ok: false, error: '登录之后才能投票' };
+    var sid = str(id);
+    var found = null, key = '';
+    Object.keys(songCache).forEach(function (k) {
+      if (found) return;
+      var b = songCache[k];
+      for (var i = 0; i < b.list.length; i++) if (b.list[i].id === sid) { found = b.list[i]; key = k; }
+    });
+    if (!found) return { ok: false, error: '这首歌不在了' };
+    var bucket = songCache[key];
+    var backup = bucket;
+    var voted = !found.votedByMe;
+    var votes = Math.max(0, round(found.votes, 0) + (voted ? 1 : -1));
+    var limit = round(bucket.limitPerDay, 3) || 3;
+    var left = Math.max(0, Math.min(limit, round(bucket.votesLeft, 0) + (voted ? -1 : 1)));
+
+    function write(v, c, mine) {
+      var b = songCache[key] || bucket;
+      var list = b.list.map(function (s) { return s.id === sid ? Object.assign({}, s, { votes: v, votedByMe: mine }) : s; });
+      var sorted = sortSongs(list);
+      putSongsLocal(key, Object.assign({}, b, {
+        list: sorted, top: sorted.slice(0, round(b.pickCount, 3) || 3),
+        myVotesUsed: Math.max(0, round(b.myVotesUsed, 0) + (mine ? 1 : -1)),
+        votesLeft: c, at: b.at
+      }));
+    }
+    write(votes, left, voted);
+    var out = { ok: true, voted: voted, votes: votes, votesLeft: left };
+
+    var a = api();
+    if (!a || !a.songs || !a.songs.vote) return out;
+    a.songs.vote(sid).then(function (data) {
+      var song = normSong((data || {}).song);
+      var b = songCache[key] || bucket;
+      var list = b.list.map(function (s) { return s.id === sid ? (song || Object.assign({}, s, { votes: votes, votedByMe: voted })) : s; });
+      var sorted = sortSongs(list);
+      putSongsLocal(key, Object.assign({}, b, {
+        list: sorted, top: sorted.slice(0, round(b.pickCount, 3) || 3),
+        votesLeft: data && data.votesLeft !== undefined ? round(data.votesLeft, left) : left,
+        myVotesUsed: b.myVotesUsed,
+        at: now()
+      }));
+      notifySongs(key, songCache[key]);
+    }, function (e) {
+      putSongsLocal(key, backup);               // 回滚（并占住最新，免得旧响应盖回来）
+      toast((e && e.error) || '投票没成功，再试一次', 'error');
+      notifySongs(key, songCache[key]);
+    });
+    return out;
+  }
+
+  /* 定歌单：仅版主/超管，同步通道（失败立刻给中文错误） */
+  function pickSong(id, picked) {
+    if (!canManage()) return { ok: false, error: '只有版主和超管能定歌单' };
+    var sid = str(id);
+    var body = (picked === true || picked === false) ? { picked: picked } : {};
+    var r = syncCall('POST', '/admin/songs/' + encodeURIComponent(sid) + '/pick', body, '正在处理…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      var song = normSong((r.data || {}).song);
+      flipPicked(sid, song);
+      return { ok: true, song: song };
+    }
+    if (!online()) return offlineResult();
+
+    var backupAll = {};
+    Object.keys(songCache).forEach(function (k) { backupAll[k] = songCache[k]; });
+    flipPicked(sid, null, picked);
+    var a = api();
+    if (!a || !a.songs || !a.songs.pick) return { ok: true };
+    a.songs.pick(sid, picked).then(function (data) {
+      flipPicked(sid, normSong((data || {}).song));
+    }, function (e) {
+      Object.keys(backupAll).forEach(function (k) { songCache[k] = backupAll[k]; });
+      toast((e && e.error) || '没定成，再试一次', 'error');
+      Object.keys(backupAll).forEach(function (k) { notifySongs(k, songCache[k]); });
+    });
+    return { ok: true };
+  }
+
+  function flipPicked(sid, song, force) {
+    Object.keys(songCache).forEach(function (k) {
+      var b = songCache[k];
+      if (!b.list.some(function (s) { return s.id === sid; })) return;
+      var list = b.list.map(function (s) {
+        if (s.id !== sid) return s;
+        if (song) return song;
+        return Object.assign({}, s, { picked: force === undefined ? !s.picked : !!force });
+      });
+      var sorted = sortSongs(list);
+      putSongsLocal(k, Object.assign({}, b, { list: sorted, top: sorted.slice(0, round(b.pickCount, 3) || 3), at: b.at }));
+      notifySongs(k, songCache[k]);
+    });
+  }
+
+  function onSongsChange(cb) { if (typeof cb === 'function') songSubs.push(cb); return songSubs.length; }
+  function songsRefresh(o) {
+    o = o || {};
+    var key = normSlot(o.slot);
+    fetchSongs(key, trim(o.week), true, null);
+    return songsWeekCached(key, trim(o.week));
+  }
+
+  /* ------------------------------------------------------------------ 后台 */
+  function cacheGet(key) {
+    var hit = adminCache[key];
+    if (hit && now() - hit.t < ADMIN_TTL) return hit.v;
+    return null;
+  }
+  function cacheSet(key, v) { adminCache[key] = { t: now(), v: v }; return v; }
+
+  function normItem(type, raw) {
+    if (!raw) return null;
+    var n = api() && api().norm;
+    if (!n) return raw;
+    if (type === 'post') return n.post(raw);
+    if (type === 'user') return n.user(raw);
+    if (type === 'comment') return n.comment(raw);
+    if (type === 'board') return n.board(raw);
+    if (type === 'notice') return n.notice(raw);
+    if (type === 'report') return n.report(raw);
+    if (type === 'log') return n.log(raw);
+    if (type === 'message') return n.message(raw);
+    return raw;
+  }
+  function normPage(type, data) {
+    data = data && typeof data === 'object' ? data : {};
+    var list = arr(data.list || data.items || data.rows).map(function (x) { return normItem(type, x); });
+    var size = round(data.size, list.length || 15) || 15;
+    var total = round(data.total, list.length);
+    var page = round(data.page, 1) || 1;
+    return { list: list, total: total, page: page, size: size, pages: round(data.pages, Math.max(1, Math.ceil(total / size))) || 1 };
+  }
+
+  function serverAdminList(o) {
+    var type = trim(o.type) || 'post';
+    var q = {
+      type: type, keyword: trim(o.keyword), status: trim(o.status), role: trim(o.role),
+      boardId: trim(o.boardId), page: round(o.page, 1) || 1,
+      size: o.size === undefined ? 15 : round(o.size, 15), sort: trim(o.sort) || 'new'
+    };
+    var path = type === 'log' ? '/admin/logs' : '/admin/list';
+    if (type === 'log') q = { action: trim(o.keyword), actorId: trim(o.actorId), page: q.page, size: q.size };
+    var r = syncCall('GET', path + api().buildQuery(q), null, '');
+    if (!r || !r.ok) return null;
+    return normPage(type, r.data);
+  }
+
+  function localAdminList(o) {
+    o = o || {};
+    var type = trim(o.type) || 'post';
+    var kw = trim(o.keyword), status = trim(o.status), role = trim(o.role), boardId = trim(o.boardId);
+    var sort = trim(o.sort) || 'new';
+    var list = [];
+    if (type === 'post') {
+      list = snap().posts.filter(function (p) {
+        if (status && p.status !== status) return false;
+        if (boardId && p.boardId !== boardId) return false;
+        if (kw && !(kwMatch(p.title, kw) || kwMatch(p.content, kw))) return false;
+        return true;
+      });
+      list.sort(function (a, b) {
+        if (sort === 'hot') return score(b) - score(a);
+        if (sort === 'views') return round(b.views, 0) - round(a.views, 0);
+        if (sort === 'comments') return round(b.commentCount, 0) - round(a.commentCount, 0);
+        return round(b.createdAt, 0) - round(a.createdAt, 0);
+      });
+    } else if (type === 'user') {
+      list = snap().users.filter(function (u) {
+        if (role && normRole(u.role) !== role) return false;
+        if (status === 'banned' && !u.banned) return false;
+        if (status === 'active' && u.banned) return false;
+        if (kw && !(kwMatch(u.username, kw) || kwMatch(u.nickname, kw) || kwMatch(u.grade, kw) || kwMatch(u.klass, kw))) return false;
+        return true;
+      });
+      list.sort(function (a, b) {
+        if (sort === 'points') return round(b.points, 0) - round(a.points, 0);
+        if (sort === 'posts') return round(b.stats.posts, 0) - round(a.stats.posts, 0);
+        if (sort === 'active') return round(b.lastLoginAt, 0) - round(a.lastLoginAt, 0);
+        if (sort === 'name') return str(a.username) < str(b.username) ? -1 : 1;
+        return round(b.createdAt, 0) - round(a.createdAt, 0);
+      });
+    } else if (type === 'comment') {
+      list = snap().comments.filter(function (c) {
+        if (status && c.status !== status) return false;
+        if (kw && !kwMatch(c.content, kw)) return false;
+        return true;
+      }).sort(function (a, b) {
+        if (sort === 'likes') return round(b.likes, 0) - round(a.likes, 0);
+        return round(b.createdAt, 0) - round(a.createdAt, 0);
+      });
+    } else if (type === 'report') {
+      list = snap().reports.filter(function (r) {
+        if (status && r.status !== status) return false;
+        if (kw && !(kwMatch(r.reason, kw) || kwMatch(r.detail, kw))) return false;
+        return true;
+      }).sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); });
+    } else if (type === 'log') {
+      list = snap().logs.filter(function (g) {
+        if (kw && !(kwMatch(g.action, kw) || kwMatch(g.detail, kw) || kwMatch(g.target, kw))) return false;
+        return true;
+      }).sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); });
+    } else if (type === 'notice') {
+      list = snap().notices.filter(function (n) { return !kw || kwMatch(n.title, kw) || kwMatch(n.content, kw); })
+        .sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); });
+    } else if (type === 'board') {
+      list = snap().boards.filter(function (b) { return !kw || kwMatch(b.name, kw) || kwMatch(b.desc, kw); })
+        .sort(function (a, b) { return round(a.order, 99) - round(b.order, 99); });
+    } else if (type === 'message') {
+      list = snap().notifications.filter(function (m) {
+        if (kw && !(kwMatch(m.title, kw) || kwMatch(m.body, kw))) return false;
+        if (status && m.type !== status) return false;
+        return true;
+      }).sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); });
+    }
+    return paginate(list, o.page, o.size === undefined ? 15 : o.size);
+  }
+
+  function adminList(o) {
+    o = o || {};
+    var type = trim(o.type) || 'post';
+    var key = 'list:' + [type, trim(o.keyword), trim(o.status), trim(o.role), trim(o.boardId),
+      round(o.page, 1) || 1, o.size === undefined ? 15 : round(o.size, 15), trim(o.sort), trim(o.actorId)].join('|');
+    var hit = cacheGet(key);
+    if (hit) return hit;
+    if (canManage() && canSync()) {
+      var remote = serverAdminList(o);
+      if (remote) return cacheSet(key, remote);
+    }
+    return cacheSet(key, localAdminList(o));
+  }
+
+  function adminGet(type, id) {
+    type = trim(type);
+    if (type === 'settings') return getSettings();
+    var local = null;
+    if (type === 'post') local = byId(snap().posts, id);
+    else if (type === 'user') local = byId(snap().users, id);
+    else if (type === 'comment') local = byId(snap().comments, id);
+    else if (type === 'report') local = byId(snap().reports, id);
+    else if (type === 'log') local = byId(snap().logs, id);
+    else if (type === 'notice') local = byId(snap().notices, id);
+    else if (type === 'board') local = byId(snap().boards, id);
+    else if (type === 'message') local = byId(snap().notifications, id);
+    if (local) return local;
+    if (canManage() && canSync()) {
+      var r = syncCall('GET', '/admin/item?type=' + encodeURIComponent(type) + '&id=' + encodeURIComponent(str(id)), null, '');
+      if (r && r.ok) {
+        var item = normItem(type, (r.data && (r.data.item || r.data)) || null);
+        if (item) return item;
+      }
+    }
+    return null;
+  }
+
+  function adminSave(type, data) {
+    type = trim(type);
+    data = data || {};
+    if (!canManage()) return { ok: false, error: '没有权限' };
+    if (type === 'board') {
+      var rb = saveBoard(data);
+      return rb.ok ? { ok: true, item: rb.board } : rb;
+    }
+    if (type === 'notice') {
+      var rn = saveNotice(data);
+      return rn.ok ? { ok: true, item: rn.notice } : rn;
+    }
+    if (type === 'settings') return saveSettings(data);
+    var r = syncCall('POST', '/admin/save', { type: type, data: data }, '正在保存…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      var item = normItem(type, (r.data && r.data.item) || null);
+      if (!item && data.id) item = adminGet(type, data.id);
+      return { ok: true, item: item };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var p = data.id ? byId(snap().posts, data.id) : null;
+      if (p) {
+        ['title', 'content', 'boardId'].forEach(function (k) { if (data[k] !== undefined) p[k] = trim(data[k]); });
+        if (data.tags !== undefined) p.tags = normTags(data.tags);
+        ['pinned', 'featured', 'locked'].forEach(function (k) { if (data[k] !== undefined) p[k] = !!data[k]; });
+        p.updatedAt = now();
+        return { ok: true, item: p };
+      }
+      return { ok: true, item: null };
+    }, function () { return api().post('/admin/save', { type: type, data: data }); }, 'major');
+  }
+
+  function adminDelete(type, id) {
+    type = trim(type);
+    if (!canManage()) return { ok: false, error: '没有权限' };
+    if (type === 'board') return deleteBoard(id);
+    if (type === 'notice') return deleteNotice(id);
+    var key = str(id);
+    var r = syncCall('POST', '/admin/delete', { type: type, id: key }, '正在删除…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      if (type === 'post') {
+        var p = byId(snap().posts, key);
+        if (p) p.status = 'deleted';
+        snap().comments.forEach(function (c) { if (c.postId === key && c.status === 'published') c.status = 'hidden'; });
+      } else if (type === 'comment') {
+        var c2 = byId(snap().comments, key);
+        if (c2) c2.status = 'deleted';
+      } else if (type === 'user') {
+        S.users = snap().users.filter(function (u) { return u.id !== key; });
+      } else if (type === 'message') {
+        S.notifications = snap().notifications.filter(function (m) { return m.id !== key; });
+      } else if (type === 'report') {
+        S.reports = snap().reports.filter(function (x) { return x.id !== key; });
+      } else if (type === 'log') {
+        S.logs = snap().logs.filter(function (x) { return x.id !== key; });
+      }
+      return { ok: true };
+    }, function () { return api().post('/admin/delete', { type: type, id: key }); }, 'major');
+  }
+
+  function localPwd() {
+    var L = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz', D = '23456789';
+    function ch(s) { return s.charAt(Math.floor(Math.random() * s.length)); }
+    return ch(L) + ch(L) + ch(L) + ch(D) + ch(D) + ch(D) + ch(L) + ch(D);
+  }
+
+  function adminBatch(type, ids, action) {
+    type = trim(type);
+    action = trim(action);
+    ids = arr(ids).map(str).filter(Boolean);
+    if (!ids.length) return { ok: false, count: 0, error: '先勾上要处理的行' };
+    if (!canManage()) return { ok: false, count: 0, error: '没有权限' };
+    if (type === 'user' && !isAdmin()) return { ok: false, count: 0, error: '只有超级管理员能管用户' };
+    if (action === 'teacher') return { ok: false, count: 0, error: '「老师」这个角色已经不用了，请选版主或学生' };
+    var valid = {
+      post: ['hide', 'publish', 'pin', 'unpin', 'lock', 'unlock', 'feature', 'unfeature', 'delete'],
+      user: ['ban', 'unban', 'mod', 'student', 'admin', 'resetPwd', 'delete'],
+      comment: ['hide', 'publish', 'delete'],
+      report: ['resolve', 'reject']
+    };
+    if (!valid[type] || valid[type].indexOf(action) < 0) return { ok: false, count: 0, error: '不支持的操作：' + action };
+    var payload = { type: type, ids: ids, action: action };
+
+    /* resetPwd 必须同步拿到新密码（后台要一次性显示 + 复制） */
+    if (action === 'resetPwd') {
+      var rp = syncCall('POST', '/admin/batch', payload, '正在重置…');
+      if (rp) {
+        if (!rp.ok) return { ok: false, count: 0, error: rp.error };
+        syncAdopt();
+        return {
+          ok: true, count: round(rp.data && rp.data.count, ids.length) || ids.length,
+          pwd: rp.data && rp.data.pwd, pwds: rp.data && rp.data.pwds
+        };
+      }
+    }
+    var r = syncCall('POST', '/admin/batch', payload, '正在处理…');
+    if (r) {
+      if (!r.ok) return { ok: false, count: 0, error: r.error };
+      syncAdopt();
+      return { ok: true, count: round(r.data && r.data.count, ids.length) || ids.length };
+    }
+    if (!online()) return { ok: false, count: 0, error: OFFLINE_MSG };
+
+    return optimistic(function () {
+      var count = 0;
+      ids.forEach(function (id) {
+        if (type === 'post') {
+          var p = byId(snap().posts, id);
+          if (!p) return;
+          if (action === 'hide') p.status = 'hidden';
+          else if (action === 'publish') p.status = 'published';
+          else if (action === 'pin') p.pinned = true;
+          else if (action === 'unpin') p.pinned = false;
+          else if (action === 'lock') p.locked = true;
+          else if (action === 'unlock') p.locked = false;
+          else if (action === 'feature') p.featured = true;
+          else if (action === 'unfeature') p.featured = false;
+          else if (action === 'delete') {
+            p.status = 'deleted';
+            snap().comments.forEach(function (c) { if (c.postId === id && c.status === 'published') c.status = 'hidden'; });
+          }
+          count++;
+        } else if (type === 'user') {
+          var u = byId(snap().users, id);
+          if (!u) return;
+          if (action === 'ban') { u.banned = true; u.banReason = u.banReason || '违反版规'; }
+          else if (action === 'unban') { u.banned = false; u.banReason = ''; }
+          else if (action === 'mod' || action === 'student' || action === 'admin') u.role = action;
+          else if (action === 'delete') S.users = snap().users.filter(function (x) { return x.id !== id; });
+          count++;
+        } else if (type === 'comment') {
+          var c2 = byId(snap().comments, id);
+          if (!c2) return;
+          if (action === 'hide') c2.status = 'hidden';
+          else if (action === 'publish') c2.status = 'published';
+          else if (action === 'delete') c2.status = 'deleted';
+          count++;
+        } else if (type === 'report') {
+          var rep = byId(snap().reports, id);
+          if (!rep) return;
+          rep.status = action === 'resolve' ? 'resolved' : 'rejected';
+          rep.handledBy = meId();
+          rep.handledAt = now();
+          count++;
+        }
+      });
+      var out = { ok: true, count: count };
+      if (action === 'resetPwd') out.pwd = localPwd();
+      return out;
+    }, function () { return api().post('/admin/batch', payload); }, 'major');
+  }
+
+  function adminSetPostStatus(id, status, reason) {
+    if (!canManage()) return { ok: false, error: '没有权限' };
+    var st = trim(status);
+    if (['published', 'pending', 'hidden', 'deleted'].indexOf(st) < 0) return { ok: false, error: '状态不对' };
+    var p = byId(snap().posts, id);
+    if (!p) return { ok: false, error: '帖子不存在' };
+    var payload = { status: st, reason: trim(reason) };
+    var r = syncCall('POST', '/posts/' + encodeURIComponent(str(id)) + '/status', payload, '正在处理…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var t = byId(snap().posts, id);
+      if (t) {
+        t.status = st;
+        t.rejectReason = st === 'hidden' ? (trim(reason) || '不符合版规，已被下架') : '';
+        t.updatedAt = now();
+      }
+      return { ok: true };
+    }, function () { return api().post('/posts/' + encodeURIComponent(str(id)) + '/status', payload); }, 'major');
+  }
+
+  function adminSetUserBan(id, banned, reason) {
+    if (!isAdmin()) return { ok: false, error: '只有超级管理员能封禁' };
+    /* 只做"别封自己"这种本地安全拦截；"这个人存不存在"交给服务端判断。
+       以前这里用快照查人，快照里没有的目标会误报"用户不存在"（后台列表是全量用户）。 */
+    if (str(id) === meId() && banned) return { ok: false, error: '别封自己' };
+    var payload = { id: str(id), banned: !!banned, reason: trim(reason) };
+    var r = syncCall('POST', '/admin/user/ban', payload, '正在处理…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var t = byId(snap().users, id);
+      if (t) { t.banned = !!banned; t.banReason = banned ? (trim(reason) || '违反版规') : ''; }
+      return { ok: true };
+    }, function () { return api().post('/admin/user/ban', payload); }, 'major');
+  }
+
+  /* 给版主指定负责的版块（只有超管）。boards 是版块 id 数组；空数组 = 不限制（能管全部内容） */
+  function adminSetModBoards(id, boards) {
+    if (!isAdmin()) return { ok: false, error: '只有超级管理员能分配版主负责的版块' };
+    var list = (Array.isArray(boards) ? boards : []).map(str).filter(Boolean);
+    var payload = { id: str(id), boards: list };
+    var r = syncCall('POST', '/admin/user/modboards', payload, '正在保存…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      return { ok: true, boards: list };
+    }
+    if (!online()) return offlineResult();
+    return { ok: false, error: '没存上，再试一次' };
+  }
+
+  function adminSetUserRole(id, role) {
+    if (!isAdmin()) return { ok: false, error: '只有超级管理员能改角色' };
+    var r0 = trim(role);
+    if (r0 === 'teacher') return { ok: false, error: '「老师」这个角色已经不用了，请选版主或学生' };
+    if (['student', 'mod', 'admin'].indexOf(r0) < 0) return { ok: false, error: '角色不对' };
+    if (!trim(id)) return { ok: false, error: '没指定是谁' };
+    /* 不在这里查快照判断"用户是否存在"：后台用户列表是全量的，
+       快照里可能没有这个人，以前的写法会误报"用户不存在"，
+       导致"设超管/设版主"点了没反应。存在性由服务端判断（它有全量数据）。 */
+    var payload = { id: str(id), role: r0 };
+    var r = syncCall('POST', '/admin/user/role', payload, '正在处理…');
+    if (r) {
+      if (!r.ok) return { ok: false, error: r.error };
+      syncAdopt();
+      return { ok: true };
+    }
+    if (!online()) return offlineResult();
+    return optimistic(function () {
+      var t = byId(snap().users, id);
+      if (t) t.role = r0;
+      return { ok: true };
+    }, function () { return api().post('/admin/user/role', payload); }, 'major');
+  }
+
+  function estimateRecipients(payload) {
+    var list = snap().users.filter(function (u) { return !u.banned; });
+    if (payload.target === 'role') list = list.filter(function (u) { return normRole(u.role) === payload.role; });
+    else if (payload.target === 'user') {
+      var u = getUser(payload.userId) || findUserByUsername(payload.userId);
+      list = u ? [u] : [];
+    }
+    return list.length;
+  }
+
+  function broadcast(d) {
+    d = d || {};
+    if (!isAdmin()) return { ok: false, sent: 0, error: '只有超级管理员能群发通知' };
+    var title = trim(d.title), body = trim(d.body);
+    if (title.length < 2) return { ok: false, sent: 0, error: '标题太短' };
+    if (body.length < 2) return { ok: false, sent: 0, error: '内容太短' };
+    var target = trim(d.target) || 'all';
+    var payload = { target: target, title: title, body: body };
+    if (target === 'role') payload.role = trim(d.role) || 'student';
+    if (target === 'user') payload.userId = trim(d.userId);
+    var est = estimateRecipients(payload);
+    var r = syncCall('POST', '/admin/broadcast', payload, '正在发送…');
+    if (r) {
+      if (!r.ok) return { ok: false, sent: 0, error: r.error };
+      syncDone(r, 'major');
+      return { ok: true, sent: round(r.data && r.data.sent, est) };
+    }
+    if (!online()) return { ok: false, sent: 0, error: OFFLINE_MSG };
+    return optimistic(function () { return { ok: true, sent: est }; },
+      function () { return api().post('/admin/broadcast', payload); }, 'major');
+  }
+
+  function log(action, target, detail) {
+    var g = {
+      id: 'local-g' + now().toString(36), actorId: meId(), action: str(action) || 'unknown',
+      target: str(target), detail: str(detail), createdAt: now()
+    };
+    snap().logs.unshift(g);
+    return g;
+  }
+
+  function listLogs(o) {
+    o = o || {};
+    var key = 'logs:' + [trim(o.action), trim(o.actorId), round(o.page, 1) || 1, o.size === undefined ? 30 : round(o.size, 30)].join('|');
+    var hit = cacheGet(key);
+    if (hit) return hit;
+    if (canManage() && canSync()) {
+      var r = syncCall('GET', '/admin/logs' + api().buildQuery({
+        action: trim(o.action), actorId: trim(o.actorId),
+        page: round(o.page, 1) || 1, size: o.size === undefined ? 30 : round(o.size, 30)
+      }), null, '');
+      if (r && r.ok) return cacheSet(key, normPage('log', r.data));
+    }
+    var action = trim(o.action), actorId = trim(o.actorId);
+    var list = snap().logs.filter(function (g) {
+      if (action && str(g.action).indexOf(action) !== 0) return false;
+      if (actorId && g.actorId !== actorId) return false;
+      return true;
+    }).sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); });
+    return cacheSet(key, paginate(list, o.page, o.size === undefined ? 30 : o.size));
+  }
+
+  function localStats() {
+    var t = now();
+    var d = new Date(); d.setHours(0, 0, 0, 0);
+    var start = d.getTime();
+    var week = t - 7 * 864e5;
+    var users = snap().users, posts = snap().posts, comments = snap().comments;
+    var livePosts = posts.filter(function (p) { return p.status !== 'deleted'; });
+    var liveComments = comments.filter(function (c) { return c.status !== 'deleted'; });
+    var visits = {};
+    snap().visits.forEach(function (v) { visits[v.date] = v; });
+    function keyOf(ts) { return TF.util.dateKey(ts); }
+    function inDay(ts, ds) { return round(ts, 0) >= ds && round(ts, 0) < ds + 864e5; }
+
+    var trend = [];
+    for (var i = 13; i >= 0; i--) {
+      var ds = start - i * 864e5, key = keyOf(ds);
+      var v = visits[key] || { pv: 0, uv: 0 };
+      trend.push({
+        date: key, pv: round(v.pv, 0), uv: round(v.uv, 0),
+        posts: livePosts.filter(function (p) { return inDay(p.createdAt, ds); }).length,
+        comments: liveComments.filter(function (c) { return inDay(c.createdAt, ds); }).length
+      });
+    }
+    var today = visits[keyOf(t)] || { pv: 0, uv: 0 };
+    var tagCount = {};
+    livePosts.forEach(function (p) { arr(p.tags).forEach(function (x) { tagCount[x] = (tagCount[x] || 0) + 1; }); });
+
+    return {
+      users: {
+        total: users.length,
+        today: users.filter(function (u) { return round(u.createdAt, 0) >= start; }).length,
+        active: users.filter(function (u) { return u.lastLoginAt && t - round(u.lastLoginAt, 0) < 7 * 864e5; }).length,
+        newWeek: users.filter(function (u) { return round(u.createdAt, 0) >= week; }).length,
+        banned: users.filter(function (u) { return !!u.banned; }).length
+      },
+      posts: {
+        total: Math.max(livePosts.length, round(snap().meta && snap().meta.totalPosts, 0)),
+        today: livePosts.filter(function (p) { return round(p.createdAt, 0) >= start && p.status === 'published'; }).length,
+        pending: posts.filter(function (p) { return p.status === 'pending'; }).length,
+        hidden: posts.filter(function (p) { return p.status === 'hidden'; }).length
+      },
+      comments: {
+        total: liveComments.length,
+        today: liveComments.filter(function (c) { return round(c.createdAt, 0) >= start && c.status === 'published'; }).length
+      },
+      reports: {
+        pending: snap().reports.filter(function (r) { return r.status === 'pending'; }).length,
+        total: snap().reports.length
+      },
+      boards: snap().boards.length,
+      online: Math.max(1, users.filter(function (u) { return u.lastLoginAt && t - round(u.lastLoginAt, 0) < 2 * 3600e3; }).length),
+      pvToday: round(today.pv, 0),
+      uvToday: round(today.uv, 0),
+      trend: trend,
+      roleDist: ['student', 'mod', 'admin'].map(function (r) {
+        return { name: ROLE_LABEL[r], value: users.filter(function (u) { return normRole(u.role) === r; }).length };
+      }),
+      boardDist: snap().boards.map(function (b) {
+        return { name: b.name, value: livePosts.filter(function (p) { return p.boardId === b.id && p.status === 'published'; }).length };
+      }).sort(function (a, b) { return b.value - a.value; }).slice(0, 12),
+      hotTags: Object.keys(tagCount).map(function (k) { return { name: k, value: tagCount[k] }; })
+        .sort(function (a, b) { return b.value - a.value; }).slice(0, 10),
+      latestPosts: livePosts.slice().sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); }).slice(0, 5),
+      latestUsers: users.slice().sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); }).slice(0, 5),
+      latestLogs: snap().logs.slice().sort(function (a, b) { return round(b.createdAt, 0) - round(a.createdAt, 0); }).slice(0, 8)
+    };
+  }
+
+  /* 服务端统计优先，缺的字段用快照算出来的兜底（页面字段名不变） */
+  function mergeStats(base, remote) {
+    function numOr(local, v) { var n = Number(v); return isFinite(n) ? n : local; }
+    function shape(local, v) {
+      if (!v || typeof v !== 'object') return local;
+      var out = {};
+      Object.keys(local).forEach(function (k) { out[k] = numOr(local[k], v[k]); });
+      Object.keys(v).forEach(function (k) { if (out[k] === undefined) out[k] = v[k]; });
+      return out;
+    }
+    var out = Object.assign({}, base);
+    out.users = shape(base.users, remote.users);
+    out.posts = shape(base.posts, remote.posts);
+    out.comments = shape(base.comments, remote.comments);
+    out.reports = shape(base.reports, remote.reports);
+    /* 学生认证：后台总览的「待认证学生」数字（新增） */
+    out.studentVerify = shape({ pending: 0, external: 0 }, remote.studentVerify);
+    ['boards', 'online', 'pvToday', 'uvToday'].forEach(function (k) {
+      if (remote[k] !== undefined) out[k] = numOr(base[k], remote[k]);
+    });
+    ['trend', 'roleDist', 'boardDist', 'hotTags', 'latestPosts', 'latestUsers', 'latestLogs'].forEach(function (k) {
+      if (Array.isArray(remote[k]) && remote[k].length) out[k] = remote[k];
+    });
+    if (Array.isArray(out.latestUsers)) out.latestUsers = out.latestUsers.map(function (u) { return normItem('user', u) || u; });
+    if (Array.isArray(out.latestPosts)) out.latestPosts = out.latestPosts.map(function (p) { return normItem('post', p) || p; });
+    if (Array.isArray(out.latestLogs)) out.latestLogs = out.latestLogs.map(function (g) { return normItem('log', g) || g; });
+    return out;
+  }
+
+  function adminStats() {
+    var key = 'stats';
+    var hit = cacheGet(key);
+    if (hit) return hit;
+    var base = localStats();
+    if (canManage() && canSync()) {
+      var r = syncCall('GET', '/admin/stats', null, '');
+      if (r && r.ok && r.data) base = mergeStats(base, r.data);
+    }
+    return cacheSet(key, base);
+  }
+
+  function mockVisits() { /* 访问统计由服务器记录，这里不再造数据 */ }
+
+  /* ------------------------------------------------------------------ 导出 */
+  var STORE = {
+    /* 初始化与状态 */
+    init: init, save: save, reset: reset, state: state,
+    isOnline: online, onSync: function (cb) { if (typeof cb === 'function') subs.push(cb); return subs.length; },
+    /* 用户与会话 */
+    currentUser: currentUser, isLogin: function () { return !!currentUser(); },
+    isAdmin: isAdmin, isMod: isMod, canManage: canManage, isTeacher: canManage,
+    /* 学生认证（新增）：external 校外人员 / pending 审核中 / student 已认证 / rejected 被驳回 */
+    studentStatus: studentStatus, isVerified: isVerified,
+    canPost: canPost, setSession: setSession, logout: logout, login: login, register: register,
+    changePassword: changePassword,
+    getSecurityQuestion: getSecurityQuestion, resetPasswordByAnswer: resetPasswordByAnswer,
+    setSecurityQuestion: setSecurityQuestion,
+    findUserByUsername: findUserByUsername, getUser: getUser,
+    updateProfile: updateProfile, uploadAvatar: uploadAvatar, listUsers: listUsers,
+    /* 版块 */
+    listBoards: listBoards, getBoard: getBoard, boardFeed: boardFeed,
+    saveBoard: saveBoard, deleteBoard: deleteBoard, ensureBoard: ensureBoard,
+    /* 帖子 */
+    listPosts: listPosts, getPost: getPost, counts: counts, hotPosts: hotPosts, featuredPosts: featuredPosts,
+    createPost: createPost, updatePost: updatePost, deletePost: deletePost,
+    toggleLike: toggleLike, toggleFavorite: toggleFavorite, favoritePosts: favoritePosts,
+    /* 评论 */
+    listComments: listComments, countComments: countComments, listReplies: listReplies, getComment: getComment,
+    addComment: addComment, deleteComment: deleteComment, toggleCommentLike: toggleCommentLike,
+    /* 通知 */
+    notify: notify, listMessages: listMessages, unreadCount: unreadCount, markRead: markRead,
+    sendMessage: sendMessage, conversations: conversations,
+    /* 公告 / 举报 / 设置 */
+    listNotices: listNotices, getNotice: getNotice, saveNotice: saveNotice, deleteNotice: deleteNotice,
+    addReport: addReport, listReports: listReports, handleReport: handleReport,
+    getSettings: getSettings, saveSettings: saveSettings, search: search,
+    /* 每周点歌投票 */
+    songsWeek: songsWeek, addSong: addSong, toggleSongVote: toggleSongVote, pickSong: pickSong,
+    closeSongWeek: closeSongWeek, deleteSong: deleteSong,
+    playlistData: playlistData, refreshPlaylist: refreshPlaylist,
+    generatePlaylist: generatePlaylist, publishPlaylist: publishPlaylist,
+    onSongsChange: onSongsChange, songsRefresh: songsRefresh, songSlotLabel: slotLabel,
+    /* 后台 */
+    log: log, listLogs: listLogs, adminStats: adminStats, adminList: adminList, adminGet: adminGet,
+    adminSave: adminSave, adminDelete: adminDelete, adminBatch: adminBatch,
+    adminSetPostStatus: adminSetPostStatus, adminSetUserBan: adminSetUserBan, adminSetUserRole: adminSetUserRole,
+    adminSetModBoards: adminSetModBoards,
+    mockVisits: mockVisits, broadcast: broadcast,
+    /* 数据层小工具（页面已在用） */
+    levelOf: levelOf, levelInfo: levelInfo,
+    roleLabel: function (r) { return ROLE_LABEL[normRole(r)] || ROLE_LABEL.student; }
+  };
+
+  /* 给"保存资料 / 发评论 / 点歌 / 私信"这些写操作加上防重锁：
+     同一内容 1.2 秒内重复调用只写一次，避免"打字/回车/自动填充"造成的重复提交。 */
+  guardWrites(STORE);
+  TF.extend('store', STORE);
+})();

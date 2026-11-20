@@ -1,0 +1,353 @@
+/* ==========================================================================
+   手机端布局（mobile.css）
+   --------------------------------------------------------------------------
+   只在 ≤620px 生效，桌面端一行都不受影响。
+   目标：单行紧凑顶栏 + 底部 Tab 栏 + 大点击区（≥44px）+ 内容卡片化。
+
+   断点约定（改样式时按这个来）：
+     ≤ 620px   手机     —— 本文件全部规则
+     621~960px 平板     —— components.css 里的 960 段
+     > 960px   桌面     —— 默认样式
+   ========================================================================== */
+
+/* 底部导航占位：避免内容被固定 Tab 栏盖住 */
+:root {
+  --tabbar-h: 56px;
+  --tap: 44px;              /* 最小点击区 */
+}
+
+/* 桌面端隐藏手机组件 */
+.tabbar,
+.iconbtn--search { display: none; }
+
+/* --------------------------------------------------------------------------
+   工具栏（Markdown 编辑器按钮条）：桌面和手机都要有间距，且不换行。
+   手机端横向滚动，桌面端正常一行。
+   -------------------------------------------------------------------------- */
+.editorbar, .mdbar { display: flex; flex-wrap: nowrap; gap: 6px; align-items: center; }
+@media (max-width: 620px) {
+  .editorbar, .mdbar { overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
+  .editorbar::-webkit-scrollbar, .mdbar::-webkit-scrollbar { display: none; }
+  .editorbar .btn, .mdbar .btn { flex: 0 0 auto; }
+}
+
+/* 后台批量操作条：手机上固定在底部 Tab 栏之上（admin.js 里已去掉 inline style） */
+@media (max-width: 620px) {
+  .bulkbar {
+    position: fixed; left: 10px; right: 10px;
+    bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px) + 12px);
+    margin: 0; width: auto; max-width: none;
+    flex-wrap: wrap; justify-content: center; z-index: 60;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   通用工具：把"视觉上很小的控件"的**触摸区域**撑到 44px。
+   用法：给外层可点元素加 class="tap-target"（例如开关的 <label>、
+   预设头像的 <label class="radiocard tap-target">）。
+   这样视觉不变、手指好点，量点击区时也不算小。
+   -------------------------------------------------------------------------- */
+@media (max-width: 620px) {
+  .tap-target {
+    position: relative;
+    min-width: var(--tap); min-height: var(--tap);
+    display: inline-flex; align-items: center;
+  }
+  .tap-target > input[type="checkbox"],
+  .tap-target > input[type="radio"] {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    margin: 0; opacity: 0; cursor: pointer;
+  }
+  /* 表单里的复选框/单选（不管有没有 .tap-target）也不能只有 13px 高 */
+  .form input[type="checkbox"], .form input[type="radio"],
+  .settingrow input[type="checkbox"], .settingrow input[type="radio"] {
+    width: 22px; height: 22px;
+  }
+  /* 但如果外层是 .tap-target，触点就是**整块 44px**（上面那条 22px 会覆盖 .tap-target 里的铺满规则，
+     所以这里用更高特异性再铺一次） */
+  .settingrow .tap-target > input[type="checkbox"],
+  .settingrow .tap-target > input[type="radio"],
+  .form .tap-target > input[type="checkbox"],
+  .form .tap-target > input[type="radio"] {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+  }
+  .settingrow { min-height: var(--tap); }
+}
+
+@media (max-width: 620px) {
+
+  /* ------------------------------------------------------- 0. 全局兜底
+     手机上横向溢出的头号原因是：flex/grid 子元素默认 `min-width:auto`，
+     里面一个长标题、一行横向 Tab、一个宽表格就能把整页撑宽。
+     这里统一把它们降为可收缩，并且任何块级容器都不许比屏幕更宽。 */
+  .row > *, .col, .col-side, .col-main,
+  .block, .card, .formgrid > *, .grid > *, .stack > * { min-width: 0; box-sizing: border-box; }
+  /* 手机上 `.row` 是竖排的，此时 `flex:1 1 0` 只作用于纵向，
+     横向宽度会被内部内容（长标题、工具栏、pre）撑开 —— 这里直接钳住。 */
+  .col, .col-main, .col-side { width: 100%; max-width: 100%; flex: 1 1 auto; }
+  .markdown, .block__body, .card__body, .postrow__main,
+  form, fieldset, .formgrid, .editorbar, .tabs, .bbs-nav { max-width: 100%; }
+  .tabs, .bbs-nav { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar, .bbs-nav::-webkit-scrollbar { display: none; width: 0; height: 0; }
+  .tabs > *, .bbs-nav > * { flex: 0 0 auto; }     /* 横滑容器里的子项不要把父级撑宽 */
+  .table-wrap, table { max-width: 100%; }
+  .markdown img, .markdown video, img, video { max-width: 100%; height: auto; }
+
+  /* ------------------------------------------------------------ 1. 顶栏
+     目标：一行 52px，只留 品牌 + 搜索图标 + 消息 + 头像菜单。
+     原来折成两行 126px 太高，把首屏挤没了。 */
+  .header { position: sticky; top: 0; z-index: 60; }
+  .header__inner {
+    height: 52px; min-height: 52px; flex-wrap: nowrap;
+    padding-block: 0; gap: 6px; align-items: center;
+  }
+  .header__inner .brand { order: 0; flex: 0 1 auto; min-width: 0; }
+  .brand__name { font-size: 15px; max-width: 40vw; }
+  .brand__logo { width: 30px; height: 30px; }
+
+  /* 手机不带那一大条搜索框，收成一个图标 */
+  .header .searchbar { display: none; }
+  .iconbtn--search { display: inline-grid; }
+
+  .header__right {
+    order: 1; margin-left: auto; flex-wrap: nowrap; gap: 2px;
+    justify-content: flex-end; row-gap: 0;
+  }
+  .header__right .iconbtn { width: var(--tap); height: var(--tap); }
+  /* 手机顶栏只留 4 个必需入口：搜索 / 消息 / 头像菜单。
+     「发帖」在底部中间的 ＋，「设置」和「管理后台」都在头像菜单里，
+     所以这里隐藏它们（桌面端照旧）。 */
+  .header__right > a[href="#/new"],
+  .header__right > a[href="#/settings"],
+  .header__right > a[href="#/admin"] { display: none; }
+  .header__inner .brand { flex: 1 1 auto; }
+  .brand__name { max-width: none; overflow: hidden; text-overflow: ellipsis; }
+  /* 汉堡菜单在手机上没用了（有底部 Tab 栏），收起来 */
+  .header__right .navToggle { display: none; }
+  .header__mobile { display: none !important; }
+
+  .usermenu__trigger { padding: 0; min-width: var(--tap); height: var(--tap); justify-content: center; }
+  .usermenu__name, .usermenu__trigger > svg { display: none; }
+  .usermenu__panel { width: min(92vw, 300px); right: 0; }
+
+  /* 内容区给底部导航留出空间 */
+  .main { padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px) + 8px); }
+  .footer { margin-top: var(--sp-6); padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px)); }
+  .footer__inner { grid-template-columns: minmax(0, 1fr); gap: var(--sp-5); padding-block: 20px 14px; }
+  .footer__col { display: none; }              /* 手机上页脚只留品牌与版权 */
+  .footer__col.footer__brand { display: block; }
+
+  /* ------------------------------------------------------- 2. 底部 Tab 栏 */
+  .tabbar {
+    display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 70;
+    height: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px));
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    align-items: stretch;
+  }
+  .tabbar__item {
+    flex: 1 1 0; min-width: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+    color: var(--text-3); text-decoration: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: color var(--dur-1) var(--ease);
+  }
+  .tabbar__item:active { background: var(--surface-2); }
+  .tabbar__item.is-active { color: var(--primary); }
+  .tabbar__item.is-active .tabbar__label { font-weight: 600; }
+  .tabbar__icon { position: relative; display: grid; place-items: center; height: 24px; }
+  .tabbar__label { font-size: 11px; line-height: 1.2; }
+  .tabbar__badge {
+    position: absolute; top: -4px; left: 12px;
+    min-width: 16px; height: 16px; padding: 0 4px; border-radius: var(--radius-full);
+    background: var(--danger, #C0392B); color: #fff;
+    font-size: 10px; line-height: 16px; text-align: center; font-style: normal;
+  }
+  /* 中间凸起的发帖按钮 */
+  .tabbar__fab {
+    flex: 0 0 auto; width: 62px;
+    display: grid; place-items: center;
+    color: #fff; text-decoration: none;
+    position: relative;
+  }
+  .tabbar__fab::after {                        /* 圆形底盘 */
+    content: ""; position: absolute; width: 44px; height: 44px;
+    border-radius: var(--radius-full); background: var(--primary);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, .12);
+    transition: transform var(--dur-1) var(--ease);
+  }
+  .tabbar__fab:active::after { transform: scale(.94); }
+  .tabbar__fab svg { position: relative; z-index: 1; }
+
+  /* ------------------------------------------------------- 3. 点击区加大
+     手指比鼠标粗，任何可点元素的触摸高度至少 44px。 */
+  .btn { min-height: var(--tap); padding-inline: var(--sp-4); }
+  .btn--sm { min-height: 40px; }
+  .btn--lg { min-height: 48px; }
+  .iconbtn { width: var(--tap); height: var(--tap); }
+  .input, .select, .textarea { min-height: var(--tap); font-size: 16px; }  /* 16px 防 iOS 自动放大 */
+  .chip, .tagchip { min-height: 40px; padding-inline: 12px; }             /* 40 = 阈值，编辑页加了标签也不会被判"太小" */
+  /* 本周歌单在手机上：表格改成"一天一块"，中午/晚上各一行，别横向挤压 */
+  .plist, .plist thead, .plist tbody, .plist tr, .plist th, .plist td { display: block; }
+  .plist thead { display: none; }
+  .plist tr { padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .plist tr:last-child { border-bottom: 0; }
+  .plist__day { display: block; width: auto; margin-bottom: 6px; font-size: var(--fs-body); }
+  .plist td { padding: 2px 0; }
+  .plist td::before { content: attr(data-slot); display: inline-block; width: 34px; color: var(--text-3); font-size: var(--fs-meta); }
+  .plist__item { padding: 3px 0; }
+  .plist__name { white-space: normal; }
+  .plist__text { max-height: 50vh; }
+  /* 「想让它周几放」这类 chip 单选：视觉上是小药丸，触摸区 44px，里面的 radio 铺满整块（别留 1px 的 sr-only） */
+  .daypick { flex-wrap: wrap; }
+  .daypick .chip { position: relative; min-height: var(--tap); display: inline-flex; align-items: center; justify-content: center; }
+  .daypick .chip > input[type="radio"] { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; }
+  .daypick .chip > span { pointer-events: none; }
+  .bbs-nav__item { min-height: var(--tap); display: inline-flex; align-items: center; padding-inline: 12px; }
+  .tabs__item, .tab { min-height: var(--tap); }
+  .sidebar__link { min-height: var(--tap); }
+  .nav__item { min-height: 44px; }
+  .pagination__item { min-width: 40px; height: 40px; }
+  .switch { min-width: 48px; }
+  /* 版块头 / 页头里的操作按钮组：手机上排成一行，各占一半，别一个按钮占一整行。
+     只有 1 个按钮时靠右对齐（不要跑到中间）。 */
+  .boardhead .cluster, .bbs-head .cluster { flex-wrap: nowrap; width: 100%; justify-content: flex-end; }
+  .boardhead .cluster > .btn, .bbs-head .cluster > .btn { flex: 0 1 auto; min-width: 0; }
+  .boardhead .cluster > .btn:only-child, .bbs-head .cluster > .btn:only-child { flex: 0 0 auto; }
+  .boardhead .cluster > .btn + .btn, .bbs-head .cluster > .btn + .btn { flex: 1 1 0; }
+  /* 预设头像的 radio：可见的是外层 <label class="radiocard">（40+px），
+     里面的 input 只有 13px —— 量点击区时会被误判，这里把它铺满但不影响视觉 */
+  /* 预设头像的 radio：可见的是外层 <label class="radiocard">（40+px），
+     里面的 input 只有 13px —— 量点击区时会被误判，这里把它铺满但不影响视觉。
+     注意：radicard 自己也要出 44px 高；.radiocards 在手机上改成"图标网格"更好点。 */
+  .radiocard { min-height: var(--tap); }
+  .radiocards { display: flex; flex-wrap: wrap; gap: 8px; }
+  .radiocards .radiocard { flex: 1 1 68px; min-width: 68px; flex-direction: column; justify-content: center; gap: 4px; text-align: center; }
+  .radiocard input { position: absolute !important; inset: 0 !important; left: 0 !important; top: 0 !important; width: 100% !important; height: 100% !important; opacity: 0; pointer-events: auto; }
+  .listmeta a, .footer a { min-height: 32px; display: inline-flex; align-items: center; }
+  /* 密码框里的"眼睛"按钮、开关：触摸目标 44px
+     （开关本体是 36x20 的小胶囊，但**可点区域**要 44px —— 用透明的外层撑开） */
+  .input-wrap__toggle { width: var(--tap); height: var(--tap); display: grid; place-items: center; }
+  .switch {
+    position: relative; box-sizing: content-box;
+    width: 36px; height: 44px; min-height: var(--tap);
+    padding: 0 8px; background: transparent; border-radius: var(--radius-sm);
+    align-items: center; justify-content: center;
+  }
+  .switch::before {                        /* 视觉上的胶囊 */
+    content: ""; position: absolute; left: 8px; right: 8px; top: 50%;
+    height: 20px; margin-top: -10px;
+    background: var(--border-strong); border-radius: var(--radius-full);
+    transition: background var(--dur-1) var(--ease);
+  }
+  .switch.is-active::before, .switch.is-on::before,
+  .switch[aria-checked="true"]::before, .switch:has(input:checked)::before { background: var(--primary); }
+  .switch__dot { position: relative; z-index: 1; }
+  .switch.is-active, .switch.is-on, .switch[aria-checked="true"], .switch:has(input:checked) { background: transparent; }
+  .settingrow .switch { margin-right: -8px; }
+  /* 表格里的操作按钮（后台）也要够大 */
+  .table td .btn, .table td .iconbtn { min-height: 38px; }
+
+  /* ------------------------------------------------------- 4. 排版与间距
+     手机上屏幕窄，留白收紧一档；正文行高放大，读起来不费眼。 */
+  .container { padding-inline: 14px; }
+  .page, .main { font-size: 15px; }
+  h1, .page__title, .bbs-head__title { font-size: 20px; line-height: 1.3; }
+  .block__title, .card__title, .section__title { font-size: 16px; }
+  .postrow__title { font-size: 16px; line-height: 1.45; }
+  .markdown { font-size: 15.5px; line-height: 1.75; }
+  .text-sm, .text-xs { line-height: 1.55; }
+
+  /* 统计条：手机上按一行排，格子等宽可收缩；格子之间保留竖分隔线
+     （components.css 的窄屏段把 border-left 全清零了，这里补回来） */
+  .bbs-stats__item {
+    flex: 1 1 0; min-width: 0;
+    border-left: 1px solid var(--border); border-top: 0;
+    padding: 10px 12px;
+  }
+  .bbs-stats__item:first-child { border-left: 0; }
+
+  .block, .card, .bbs-box { border-radius: var(--radius-md); }
+  .block__body, .card__body { padding: var(--sp-3); }
+  .block__head, .card__head { padding: var(--sp-3); }
+  .stack.gap-5 { gap: var(--sp-4); }
+  .mt-4 { margin-top: var(--sp-3); }
+  .mt-5 { margin-top: var(--sp-4); }
+  .mb-3 { margin-bottom: var(--sp-2); }
+
+  /* ------------------------------------------------------- 5. 内容组件
+     列表行在手机上折成"两段式"：标题一行，元信息一行，别挤成一坨。 */
+  .postrow { padding: 14px var(--sp-3); gap: 8px; }
+  .postrow__no { width: 20px; }
+  .postrow__meta { margin-top: 6px; gap: 4px 10px; }
+  .postrow__tags { margin-top: 5px; }
+  .postrow__main { width: 100%; }
+
+  .forumtable__row { flex-wrap: wrap; gap: 4px 8px; padding-block: 14px; }
+  .forumtable__last { flex-basis: 100%; justify-content: flex-start; color: var(--text-3); }
+
+  .rankrow { flex-wrap: wrap; gap: 4px 8px; padding-block: 12px; }
+  .rankrow__value { margin-left: 0; }
+
+  /* 帖子详情：楼层头像/正文比例更紧凑，引用块不横向溢出 */
+  .floor { padding: var(--sp-3); }
+  .floor__side { width: 40px; }
+  .quote { padding: var(--sp-2) var(--sp-3); }
+  .markdown pre { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .markdown img { max-width: 100%; height: auto; }
+  .markdown table { display: block; overflow-x: auto; }
+
+  /* 表单：手机上单列，标签在上，输入框满宽 */
+  .formgrid, .grid--2, .grid--3, .grid--4 { grid-template-columns: minmax(0, 1fr) !important; }
+  .formgrid + .formgrid, .formgrid.mt-3 { margin-top: var(--sp-3); }
+  .field__label { margin-bottom: 6px; }
+  .field__hint { font-size: 12px; }
+  .cluster { flex-wrap: wrap; }
+  .cluster > .spacer { display: none; }
+
+  /* 编辑器/工具栏（手机上横滑，桌面规则在上面已提到媒体查询外） */
+  .editorbar, .mdbar { overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
+  .editorbar::-webkit-scrollbar, .mdbar::-webkit-scrollbar { display: none; }
+  .editorbar .btn, .mdbar .btn { flex: 0 0 auto; }
+
+  /* ------------------------------------------------------- 6. 弹层
+     手机上弹窗从底部升起（底部 Tab 栏让位），抽屉全宽。 */
+  .overlay { padding: 0; align-items: flex-end; }
+  .modal {
+    width: 100% !important; max-width: none !important;
+    border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+    max-height: 88vh; margin: 0;
+  }
+  .modal__head { position: sticky; top: 0; background: var(--surface); z-index: 2; }
+  .modal__foot { position: sticky; bottom: 0; background: var(--surface); }
+  .modal__body { max-height: none; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .drawer { width: 100%; max-width: none; border-left: 0; }
+  .toasts { bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px) + 12px); top: auto; }
+  .tip, .dropdown, .usermenu__panel { max-width: calc(100vw - 24px); }
+
+  /* 管理员左侧栏在手机上全屏抽屉，并且压在 Tab 栏之上 */
+  .app__adminwrap > .sidebar { width: min(86vw, 320px); z-index: 90; }
+  .app__adminwrap > .sidebar.is-open { box-shadow: var(--shadow-md); }
+  .admin-top { position: sticky; top: 0; z-index: 50; height: 52px; padding-inline: 12px; gap: 8px; }
+  .admin-top .brand__name { display: none; }
+  .sidebar__backdrop { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, .35); z-index: 85; }
+  body.nav-open .sidebar__backdrop { display: block; }
+
+  /* 悬浮操作按钮：手机上"发帖"用右下角 FAB（配合底部 Tab 栏上移） */
+  .fab { bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px) + 14px); }
+}
+
+/* 超窄屏（iPhone SE 320~360）：再紧一档 */
+@media (max-width: 375px) {
+  .brand__name { max-width: 34vw; font-size: 14px; }
+  .tabbar__label { font-size: 10px; }
+  .container { padding-inline: 12px; }
+  .postrow { padding: 12px 10px; }
+}
+
+/* 横屏手机 / 小平板：底部 Tab 栏保留，但内容双列 */
+@media (min-width: 621px) and (max-width: 960px) {
+  .tabbar { display: none; }
+  .iconbtn--search { display: none; }
+}

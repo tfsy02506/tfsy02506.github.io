@@ -1,0 +1,339 @@
+/* ==========================================================================
+   tokens.css · 设计令牌 —— 天府师大一中·校园论坛
+   方向：干净信息流（知乎 / 小红书式克制中性 + 单一低饱和强调色）
+   原则：无渐变、无大色块、无发光阴影；层次靠 1px 描边，不靠阴影
+   契约：CONTRACT.md 第 10 节「变量」清单全部在此定义；本文件只放令牌，不写组件样式
+   顺序：tokens.css → base.css → components.css
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1) 浅色主题（默认）
+   -------------------------------------------------------------------------- */
+:root {
+  color-scheme: light;
+
+  /* —— 主色：低饱和钢蓝（克制，不发光）—— */
+  --primary: #2C6E9B;
+  --primary-600: #235B80;
+  --primary-700: #1B4761;
+  --primary-100: #EDF4F9;
+  --primary-200: #D6E5F0;
+  --primary-ink: #1B4761;
+  --primary-soft: #EDF4F9;
+  --primary-hover: #E4EFF7;
+  --on-primary: #FFFFFF;
+  --primary-solid: #2C6E9B;
+
+  /* —— 强调：暖砖红（只用于置顶 / 精华 / 未读 / 重要）—— */
+  --accent: #C0563C;
+  --accent-600: #A8472F;
+  --accent-100: #FAEFEC;
+  --accent-soft: #FAEFEC;
+  --on-accent: #FFFFFF;
+  --accent-solid: #C0563C;
+
+  /* —— 语义色（一律低饱和）—— */
+  --success: #2E7D5B;
+  --success-soft: #EDF5F0;
+  --success-solid: #2E7D5B;
+  --warn: #A9762B;
+  --warn-soft: #F8F3E9;
+  --warn-solid: #A9762B;
+  --danger: #B4453C;
+  --danger-soft: #FAEFEE;
+  --danger-solid: #B4453C;
+  --info: #3A6EA5;
+  --info-soft: #EEF3F9;
+  --info-solid: #3A6EA5;
+
+  /* —— 背景与表面（冷灰白，不是纯白也不是米黄）—— */
+  --bg: #F7F8FA;
+  --bg-soft: #F2F4F6;
+  --surface: #FFFFFF;
+  --surface-2: #FBFBFC;
+  --surface-3: #F2F4F6;
+
+  /* —— 文字 —— */
+  --text: #1B1F23;
+  --text-2: #5C646D;
+  --text-3: #8B939C;
+  --text-inverse: #FFFFFF;
+
+  /* —— 链接（真实站点有 visited 色）—— */
+  --link: #2C6E9B;
+  --link-hover: #235B80;
+  --link-visited: #6B5A8A;
+
+  /* —— 描边 / 聚焦 —— */
+  --border: #EBEDF0;
+  --border-strong: #DCDFE3;
+  --border-dashed: #E4E7EA;
+  --ring: rgba(44, 110, 155, .28);
+
+  /* —— 圆角：信息流尺度（卡片 8 / 控件 6 / 标签 4）—— */
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+  --radius-2xl: 12px;
+  --radius-full: 999px;
+
+  /* —— 阴影：默认无阴影，只有弹层一层极轻投影 —— */
+  --shadow-xs: none;
+  --shadow-sm: 0 1px 2px rgba(20, 30, 40, .04);
+  --shadow-md: 0 4px 16px rgba(20, 30, 40, .06);
+  --shadow-lg: 0 8px 28px rgba(20, 30, 40, .08);
+  --shadow-xl: 0 12px 36px rgba(20, 30, 40, .10);
+  --shadow-focus: 0 0 0 3px var(--ring);
+
+  /* —— 保留渐变变量名（页面/图表可能引用），但一律做成"无渐变"的纯色 —— */
+  --grad-primary: var(--primary);
+  --grad-accent: var(--accent);
+  --grad-hero: var(--surface);
+  --grad-soft: var(--surface-3);
+
+  /* —— 头像底色（不是渐变，是一组低饱和纯色）—— */
+  --grad-a1: #4B7FA6;
+  --grad-a2: #A2683F;
+  --grad-a3: #3F8478;
+  --grad-a4: #6B6296;
+  --grad-a5: #9C5A72;
+  --grad-a6: #4C7F57;
+  --grad-a7: #4A6899;
+  --grad-a8: #9A7B3E;
+
+  /* —— 版块色（低饱和）—— */
+  --c-0: #2C6E9B;
+  --c-1: #3A6EA5;
+  --c-2: #3F8478;
+  --c-3: #A2683F;
+  --c-4: #6B6296;
+  --c-5: #8A7434;
+  --c-6: #9C5A72;
+  --c-7: #3F7E85;
+
+  /* —— 尺寸骨架 —— */
+  --header-h: 52px;
+  --maxw: 1120px;
+  --sidebar-w: 220px;
+  --side-col-w: 280px;
+
+  /* —— 间距阶梯 —— */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 28px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* —— 字号（信息流尺度，不用营销大标题）—— */
+  --fs-page: 22px;      /* 页面主标题 */
+  --fs-h2: 18px;        /* 区块大标题 */
+  --fs-title: 16px;     /* 帖子标题 / 弹窗标题 */
+  --fs-section: 15px;   /* 区段标题 */
+  --fs-body: 14px;      /* 正文 */
+  --fs-sm: 13px;
+  --fs-meta: 12.5px;    /* 元信息 */
+  --fs-xs: 12px;
+
+  /* —— 字体（全部系统字体，禁止外网字体）—— */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+
+  /* —— 动效（克制）—— */
+  --dur-1: .12s;
+  --dur-2: .18s;
+  --dur-3: .26s;
+  --ease: cubic-bezier(.2, .7, .3, 1);
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+
+  /* —— 层级 —— */
+  --z-header: 50;
+  --z-sidebar: 60;
+  --z-overlay: 90;
+  --z-toast: 120;
+
+  /* —— 外壳 —— */
+  --header-bg: #FFFFFF;              /* 实底，不要毛玻璃 */
+  --overlay-bg: rgba(27, 31, 35, .42);
+  --logo-shadow: none;
+  --ring-brand: 0 0 0 3px rgba(44, 110, 155, .12);
+}
+
+/* --------------------------------------------------------------------------
+   2) 暗色主题：干净暗色（低对比、无发光，像知乎暗色）
+   -------------------------------------------------------------------------- */
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --primary: #5FA8D3;
+  --primary-600: #79B9DE;
+  --primary-700: #8FC6E6;
+  --primary-100: #1E2A33;
+  --primary-200: #26343F;
+  --primary-ink: #CFE4F1;
+  --primary-soft: #1E2A33;
+  --primary-hover: #22303A;
+  --on-primary: #10222E;
+  --primary-solid: #4E9BC8;
+
+  --accent: #D9806A;
+  --accent-600: #E39B88;
+  --accent-100: #2E2320;
+  --accent-soft: #2E2320;
+  --on-accent: #1A1310;
+  --accent-solid: #C4705B;
+
+  --success: #6BAE8C;
+  --success-soft: #1D2A24;
+  --success-solid: #4E9377;
+  --warn: #C7A15E;
+  --warn-soft: #2B2620;
+  --warn-solid: #A9853F;
+  --danger: #D2766E;
+  --danger-soft: #2C2120;
+  --danger-solid: #B85D55;
+  --info: #77A6D4;
+  --info-soft: #1E2731;
+  --info-solid: #5A8CBE;
+
+  --bg: #15171A;
+  --bg-soft: #1A1D20;
+  --surface: #1C1F23;
+  --surface-2: #202427;
+  --surface-3: #24282C;
+
+  --text: #E7E9EB;
+  --text-2: #A8AEB5;
+  --text-3: #7C838B;
+  --text-inverse: #15171A;
+
+  --link: #7CB8DC;
+  --link-hover: #9ACAE6;
+  --link-visited: #A99BC4;
+
+  --border: #2A2E33;
+  --border-strong: #3A3F45;
+  --border-dashed: #31363B;
+  --ring: rgba(95, 168, 211, .38);
+
+  --shadow-xs: none;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .35);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, .42);
+  --shadow-lg: 0 8px 28px rgba(0, 0, 0, .48);
+  --shadow-xl: 0 12px 36px rgba(0, 0, 0, .52);
+
+  --grad-primary: var(--primary);
+  --grad-accent: var(--accent);
+  --grad-hero: var(--surface);
+  --grad-soft: var(--surface-3);
+
+  --grad-a1: #5D8FB0;
+  --grad-a2: #B07C55;
+  --grad-a3: #529B8E;
+  --grad-a4: #7E76A8;
+  --grad-a5: #AE6F88;
+  --grad-a6: #5F9670;
+  --grad-a7: #5C7BAB;
+  --grad-a8: #AE9052;
+
+  --c-0: #5FA8D3;
+  --c-1: #77A6D4;
+  --c-2: #6BAE8C;
+  --c-3: #C79A6B;
+  --c-4: #948BC0;
+  --c-5: #BE9E5B;
+  --c-6: #C08099;
+  --c-7: #6BA3AB;
+
+  --header-bg: #1C1F23;
+  --overlay-bg: rgba(0, 0, 0, .58);
+  --ring-brand: 0 0 0 3px rgba(95, 168, 211, .14);
+}
+
+/* 未显式设置主题时跟随系统（避免暗色用户首屏闪白） */
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme]) {
+    color-scheme: dark;
+
+    --primary: #5FA8D3;
+    --primary-600: #79B9DE;
+    --primary-700: #8FC6E6;
+    --primary-100: #1E2A33;
+    --primary-200: #26343F;
+    --primary-ink: #CFE4F1;
+    --primary-soft: #1E2A33;
+    --primary-hover: #22303A;
+    --on-primary: #10222E;
+    --primary-solid: #4E9BC8;
+
+    --accent: #D9806A;
+    --accent-600: #E39B88;
+    --accent-100: #2E2320;
+    --accent-soft: #2E2320;
+    --on-accent: #1A1310;
+    --accent-solid: #C4705B;
+
+    --success: #6BAE8C;
+    --success-soft: #1D2A24;
+    --success-solid: #4E9377;
+    --warn: #C7A15E;
+    --warn-soft: #2B2620;
+    --warn-solid: #A9853F;
+    --danger: #D2766E;
+    --danger-soft: #2C2120;
+    --danger-solid: #B85D55;
+    --info: #77A6D4;
+    --info-soft: #1E2731;
+    --info-solid: #5A8CBE;
+
+    --bg: #15171A;
+    --bg-soft: #1A1D20;
+    --surface: #1C1F23;
+    --surface-2: #202427;
+    --surface-3: #24282C;
+
+    --text: #E7E9EB;
+    --text-2: #A8AEB5;
+    --text-3: #7C838B;
+    --text-inverse: #15171A;
+
+    --link: #7CB8DC;
+    --link-hover: #9ACAE6;
+    --link-visited: #A99BC4;
+
+    --border: #2A2E33;
+    --border-strong: #3A3F45;
+    --border-dashed: #31363B;
+    --ring: rgba(95, 168, 211, .38);
+
+    --shadow-xs: none;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, .35);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, .42);
+    --shadow-lg: 0 8px 28px rgba(0, 0, 0, .48);
+    --shadow-xl: 0 12px 36px rgba(0, 0, 0, .52);
+
+    --grad-primary: var(--primary);
+    --grad-accent: var(--accent);
+    --grad-hero: var(--surface);
+    --grad-soft: var(--surface-3);
+
+    --c-0: #5FA8D3;
+    --c-1: #77A6D4;
+    --c-2: #6BAE8C;
+    --c-3: #C79A6B;
+    --c-4: #948BC0;
+    --c-5: #BE9E5B;
+    --c-6: #C08099;
+    --c-7: #6BA3AB;
+
+    --header-bg: #1C1F23;
+    --overlay-bg: rgba(0, 0, 0, .58);
+    --ring-brand: 0 0 0 3px rgba(95, 168, 211, .14);
+  }
+}

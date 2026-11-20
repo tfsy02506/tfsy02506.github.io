@@ -1,0 +1,384 @@
+/* 天府师大一中·校园论坛 —— 通用工具层 TF.util（data 负责，契约第 3 节）
+   纯原生 JS，classic script，无任何依赖。 */
+(function () {
+  'use strict';
+  var TF = (window.TF = window.TF || {});
+  TF.extend = TF.extend || function (n, o) { TF[n] = Object.assign(TF[n] || {}, o); return TF[n]; };
+
+  var ENT = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  var ENT_RE = /[&<>"']/g;
+
+  function esc(v) {
+    if (v === null || v === undefined) return '';
+    return String(v).replace(ENT_RE, function (c) { return ENT[c]; });
+  }
+
+  function attr(v) { return esc(v); }
+
+  function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
+  function toNum(n) {
+    var v = Number(n);
+    return isFinite(v) ? v : 0;
+  }
+
+  /* 1234 -> '1,234'；digits>0 时保留小数 */
+  function num(n, digits) {
+    digits = digits || 0;
+    var v = toNum(n);
+    var neg = v < 0;
+    var s = Math.abs(v).toFixed(digits);
+    var parts = s.split('.');
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return (neg ? '-' : '') + parts.join('.');
+  }
+
+  function trimZero(s) { return s.replace(/\.0+$/, ''); }
+
+  /* 12345 -> '1.2万' */
+  function shortNum(n) {
+    var v = toNum(n);
+    var a = Math.abs(v);
+    var sign = v < 0 ? '-' : '';
+    if (a >= 1e8) return sign + trimZero((a / 1e8).toFixed(2)) + '亿';
+    if (a >= 1e4) return sign + trimZero((a / 1e4).toFixed(1)) + '万';
+    return sign + num(Math.round(a));
+  }
+
+  function todayStart() {
+    var d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+
+  function fmtDate(ts) {
+    var d = ts instanceof Date ? ts : new Date(toNum(ts));
+    if (isNaN(d.getTime())) return '';
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+  }
+
+  function fmtTime(ts, withTime) {
+    var d = ts instanceof Date ? ts : new Date(toNum(ts));
+    if (isNaN(d.getTime())) return '';
+    var s = fmtDate(d);
+    if (withTime === false) return s;
+    return s + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  /* '刚刚' / '5分钟前' / '3小时前' / '昨天 12:03' / '3天前' / '2025-03-02' */
+  function relTime(ts) {
+    var t = toNum(ts);
+    if (!t) return '';
+    var now = Date.now();
+    var d = now - t;
+    if (d < 0) d = 0;
+    if (d < 60e3) return '刚刚';
+    if (d < 3600e3) return Math.floor(d / 60e3) + '分钟前';
+    var start = todayStart();
+    if (t >= start) return Math.floor(d / 3600e3) + '小时前';
+    if (t >= start - 864e5) {
+      var y = new Date(t);
+      return '昨天 ' + pad2(y.getHours()) + ':' + pad2(y.getMinutes());
+    }
+    if (t >= start - 864e5 * 6) return Math.max(2, Math.floor((start - t) / 864e5)) + '天前';
+    return fmtDate(t);
+  }
+
+  function stripHtml(html) {
+    if (html === null || html === undefined) return '';
+    var s = String(html)
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<br\s*\/?>/gi, ' ')
+      .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, ' ')
+      .replace(/<[^>]+>/g, '');
+    s = s.replace(/&nbsp;/g, ' ')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&');
+    return s.replace(/\s+/g, ' ').trim();
+  }
+
+  function excerpt(text, n) {
+    n = n || 80;
+    var s = stripHtml(text);
+    if (s.length <= n) return s;
+    return s.slice(0, n) + '…';
+  }
+
+  function safeLink(url) {
+    var u = String(url || '').trim();
+    if (!u) return '';
+    if (/^(https?:|mailto:|tel:)/i.test(u)) return u;
+    if (/^(#|\/(?!\/)|\.\.?\/)/.test(u)) return u;
+    return '';
+  }
+
+  function safeImg(url) {
+    var u = String(url || '').trim();
+    if (/^data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,/i.test(u)) return u;
+    return safeLink(u);
+  }
+
+  function inline(s) {
+    s = s.replace(/`([^`]+)`/g, function (m, c) { return '<code>' + c + '</code>'; });
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, function (m, p, c) { return p + '<em>' + c + '</em>'; });
+    s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, function (m, alt, url) {
+      var u = safeImg(url);
+      return u ? '<img src="' + u + '" alt="' + alt + '" loading="lazy">' : m;
+    });
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (m, txt, url) {
+      var u = safeLink(url);
+      return u ? '<a href="' + u + '" target="_blank" rel="noopener">' + txt + '</a>' : txt;
+    });
+    return s;
+  }
+
+  /* 极简安全 Markdown：先整体转义，再按行/行内渲染，绝不输出原始 HTML */
+  function md(text) {
+    if (text === null || text === undefined) return '';
+    var src = String(text).replace(/\r\n?/g, '\n');
+    var blocks = [];
+    src = src.replace(/```([\s\S]*?)```/g, function (m, code) {
+      blocks.push('<pre><code>' + esc(code.replace(/^\n+|\n+$/g, '')) + '</code></pre>');
+      return '\u0000B' + (blocks.length - 1) + '\u0000';
+    });
+
+    var lines = esc(src).split('\n');
+    var out = [];
+    var list = [];
+    var listTag = '';
+
+    function flushList() {
+      if (!list.length) return;
+      out.push('<' + listTag + '>' + list.join('') + '</' + listTag + '>');
+      list = [];
+      listTag = '';
+    }
+
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      var ph = line.match(/^\u0000B(\d+)\u0000$/);
+      if (ph) { flushList(); out.push(blocks[+ph[1]] || ''); continue; }
+      if (!line.trim()) { flushList(); continue; }
+      var m;
+      if ((m = line.match(/^\s*&gt;\s?(.*)$/))) { flushList(); out.push('<blockquote>' + inline(m[1]) + '</blockquote>'); continue; }
+      if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) {
+        if (listTag && listTag !== 'ul') flushList();
+        listTag = 'ul'; list.push('<li>' + inline(m[1]) + '</li>'); continue;
+      }
+      if ((m = line.match(/^\s*\d+[.、)]\s+(.*)$/))) {
+        if (listTag && listTag !== 'ol') flushList();
+        listTag = 'ol'; list.push('<li>' + inline(m[1]) + '</li>'); continue;
+      }
+      if ((m = line.match(/^\s*(#{1,4})\s+(.*)$/))) {
+        flushList();
+        var lv = Math.min(4, m[1].length);
+        out.push('<h' + lv + '>' + inline(m[2]) + '</h' + lv + '>');
+        continue;
+      }
+      flushList();
+      out.push('<p>' + inline(line) + '</p>');
+    }
+    flushList();
+    return out.join('\n');
+  }
+
+  function uid(prefix) {
+    prefix = prefix || 'id';
+    return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  }
+
+  function clamp(n, min, max) {
+    var v = toNum(n);
+    if (min !== undefined && v < min) v = min;
+    if (max !== undefined && v > max) v = max;
+    return v;
+  }
+
+  function debounce(fn, wait) {
+    wait = wait === undefined ? 250 : wait;
+    var timer = null;
+    function wrapped() {
+      var self = this;
+      var args = arguments;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(function () { timer = null; fn.apply(self, args); }, wait);
+    }
+    wrapped.cancel = function () { if (timer) { clearTimeout(timer); timer = null; } };
+    return wrapped;
+  }
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, Math.max(0, toNum(ms))); });
+  }
+
+  function pick(arr) {
+    if (!arr || !arr.length) return undefined;
+    return arr[Math.floor(Math.random() * arr.length)];
+  }
+
+  function shuffle(arr) {
+    var a = (arr || []).slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+  }
+
+  /* 压缩到最长边 <= maxSide（默认 1280），失败时回退原始 dataURL */
+  function fileToDataUrl(file, maxSide) {
+    maxSide = maxSide || 1280;
+    return new Promise(function (resolve, reject) {
+      if (!file) { reject(new Error('没有选择文件')); return; }
+      if (typeof FileReader === 'undefined') { reject(new Error('当前环境不支持读取文件')); return; }
+      var reader = new FileReader();
+      reader.onerror = function () { reject(new Error('文件读取失败，请重试')); };
+      reader.onload = function () {
+        var raw = reader.result;
+        if (typeof Image === 'undefined' || typeof document === 'undefined') { resolve(raw); return; }
+        var img = new Image();
+        img.onerror = function () { resolve(raw); };
+        img.onload = function () {
+          var w = img.width || maxSide, h = img.height || maxSide;
+          var scale = Math.min(1, maxSide / Math.max(w, h));
+          if (scale >= 1 && (file.size || 0) <= 400 * 1024) { resolve(raw); return; }
+          try {
+            var cw = Math.max(1, Math.round(w * scale));
+            var ch = Math.max(1, Math.round(h * scale));
+            var cv = document.createElement('canvas');
+            cv.width = cw; cv.height = ch;
+            var ctx = cv.getContext('2d');
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, cw, ch);
+            ctx.drawImage(img, 0, 0, cw, ch);
+            resolve(cv.toDataURL('image/jpeg', 0.86));
+          } catch (e) { resolve(raw); }
+        };
+        img.src = raw;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function copy(text) {
+    var s = text === null || text === undefined ? '' : String(text);
+    return new Promise(function (resolve) {
+      function fallback() {
+        try {
+          if (typeof document === 'undefined') { resolve(false); return; }
+          var ta = document.createElement('textarea');
+          ta.value = s;
+          ta.setAttribute('readonly', 'readonly');
+          ta.style.position = 'fixed';
+          ta.style.top = '-1000px';
+          document.body.appendChild(ta);
+          ta.select();
+          ta.setSelectionRange(0, s.length);
+          var ok = document.execCommand && document.execCommand('copy');
+          document.body.removeChild(ta);
+          resolve(!!ok);
+        } catch (e) { resolve(false); }
+      }
+      try {
+        if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(s).then(function () { resolve(true); }, fallback);
+          return;
+        }
+      } catch (e) { /* 走兜底方案 */ }
+      fallback();
+    });
+  }
+
+  function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+  /* 关键词高亮，输出已转义 */
+  function highlight(text, kw) {
+    var s = text === null || text === undefined ? '' : String(text);
+    kw = kw === null || kw === undefined ? '' : String(kw).trim();
+    if (!kw) return esc(s);
+    var parts = s.split(new RegExp('(' + escapeRe(kw) + ')', 'gi'));
+    var out = '';
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i]) continue;
+      out += (i % 2 === 1) ? '<mark>' + esc(parts[i]) + '</mark>' : esc(parts[i]);
+    }
+    return out;
+  }
+
+  function sexLabel(sex) {
+    if (sex === '男' || sex === '女') return sex;
+    return '未设置';
+  }
+
+  /* ---- 以下为数据层内部使用的补充工具（契约未禁止） ---- */
+
+  /* FNV-1a 32 位哈希，返回 8 位十六进制 */
+  function hash(str) {
+    var s = str === null || str === undefined ? '' : String(str);
+    var h = 0x811c9dc5;
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    return ('00000000' + h.toString(16)).slice(-8);
+  }
+
+  function hashPass(pwd) { return 'hash:' + hash(pwd); }
+
+  function checkPass(pwd, stored) {
+    var s = String(stored || '');
+    if (!s) return false;
+    if (s.indexOf('hash:') === 0) return s === hashPass(pwd);
+    return s === String(pwd || ''); // 兼容极端情况下遗留的明文（登录后会被升级为哈希）
+  }
+
+  /* 本地日期键：'2025-03-02' */
+  function dateKey(ts) { return fmtDate(ts === undefined ? Date.now() : ts); }
+
+  function sensitiveHit(text, words) {
+    var s = String(text || '');
+    var ws = words || [];
+    for (var i = 0; i < ws.length; i++) {
+      var w = String(ws[i] || '').trim();
+      if (w && s.toLowerCase().indexOf(w.toLowerCase()) >= 0) return w;
+    }
+    return '';
+  }
+
+  TF.extend('util', {
+    esc: esc,
+    attr: attr,
+    num: num,
+    shortNum: shortNum,
+    relTime: relTime,
+    fmtTime: fmtTime,
+    fmtDate: fmtDate,
+    todayStart: todayStart,
+    stripHtml: stripHtml,
+    md: md,
+    excerpt: excerpt,
+    uid: uid,
+    clamp: clamp,
+    debounce: debounce,
+    sleep: sleep,
+    pick: pick,
+    shuffle: shuffle,
+    fileToDataUrl: fileToDataUrl,
+    copy: copy,
+    highlight: highlight,
+    sexLabel: sexLabel,
+    // 数据层扩展
+    hash: hash,
+    hashPass: hashPass,
+    checkPass: checkPass,
+    escapeRe: escapeRe,
+    dateKey: dateKey,
+    sensitiveHit: sensitiveHit,
+    pad2: pad2
+  });
+})();

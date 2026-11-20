@@ -1,0 +1,2502 @@
+/* 天府师大一中·校园论坛 —— 论坛主体页面 pages-forum.js（R5 重写：干净信息流 + 版主权限 + 去 AI 文案）
+ * 路由：#/forum #/board/:id #/post/:id #/new #/edit/:id #/u/:id #/me #/messages #/settings #/search
+ * 依赖：CONTRACT §3 util / §6 store / §6.2 守卫归 app.js / §7 路由 / §8 TF.ui / §9 data-action / §10 类名
+ *
+ * 设计口径（R5：用户反馈「太像 AI」）：
+ *   知乎式信息流 —— 1px 描边分层，不用大色块、不用渐变；
+ *   版块 = .forumtable 行；帖子列表 = .postrow 行；帖子流 = .postcard 条目；评论区 = 论坛楼层（#N + .quote + .sigline）。
+ * 角色（R5）：student / mod（版主）/ admin（站长）。内容管理权限一律走 TF.store.canManage()。
+ * 加载顺序（CONTRACT §1 R3）：… design → app → pages-core → pages-forum → admin，
+ *   所以模块顶层直接 TF.app.register / TF.app.on（不做延迟注册，避免重复注册）。
+ */
+(function () {
+  'use strict';
+
+  var TF = (window.TF = window.TF || {});
+  TF.extend = TF.extend || function (n, o) { TF[n] = Object.assign(TF[n] || {}, o); return TF[n]; };
+
+  var U = TF.util, ST = TF.store, UI = TF.ui;
+
+  var PREF_KEY = 'tf.forum.prefs';
+  var DRAFT_PREFIX = 'tf.forum.draft.';
+  var PAGE_SIZE = 15;
+  var MAX_TAGS = 5;
+  var MAX_IMAGES = 3;
+  var GRADES = ['初一', '初二', '初三', '高一', '高二', '高三'];
+  /* 班级只能选 1~10 班（与后端 RE_KLASS 一致） */
+  var KLASS_OPTIONS = ['1班', '2班', '3班', '4班', '5班', '6班', '7班', '8班', '9班', '10班'];
+  /* 放歌的日子：周一到周五（周末不放）；索引 0 留空，方便用 dayOfWeek 直接取 */
+  var DAY_NAMES = ['', '周一', '周二', '周三', '周四', '周五'];
+  var REPORT_REASONS = ['广告', '骂人', '色情低俗', '泄露隐私', '抄袭', '其他'];
+  var SORTS = [{ key: 'latest', label: '最新' }, { key: 'hot', label: '热门' }, { key: 'essence', label: '精华' }, { key: 'unanswered', label: '待解答' }];
+  var PAGES = {
+    forum: 'data-page="forum"', board: 'data-page="board"', post: 'data-page="post"',
+    new: 'data-page="new"', edit: 'data-page="new"', profile: 'data-page="profile"',
+    me: 'data-page="profile"', messages: 'data-page="messages"',
+    settings: 'data-page="settings"', search: 'data-page="search"'
+  };
+
+  /* ==================================================================
+     0 · 基础工具
+     ================================================================== */
+
+  function esc(v) { return U.esc(v); }
+  /* 属性值转义：把 & < > " ' 一律换成实体。
+     这里**不**信任 U.attr（历史上出现过属性值里的 > 没被转义，
+     导致浏览器提前结束标签、整块版面被吞进 <a> 的故障），自己兜一道。 */
+  function attr(v) {
+    return String(v === null || v === undefined ? '' : v)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  /* 拼一个 <a>：链接自己转义，不再走 "href=\"" + attr(...) + ">" 这种易错拼接。
+     踩过的坑：属性值里的 > (或任何未转义字符) 会让浏览器提前结束标签，
+     后面的排序条/标题/卡片全被吞进这个 <a> 里 —— 桌面端整块版面错位。 */
+  function anchor(cls, url, label, extra) {
+    return '<a class="' + attr(cls || '') + '" href="' + attr(url) + '"' + (extra || '') + '>' + label + '</a>';
+  }
+  function arr(v) { return Array.isArray(v) ? v : []; }
+  function str(v) { return v === null || v === undefined ? '' : String(v); }
+  function num(v) { return U.num(v || 0); }
+  function snum(v) { return U.shortNum(v || 0); }
+  function rel(ts) { return U.relTime(ts); }
+  function icon(n, s, c) { return UI.icon(n, s, c); }
+  function toast(m, t, ms) { UI.toast(m, t, ms); }
+  function go(path, query) { if (TF.app && TF.app.go) TF.app.go(path, query); else location.hash = '#' + path; }
+  function refresh() { if (TF.app && TF.app.refresh) TF.app.refresh(); }
+  function me() { return ST.currentUser ? ST.currentUser() : null; }
+  function canManage() { return !!(ST.canManage && ST.canManage()); }
+  function settings() { return ST.getSettings ? (ST.getSettings() || {}) : {}; }
+  function toInt(v, d) { var n = parseInt(v, 10); return isFinite(n) && n > 0 ? n : d; }
+  function dp(obj) { return " data-param='" + attr(JSON.stringify(obj || {})) + "'"; }
+  function isManager(u) { return !!(u && (u.role === 'mod' || u.role === 'admin')); }
+
+  function href(path, query) {
+    var parts = [];
+    Object.keys(query || {}).forEach(function (k) {
+      var v = query[k];
+      if (v === undefined || v === null || v === '') return;
+      parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+    });
+    return '#' + path + (parts.length ? '?' + parts.join('&') : '');
+  }
+  function withQ(q, patch) {
+    var out = {};
+    Object.keys(q || {}).forEach(function (k) { out[k] = q[k]; });
+    Object.keys(patch || {}).forEach(function (k) { out[k] = patch[k]; });
+    return out;
+  }
+  function shareUrl(path) { return str(location.href).split('#')[0] + '#' + path; }
+
+  function replaceOuter(el, html) {
+    if (!el || !el.parentNode) return;
+    var box = document.createElement('div');
+    box.innerHTML = html;
+    if (box.firstChild) el.parentNode.replaceChild(box.firstChild, el);
+  }
+
+  /* 本机界面偏好（契约 §6.1.4：不写入 tf.forum.v2；主题由 design.js 存在 tf.theme） */
+  function readPrefs() {
+    try { return JSON.parse(localStorage.getItem(PREF_KEY) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+  function savePrefs(patch) {
+    var p = readPrefs();
+    Object.keys(patch || {}).forEach(function (k) { p[k] = patch[k]; });
+    try { localStorage.setItem(PREF_KEY, JSON.stringify(p)); } catch (e) { /* 隐私模式忽略 */ }
+    return p;
+  }
+  /* 头像：服务端 avatarUrl 优先（design.js 对字符串 avatar 已经渲染 <img>，.avatar img 样式在 components.css 里），
+     没有上传头像就用预设色块。本机不再保存头像 —— 旧的 tf.forum.prefs.avatarImg 是「假成功」的根源，已废弃。 */
+  function av(user, size, cls) {
+    if (!user) return UI.avatar('已注销', size, cls);
+    var img = str(user.avatarUrl);
+    if (img) return UI.avatar({ id: user.id, nickname: nick(user), avatar: img }, size, cls);
+    return UI.avatar(user, size, cls);
+  }
+  /* 资料保存：走 store.updateProfile；store 的白名单还没放开 realName/avatarUrl 时，
+     用同一端点补一次（TF.api.put('/me')），避免「看起来存上了其实没存」。 */
+  function saveProfile(patch) {
+    var res = ST.updateProfile(patch);
+    if (!res || !res.ok) return res;
+    var extras = {};
+    if (patch.realName !== undefined) extras.realName = patch.realName;
+    if (patch.avatarUrl !== undefined) extras.avatarUrl = patch.avatarUrl;
+    if (!Object.keys(extras).length || !TF.api || !TF.api.put) return res;
+    var u = res.user || me() || {};
+    var dropped = Object.keys(extras).some(function (k) {
+      return !(k in u) || str(u[k]) !== str(extras[k]);
+    });
+    if (!dropped) return res;
+    try {
+      var r2 = TF.api.put('/me', extras);
+      if (r2 && typeof r2.then === 'function') {
+        r2.then(function () {
+          /* 服务端 /api/me 对本人也可能回空值，等快照刷新落库后再渲染一次 */
+          setTimeout(function () { refresh(); }, 500);
+        }, function (e) { toast((e && e.error) || '资料没存上', 'error'); });
+      } else if (r2 && r2.ok === false) return { ok: false, error: r2.error || '资料没存上' };
+    } catch (e2) { return { ok: false, error: '资料没存上，刷新再试' }; }
+    return res;
+  }
+  /* 真上传头像：store.uploadAvatar(file) 返回 thenable → {ok,url,error}；
+     没有它就退回 api-client 的 /upload（返回 url 字符串）。 */
+  function uploadAvatarFile(file) {
+    if (ST.uploadAvatar) return Promise.resolve(ST.uploadAvatar(file));
+    if (TF.api && TF.api.upload) {
+      return TF.api.upload(file).then(function (u) { return { ok: true, url: str(u) }; });
+    }
+    return Promise.resolve({ ok: false, error: '头像上传还没上线，稍后再试' });
+  }
+  function uploadedUrl(res) {
+    if (res === null || res === undefined) return '';
+    if (typeof res === 'string') return res;
+    if (typeof res === 'object') return str(res.url || res.avatarUrl || '');
+    return str(res);
+  }
+  function avatarUrlOf(user) { return user ? str(user.avatarUrl) : ''; }
+  function nick(u) {
+    if (!u) return '已注销';
+    return u.nickname || u.username || '匿名';
+  }
+  function roleBadge(u) {
+    if (!u) return '';
+    if (u.role === 'admin') return UI.badge('站长', 'primary');
+    if (u.role === 'mod') return UI.badge('版主', 'mod');
+    return '';
+  }
+
+  function draftKey(id) { return DRAFT_PREFIX + (id || 'new'); }
+  function readDraft(key) { try { var r = localStorage.getItem(key); return r ? JSON.parse(r) : null; } catch (e) { return null; } }
+  function writeDraft(key, d) { try { localStorage.setItem(key, JSON.stringify(d)); } catch (e) { /* 忽略 */ } }
+  function clearDraft(key) { try { localStorage.removeItem(key); } catch (e) { /* 忽略 */ } }
+
+  /* 敏感词：契约 §6.1.5 由页面侧实现 */
+  function sensitiveHit(text, words) {
+    var s = str(text).toLowerCase();
+    var list = arr(words);
+    for (var i = 0; i < list.length; i++) {
+      var w = str(list[i]).trim();
+      if (w && s.indexOf(w.toLowerCase()) >= 0) return w;
+    }
+    return '';
+  }
+
+  /* ==================================================================
+     1 · 公共片段
+     ================================================================== */
+
+  function li(iconName, text) {
+    return '<span class="listmeta__item">' + icon(iconName, 13) + '<span>' + esc(text) + '</span></span>';
+  }
+  function crumb(items) {
+    var list = items || [];
+    return '<nav class="crumb" aria-label="面包屑">' + list.map(function (it, i) {
+      if (i !== list.length - 1 && it.href) return '<a href="' + attr(it.href) + '">' + esc(it.text) + '</a>';
+      return '<span>' + esc(it.text) + '</span>';
+    }).join('') + '</nav>';
+  }
+  function block(title, body, more) {
+    return '<div class="block">' +
+      (title ? '<div class="block__head"><h2 class="block__title">' + esc(title) + '</h2>' + (more || '') + '</div>' : '') +
+      '<div class="block__body">' + body + '</div></div>';
+  }
+  function boxBlock(title, body, more) {
+    return '<div class="block block--box">' +
+      (title ? '<div class="block__head"><h2 class="block__title">' + esc(title) + '</h2>' + (more || '') + '</div>' : '') +
+      '<div class="block__body">' + body + '</div></div>';
+  }
+  function rowBlock(title, rows, more) {
+    return '<div class="block block--box block--flush">' +
+      (title ? '<div class="block__head"><h2 class="block__title">' + esc(title) + '</h2>' + (more || '') + '</div>' : '') +
+      '<div class="block__body">' + rows + '</div></div>';
+  }
+  function plain(title, desc) {
+    return '<div class="empty--plain">' + esc(title || '空') + (desc ? '<div class="mt-1">' + esc(desc) + '</div>' : '') + '</div>';
+  }
+  function pager(path, query, pageData) {
+    if (!pageData || !pageData.total) return '';
+    return UI.pagination({
+      page: pageData.page, pages: pageData.pages, total: pageData.total,
+      makeHref: function (p) { return href(path, withQ(query, { page: p })); }
+    });
+  }
+  function flagBadges(p) {
+    var out = '';
+    if (p.pinned) out += UI.badge('置顶', 'pinned');
+    if (p.featured) out += UI.badge('精华', 'essence');
+    if (p.locked) out += UI.badge('锁定', 'default');
+    if (p.status === 'pending') out += UI.badge('审核中', 'warn');
+    if (p.status === 'hidden') out += UI.badge('已下架', 'danger');
+    return out;
+  }
+  function tagsHtml(tags, boardId) {
+    return arr(tags).map(function (t) {
+      return '<a class="tag" href="' + attr(href('/board/' + boardId, { tag: t })) + '">' + esc(t) + '</a>';
+    }).join('');
+  }
+  function boardName(id) { var b = ST.getBoard(id); return b ? b.name : '版块'; }
+  /* 排序筛选：用 .tabs（组件自带 overflow-x:auto、不换行）→ 手机上横向可滑，不堆成两排 */
+  function sortNav(path, query, current) {
+    return '<nav class="tabs">' + SORTS.map(function (s) {
+      return anchor('tab' + (s.key === current ? ' is-active' : ''), href(path, withQ(query, { sort: s.key, page: '' })), esc(s.label));
+    }).join('') + '</nav>';
+  }
+  /* 标签筛选：也用 .tabs/.tab（.tab 自带 white-space:nowrap，不会被挤成竖排字），容器横向可滑 */
+  function tagFilterHtml(path, query, tags, active) {
+    return '<div class="tabs">' +
+      anchor('tab' + (active ? '' : ' is-active'), href(path, withQ(query, { tag: '', page: '' })), '全部') +
+      arr(tags).map(function (t) {
+        var name = t.tag || t.name || '';
+        var on = name === active;
+        return anchor('tab' + (on ? ' is-active' : ''), href(path, withQ(query, { tag: on ? '' : name, page: '' })),
+          '#' + esc(name) + '<b>' + (t.count == null ? 0 : t.count) + '</b>');
+      }).join('') + '</div>';
+  }
+
+  /* 版主 / 站长操作条；学生返回空串（不留灰按钮） */
+  function modBarHtml(p, compact) {
+    if (!canManage()) return '';
+    var base = compact ? 'btn btn--text btn--sm' : 'btn btn--ghost btn--sm';
+    function btn(actName, label, danger) {
+      var cls = danger ? base.replace('btn--ghost', 'btn--danger') : base;
+      return '<button type="button" class="' + cls + '" data-action="mod.act"' + dp({ id: p.id, act: actName }) + '>' + esc(label) + '</button>';
+    }
+    return '<span class="cluster gap-1">' +
+      btn(p.pinned ? 'unpin' : 'pin', p.pinned ? '取消置顶' : '置顶') +
+      btn(p.featured ? 'unfeature' : 'feature', p.featured ? '取消加精' : '加精') +
+      btn(p.locked ? 'unlock' : 'lock', p.locked ? '解锁' : '锁定') +
+      (p.status === 'published' ? btn('hide', '下架', true) : btn('publish', '恢复')) +
+      '</span>';
+  }
+
+  /* ---------------- 列表条目 ---------------- */
+  function postRowHtml(p, o) {
+    o = o || {};
+    var author = ST.getUser(p.authorId);
+    var titleHtml = o.hl ? U.highlight(p.title, o.hl) : esc(p.title);
+    return '<div class="postrow' + (p.pinned ? ' postrow--pinned' : '') + (p.featured ? ' postrow--essence' : '') + '">' +
+      (o.no ? '<span class="postrow__no">' + o.no + '</span>' : '') +
+      '<div class="postrow__main">' +
+        '<div class="postrow__title">' + flagBadges(p) + songBadgeOf(p) + '<a href="' + attr(href('/post/' + p.id)) + '">' + titleHtml + '</a></div>' +
+        '<div class="postrow__meta listmeta">' +
+          (o.showBoard ? li('grid', boardName(p.boardId)) : '') +
+          li('user', nick(author)) + li('clock', rel(p.createdAt)) +
+          li('eye', snum(p.views)) + li('comment', snum(p.commentCount)) +
+        '</div>' +
+        (arr(p.tags).length ? '<div class="postrow__tags">' + tagsHtml(arr(p.tags).slice(0, 4), p.boardId) + '</div>' : '') +
+        (canManage() ? '<div class="mt-2">' + modBarHtml(p, true) + '</div>' : '') +
+      '</div></div>';
+  }
+
+  function postCardHtml(p, o) {
+    o = o || {};
+    var author = ST.getUser(p.authorId);
+    var titleHtml = o.hl ? U.highlight(p.title, o.hl) : esc(p.title);
+    var excerpt = p.content ? U.excerpt(p.content, 110) : '';
+    return '<article class="postcard">' +
+      '<h3 class="postcard__title">' + flagBadges(p) + songBadgeOf(p) + ' <a href="' + attr(href('/post/' + p.id)) + '">' + titleHtml + '</a></h3>' +
+      (excerpt ? '<div class="postcard__excerpt">' + (o.hl ? U.highlight(excerpt, o.hl) : esc(excerpt)) + '</div>' : '') +
+      (arr(p.tags).length ? '<div class="postcard__tags">' + tagsHtml(arr(p.tags).slice(0, 4), p.boardId) + '</div>' : '') +
+      '<div class="postcard__meta listmeta">' +
+        (o.showBoard ? li('grid', boardName(p.boardId)) : '') +
+        '<a class="listmeta__item" href="' + attr(href('/u/' + p.authorId)) + '">' + av(author, 20, 'avatar--round') + esc(nick(author)) + '</a>' +
+        li('clock', rel(p.createdAt)) + li('eye', snum(p.views)) + li('comment', snum(p.commentCount)) +
+      '</div></article>';
+  }
+
+  function rankRowHtml(i, title, value, link) {
+    return '<div class="rankrow">' +
+      '<span class="rankrow__no' + (i < 3 ? ' rankrow__no--top' : '') + '">' + (i + 1) + '</span>' +
+      '<span class="rankrow__title">' + (link ? '<a href="' + attr(link) + '">' + esc(title) + '</a>' : esc(title)) + '</span>' +
+      '<span class="rankrow__value">' + esc(value) + '</span></div>';
+  }
+  function noticeRow(link, titleHtml, right) {
+    var inner = '<span class="noticerow__title">' + titleHtml + '</span><span class="noticerow__time">' + esc(right || '') + '</span>';
+    return link ? '<a class="noticerow" href="' + attr(link) + '">' + inner + '</a>' : '<div class="noticerow">' + inner + '</div>';
+  }
+  function userLine(u, right) {
+    return '<div class="noticerow">' +
+      '<a class="userchip" href="' + attr(href('/u/' + u.id)) + '">' + av(u, 28, 'avatar--round') +
+        '<span class="userchip__text"><b>' + esc(nick(u)) + '</b><i>' + esc(((u.grade || '') + ' ' + (u.klass || '')).trim()) + '</i></span></a>' +
+      '<span class="spacer"></span>' + roleBadge(u) +
+      '<span class="noticerow__time">' + esc(right || '') + '</span></div>';
+  }
+
+  /* 每版最后发表：一次查询算完，避免逐版块查 */
+  function lastPostMap() {
+    var map = {};
+    ST.listPosts({ sort: 'hot', page: 1, size: 200 }).list.forEach(function (p) {
+      var t = Number(p.lastReplyAt) || Number(p.createdAt) || 0;
+      if (!map[p.boardId] || t > map[p.boardId].t) map[p.boardId] = { post: p, t: t };
+    });
+    return map;
+  }
+
+  /* ==================================================================
+     1.5 · 每周点歌投票（后端已实现，数据层 TF.store.songsWeek/addSong/toggleSongVote/pickSong 同步代理）
+     ================================================================== */
+
+  /* 点歌帖标题由后端生成：[点歌·中午] 歌名 - 歌手 —— 列表里给它们一个徽标，别混成普通帖 */
+  function songBadgeOf(p) {
+    var m = /^\[点歌·(中午|晚上)\]/.exec(str(p && p.title));
+    if (!m) return '';
+    return UI.badge(m[1], m[1] === '中午' ? 'primary' : 'info');
+  }
+  /* 只有「听歌点歌」版块显示点歌面板（slug 优先，名称兜底） */
+  function isSongBoard(b) {
+    if (!b) return false;
+    return str(b.slug) === 'song' || /点歌/.test(str(b.name));
+  }
+  /* 数据层还没交付时返回空结构，页面不崩（存在性兜底） */
+  function songsOf(slot) {
+    var d = null;
+    try { d = ST.songsWeek ? ST.songsWeek({ slot: slot }) : null; } catch (e) { d = null; }
+    d = d || {};
+    return {
+      slot: slot,
+      weekKey: str(d.weekKey),
+      list: arr(d.list),
+      top: arr(d.top),
+      votesLeft: typeof d.votesLeft === 'number' ? d.votesLeft : 0,
+      limitPerDay: typeof d.limitPerDay === 'number' ? d.limitPerDay : 3,
+      pickCount: typeof d.pickCount === 'number' ? d.pickCount : 3,
+      canManage: !!d.canManage,
+      /* 投稿窗口（周日中午 12:00 截止 / 管理员可提前结束）—— 别漏，否则页面显示空括号 */
+      submitOpen: d.submitOpen !== false,
+      submitCloseAt: typeof d.submitCloseAt === 'number' ? d.submitCloseAt : 0,
+      submitLeftMs: typeof d.submitLeftMs === 'number' ? d.submitLeftMs : 0,
+      submitEndedEarly: !!d.submitEndedEarly,
+      closedAt: typeof d.closedAt === 'number' ? d.closedAt : 0,
+      /* 这一轮是哪个周的周一到周五（页面显示"本周 10月5日–10月9日 · 周一到周五"） */
+      weekStart: typeof d.weekStart === 'number' ? d.weekStart : 0,
+      weekEnd: typeof d.weekEnd === 'number' ? d.weekEnd : 0
+    };
+  }
+  function songsReady() { return !!(ST.songsWeek && ST.addSong && ST.toggleSongVote); }
+
+  /* 投票按钮用 .btn（手机上 44px 触控高），不用 .btn--sm */
+  function songVoteBtnHtml(song) {
+    if (!me()) {
+      return '<a class="btn" href="' + attr(href('/login', { redirect: TF.route && TF.route.path })) + '">投票</a>';
+    }
+    return '<button type="button" class="btn ' + (song.votedByMe ? 'btn--ghost' : 'btn--primary') + '"' +
+      ' data-action="song.vote"' + dp({ id: song.id }) +
+      (song.votedByMe ? ' title="再点一下取消投票"' : ' title="投它一票"') + '>' +
+      (song.votedByMe ? icon('check', 14) + '<span>已投</span>' : '<span>投票</span>') + '</button>';
+  }
+  function songPickBtnHtml(song, manage) {
+    if (!manage || !ST.pickSong) return '';
+    return '<button type="button" class="btn btn--text btn--sm" data-action="song.pick"' +
+      dp({ id: song.id, picked: !song.picked }) +
+      ' title="' + attr(song.picked ? '移出播放清单' : '选入播放清单') + '">' +
+      icon(song.picked ? 'minus' : 'star', 12) + '<span>' + (song.picked ? '移出' : '选入') + '</span></button>';
+  }
+  /* 删歌：管理员及以上，或者负责「听歌点歌」版块的版主（服务端也会再校验一次） */
+  function songDeleteBtnHtml(song, manage) {
+    if (!manage || !ST.deleteSong) return '';
+    return '<button type="button" class="btn btn--text btn--sm" data-action="song.delete"' +
+      dp({ id: song.id, title: song.title }) +
+      ' title="删掉这一首（帖子和票数一起清掉）">' + icon('trash', 12) + '<span>删除</span></button>';
+  }
+  function songRowHtml(song, i, opt) {
+    var willPlay = i < opt.pickCount;
+    var link = song.postId ? href('/post/' + song.postId) : '';
+    var name = esc(song.title || '没写歌名') +
+      (song.artist ? ' <span class="text-muted">' + esc(song.artist) + '</span>' : '') +
+      (song.dayOfWeek ? ' <span class="badge">' + DAY_NAMES[song.dayOfWeek] + '</span>' : '');
+    return '<div class="rankrow">' +
+      '<span class="rankrow__no' + (willPlay ? ' rankrow__no--top' : '') + '">' + (i + 1) + '</span>' +
+      (willPlay ? UI.badge('将播放', 'success') : '') +
+      (song.picked ? UI.badge('已选入', 'primary') : '') +
+      '<span class="rankrow__title"' + (song.note ? ' data-tip="' + attr(song.note) + '"' : '') + '>' +
+        (link ? '<a href="' + attr(link) + '">' + name + '</a>' : name) +
+      '</span>' +
+      '<span class="rankrow__value">' + num(song.votes) + ' 票</span>' +
+      songVoteBtnHtml(song) + songPickBtnHtml(song, opt.manage) + songDeleteBtnHtml(song, opt.manage) +
+      '</div>';
+  }
+  function songPanelHtml(board, q) {
+    var slot = str(q.slot) === 'evening' ? 'evening' : 'noon';
+    var d = songsOf(slot);
+    var user = me();
+    var ready = songsReady();
+    var limit = d.limitPerDay || 3;
+    var pickCount = d.pickCount || 3;
+    var open = d.submitOpen !== false;             /* 投稿窗口开着吗（周日中午前 / 没被提前结束） */
+    /* 截止文案：把"周日中午截止"说清楚，住校生周末提前投 */
+    function leftText() {
+      if (!d.submitCloseAt) return '';
+      var left = Number(d.submitLeftMs) || 0;
+      if (left <= 0) return '本周已截止';
+      var days = Math.floor(left / 864e5);
+      var hours = Math.floor((left % 864e5) / 36e5);
+      if (days > 0) return '还剩 ' + days + ' 天 ' + hours + ' 小时';
+      if (hours > 0) return '还剩 ' + hours + ' 小时';
+      return '还剩不到 1 小时';
+    }
+    var deadline = '';
+    if (ready) {
+      deadline = open
+        ? '投稿周日中午 12:00 截止（' + leftText() + '）'
+        : (d.submitEndedEarly ? '本周投稿已被广播站提前结束' : '本周投稿已截止（周日中午 12:00），下周一开始收下一周的');
+    }
+    /* 这一轮是哪个周：写清楚"周一到周五"，因为周末不放歌 */
+    var weekText = '';
+    if (d.weekStart && d.weekEnd) {
+      weekText = '这一轮：' + U.fmtDate(d.weekStart) + ' 到 ' + U.fmtDate(d.weekEnd) + '（周一到周五放）';
+    }
+    var hint;
+    if (!ready) hint = '点歌功能正在上线，稍后刷新';
+    else if (!user) hint = '每周一到周五播放 · 每个时段前 ' + pickCount + ' 名 · 登录后可以投歌 · ' + deadline;
+    else if (d.votesLeft <= 0) hint = '每周一到周五播放 · 今天这个时段的 ' + limit + ' 票投完了，明天再来 · ' + deadline;
+    else hint = '每周一到周五播放 · 每个时段票选前 ' + pickCount + ' 名 · 今天还能投 ' + d.votesLeft + ' 票 · ' + deadline;
+
+    var tabs = '<nav class="bbs-nav">' +
+      '<a class="bbs-nav__item' + (slot === 'noon' ? ' is-active' : '') + '" href="' +
+        attr(href('/board/' + board.id, withQ(q, { slot: 'noon', page: '' }))) + '">中午</a>' +
+      '<a class="bbs-nav__item' + (slot === 'evening' ? ' is-active' : '') + '" href="' +
+        attr(href('/board/' + board.id, withQ(q, { slot: 'evening', page: '' }))) + '">晚上</a>' +
+      '</nav>';
+
+    var form;
+    if (!ready) {
+      form = '<div class="noticebar">' + icon('clock', 15) + '<span>点歌数据没到，刷新一下试试</span></div>';
+    } else if (!user) {
+      form = '<div class="noticebar">' + icon('lock', 15) + '<span>登录后才能点歌和投票。' +
+        '<a class="btn btn--primary btn--sm" href="' + attr(href('/login', { redirect: '/board/' + board.id })) + '">去登录</a></span></div>';
+    } else if (!open) {
+      form = '<div class="noticebar noticebar--warn">' + icon('clock', 15) + '<span>' +
+        (d.submitEndedEarly ? '本周投稿已经被广播站提前结束，下周一开始收下一周的。' : '本周投稿已经在周日中午 12:00 截止，下一个周一开始收下一周的歌。') +
+        '</span></div>';
+    } else {
+      form = '<form data-action="song.add">' +
+        '<input type="hidden" name="slot" value="' + attr(slot) + '">' +
+        UI.field({ label: '歌名', name: 'title', required: true, maxlength: 60, placeholder: '比如：晴天' }) +
+        '<div class="mt-3">' + UI.field({ label: '歌手', name: 'artist', maxlength: 40, placeholder: '周杰伦' }) + '</div>' +
+        /* 周几：周一到周五才放歌，不选就表示"哪天津放都行"。
+           radio 视觉上藏起来，但触摸区交给 label（手机上 label 有 44px 高） */
+        '<div class="mt-3"><div class="field__label">想让它周几放</div>' +
+          '<div class="cluster gap-2 mt-2 daypick">' +
+            '<label class="chip tap-target"><input type="radio" name="day" value="0" checked class="sr-only"> <span>都行</span></label>' +
+            DAY_NAMES.slice(1).map(function (nm, i) {
+              return '<label class="chip tap-target"><input type="radio" name="day" value="' + (i + 1) + '" class="sr-only"> <span>' + nm + '</span></label>';
+            }).join('') +
+          '</div>' +
+          '<div class="field__hint">周一到周五每天中午 3 首、晚上 3 首；不选就表示哪天放都行</div>' +
+        '</div>' +
+        '<div class="mt-3">' + UI.field({ label: '链接', name: 'link', maxlength: 300, placeholder: '音乐平台链接，可以不填' }) + '</div>' +
+        '<div class="mt-3">' + UI.field({ label: '一句话理由', name: 'note', maxlength: 60, placeholder: '为什么想听，比如：跑操时听到的' }) + '</div>' +
+        '<div class="noticebar mt-3">' + icon('alert', 15) + '<span>歌名里不能有日文/韩文（广播站不收日韩歌曲）；一个帖子最多 2 首。</span></div>' +
+        '<div class="cluster gap-2 mt-4"><button class="btn btn--primary" type="submit">点歌</button>' +
+        '<span class="text-xs text-muted">点完会自动在版块里发一篇帖子</span></div></form>';
+    }
+
+    /* 管理员 / 版主：可以提前结束（或重新开放）本周投稿 */
+    var manageBar = '';
+    if (ready && user && d.canManage && canManage()) {
+      manageBar = '<div class="cluster gap-2 mt-3">' +
+        (open
+          ? '<button class="btn btn--outline btn--sm" type="button" data-action="song.closeWeek">' +
+            icon('clock', 14) + '<span>提前结束本周投稿</span></button>' +
+            '<span class="text-xs text-muted">结束之后同学就投不了了（可以再打开）</span>'
+          : '<button class="btn btn--outline btn--sm" type="button" data-action="song.closeWeek" data-param=\'{"reopen":true}\'>' +
+            icon('refresh', 14) + '<span>重新开放本周投稿</span></button>') +
+      '</div>';
+    }
+
+    var sorted = d.list.slice().sort(function (a, b) { return (b.votes || 0) - (a.votes || 0); });
+    var listHtml = sorted.length
+      ? '<div class="ranklist">' + sorted.map(function (s, i) {
+          return songRowHtml(s, i, { pickCount: pickCount, manage: d.canManage && canManage() });
+        }).join('') + '</div>'
+      : plain('这周「' + (slot === 'noon' ? '中午' : '晚上') + '」还没人点歌', '你可以第一个点');
+
+    return '<div class="block block--box mt-4">' +
+      '<div class="block__head"><h2 class="block__title">本周点歌</h2></div>' +
+      '<div class="block__body">' + tabs +
+        /* 说明放 Tab 下面：手机上如果塞在标题右侧会把「本周点歌」挤成两行 */
+        '<div class="text-xs text-muted mb-3">' + esc(hint) + '</div>' +
+        (weekText ? '<div class="text-xs text-muted mb-3">' + esc(weekText) + '</div>' : '') +
+        '<div class="grid grid--2">' +
+          '<div>' + form + manageBar + '</div>' +
+          '<div><div class="text-xs text-muted mb-2">本期榜单（票多的先播）</div>' + listHtml + '</div>' +
+        '</div>' +
+      '</div></div>';
+  }
+
+  /* ==================================================================
+     2 · 页面：论坛 #/forum
+     ================================================================== */
+
+  function buildForum(p) {
+    var q = p.query || {};
+    var sort = SORTS.some(function (s) { return s.key === q.sort; }) ? q.sort : 'latest';
+    var page = toInt(q.page, 1);
+    var boards = ST.listBoards();
+    var counts = ST.counts();
+    var last = lastPostMap();
+    var members = ST.listUsers({ size: 1 }).total;
+
+    var groups = [], gmap = {};
+    boards.forEach(function (b) {
+      var g = b.group || '其他';
+      if (!gmap[g]) { gmap[g] = []; groups.push(g); }
+      gmap[g].push(b);
+    });
+    /* 版块列表：整行可点的卡片行（名称 / 简介 / N 帖 · 今天 M）+ 右侧 chevron，
+       手机上和桌面共用同一套结构，不再用会折行的表格列。 */
+    var table = groups.map(function (g) {
+      return '<div class="forumtable__group">' + esc(g) + '</div>' +
+        gmap[g].map(function (b) {
+          var s = b.stats || {};
+          var lp = last[b.id];
+          return '<a class="noticerow" href="' + attr(href('/board/' + b.id)) + '">' +
+            '<span class="forumtable__icon">' + icon(b.icon || 'forum', 16) + '</span>' +
+            '<span class="forumtable__name"><span class="stack gap-0">' +
+              '<span class="boardcard__title">' + esc(b.name) + (b.locked ? ' ' + UI.badge('只读', 'default') : '') + '</span>' +
+              (b.desc ? '<span class="text-xs text-muted clamp-2">' + esc(b.desc) + '</span>' : '') +
+              '<span class="text-xs text-muted">' + num(s.posts) + ' 帖 · 今天 ' + num(s.today) +
+                (lp ? ' · 最新 ' + esc(rel(lp.t)) : '') + '</span>' +
+            '</span></span>' +
+            '<span class="noticerow__time">' + icon('chevronRight', 16) + '</span>' +
+            '</a>';
+        }).join('');
+    }).join('');
+
+    var feed = ST.listPosts({ sort: sort, page: page, size: 10 });
+    var feedTitle = { latest: '最新帖子', hot: '热门帖子', essence: '精华帖', unanswered: '没人回的帖子' }[sort] || '帖子';
+    var feedHtml = feed.list.length
+      ? feed.list.map(function (x) { return postCardHtml(x, { showBoard: true }); }).join('') + pager('/forum', withQ(q, { sort: sort }), feed)
+      : plain('这里还没有帖子', sort === 'unanswered' ? '每个帖子都有人回过了' : '换个筛选看看');
+
+    var hot = ST.hotPosts(8);
+    var sideHot = boxBlock('热帖', hot.length
+      ? '<div class="ranklist">' + hot.map(function (x, i) { return rankRowHtml(i, x.title, snum(x.views) + ' 阅', href('/post/' + x.id)); }).join('') + '</div>'
+      : plain('还没有热帖'));
+
+    var active = ST.listUsers({ sort: 'points', size: 6 }).list;
+    var sideUsers = boxBlock('活跃同学', active.length
+      ? '<div class="noticelist">' + active.map(function (u) { return userLine(u, num(u.stats ? u.stats.posts : 0) + ' 帖'); }).join('') + '</div>'
+      : plain('还没有数据'));
+
+    var sideTags = boxBlock('标签', counts.tags.length
+      ? '<div class="tagcloud">' + counts.tags.map(function (t) {
+          return '<a class="tagchip" href="' + attr(href('/search', { q: t.tag })) + '">' + esc(t.tag) +
+            '<span class="tagchip__count">' + t.count + '</span></a>';
+        }).join('') + '</div>'
+      : plain('还没有标签'));
+
+    var head = '<div class="bbs-head"><div>' +
+      '<div class="bbs-head__title">' + icon('forum', 18) + '<span>论坛</span></div>' +
+      '<div class="bbs-head__desc">' + boards.length + ' 个版块 · ' + num(counts.total) + ' 篇帖子 · 今天 ' + num(counts.today) + ' 篇</div>' +
+      '</div><form class="bbs-head__search" data-action="search.go">' +
+        '<input class="input" name="q" type="search" placeholder="搜帖子、同学、版块" aria-label="搜索">' +
+        '<button class="btn btn--primary" type="submit">搜索</button>' +
+      '</form></div>';
+
+    var stats = '<div class="bbs-stats mt-3">' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(counts.total) + '</div><div class="bbs-stats__label">帖子</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(counts.today) + '</div><div class="bbs-stats__label">今天</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(members) + '</div><div class="bbs-stats__label">同学</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(boards.length) + '</div><div class="bbs-stats__label">版块</div></div>' +
+      '</div>';
+
+    var main =
+      rowBlock('版块', '<div class="forumtable">' + table + '</div>', '<a class="block__more" href="' + attr(href('/search', {})) + '">搜内容</a>') +
+      '<div class="mt-5">' + sortNav('/forum', q, sort) + '</div>' +
+      block(feedTitle, feedHtml, '<a class="block__more" href="' + attr(href('/new', {})) + '">发帖</a>');
+
+    return {
+      title: '论坛',
+      html: head + stats +
+        '<div class="row mt-4"><div class="col">' + main + '</div>' +
+        '<aside class="col-side stack gap-5">' + sideHot + sideUsers + sideTags + '</aside></div>'
+    };
+  }
+
+  /* ==================================================================
+     2.5 · 当周歌单（排到 周一到周五 × 中午/晚上）
+     广播站的实际需求：把当周投稿排进 5 天 × 2 时段 × 3 首 = 30 个位置，
+     然后"复制成文本"发到群里。排歌单优先用 DeepSeek，失败自动退回按票数排。
+     ================================================================== */
+  var WEEK_DAYS = [1, 2, 3, 4, 5];
+  var WEEK_DAY_NAMES = { 1: '周一', 2: '周二', 3: '周三', 4: '周四', 5: '周五' };
+
+  function playlistOf() {
+    try { return ST.playlistData ? ST.playlistData() : null; } catch (e) { return null; }
+  }
+  /* 把 plan 整理成 天 → {noon:[], evening:[]} */
+  function playlistGrid(plan) {
+    var grid = {};
+    WEEK_DAYS.forEach(function (d) { grid[d] = { noon: [], evening: [] }; });
+    arr(plan).forEach(function (p) {
+      var d = Number(p.day) || 0;
+      var s = p.slot === 'evening' ? 'evening' : 'noon';
+      if (grid[d]) grid[d][s].push(p);
+    });
+    return grid;
+  }
+  function playlistText(pl) {
+    var grid = playlistGrid(pl && pl.plan);
+    var lines = ['【本周歌单】' + (pl && pl.weekKey ? pl.weekKey : '')];
+    WEEK_DAYS.forEach(function (d) {
+      lines.push('');
+      lines.push(WEEK_DAY_NAMES[d]);
+      ['noon', 'evening'].forEach(function (s) {
+        var items = grid[d][s];
+        lines.push('  ' + (s === 'noon' ? '中午' : '晚上') + '：' +
+          (items.length ? items.map(function (x) { return x.title + (x.artist ? ' - ' + x.artist : ''); }).join('、') : '（空）'));
+      });
+    });
+    if (pl && pl.note) { lines.push(''); lines.push('备注：' + pl.note); }
+    return lines.join('\n');
+  }
+
+  function playlistHtml(board) {
+    var pl = playlistOf();
+    var user = me();
+    var manage = canManage();
+    var data = pl && pl.playlist ? pl.playlist : null;
+    var head = '<div class="block__head"><h2 class="block__title">本周歌单</h2>' +
+      (data ? '<span class="block__more">' + (data.published ? '已公布' : '未公布') +
+        (data.source === 'deepseek' ? ' · DeepSeek 排的' : data.source === 'manual' ? ' · 手工调整' : ' · 按票数排的') +
+        '</span>' : '') + '</div>';
+
+    if (!data) {
+      return '<div class="block block--box mt-4">' + head + '<div class="block__body">' +
+        plain('这周还没有歌单',
+          manage ? '点下面的按钮排一次（优先用 DeepSeek，没配密钥就按票数排）' : '等广播站的同学排好吧') +
+        (manage ? manageBarHtml(true) : '') +
+        '</div></div>';
+    }
+
+    var grid = playlistGrid(data.plan);
+    var rows = WEEK_DAYS.map(function (d) {
+      function cell(slot) {
+        var items = grid[d][slot];
+        if (!items.length) return '<span class="text-muted">（空）</span>';
+        return items.map(function (x, i) {
+          return '<div class="plist__item"><span class="plist__no">' + (i + 1) + '</span>' +
+            '<span class="plist__name">' + esc(x.title) + (x.artist ? ' <span class="text-muted">' + esc(x.artist) + '</span>' : '') + '</span>' +
+            (Number(x.votes) ? '<span class="plist__votes">' + num(x.votes) + ' 票</span>' : '') +
+            (x.reason ? '<span class="text-xs text-muted">' + esc(x.reason) + '</span>' : '') + '</div>';
+        }).join('');
+      }
+      return '<tr><th class="plist__day">' + WEEK_DAY_NAMES[d] + '</th>' +
+        '<td data-slot="中午">' + cell('noon') + '</td><td data-slot="晚上">' + cell('evening') + '</td></tr>';
+    }).join('');
+
+    return '<div class="block block--box mt-4">' + head + '<div class="block__body">' +
+      '<div class="table-wrap"><table class="table plist">' +
+        '<thead><tr><th>星期</th><th>中午（3 首）</th><th>晚上（3 首）</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table></div>' +
+      (data.note ? '<div class="noticebar mt-3">' + icon('info', 15) + '<span>' + esc(data.note) + '</span></div>' : '') +
+      '<div class="cluster gap-2 mt-3">' +
+        '<button class="btn btn--ghost btn--sm" type="button" data-action="playlist.copy">' + icon('copy', 14) + '<span>复制成文本发群里</span></button>' +
+        (user ? '<button class="btn btn--ghost btn--sm" type="button" data-action="playlist.open">' + icon('list', 14) + '<span>看完整歌单</span></button>' : '') +
+      '</div>' +
+      (manage ? manageBarHtml(false) : '') +
+      '</div></div>';
+  }
+
+  /* 完整歌单弹窗：跟其它弹窗一样，作为页面 HTML 的一部分渲染出来，之后按 id 打开 */
+  function playlistModalHtml() {
+    var pl = playlistOf();
+    if (!pl || !pl.playlist) return '';
+    return UI.modal({
+      id: 'pf-playlist', title: '本周歌单（' + (pl.playlist.weekKey || '') + '）',
+      body: '<pre class="plist__text">' + esc(playlistText(pl.playlist)) + '</pre>' +
+        '<div class="cluster gap-2 mt-3">' +
+        '<button class="btn btn--primary btn--sm" type="button" data-action="playlist.copy">' + icon('copy', 14) + '<span>复制</span></button>' +
+        '<button class="btn btn--sm" type="button" data-modal-close>关闭</button>' +
+        '</div>'
+    });
+  }
+
+  function manageBarHtml(empty) {
+    var pl = playlistOf();
+    var data = pl && pl.playlist ? pl.playlist : null;
+    var working = typeof window !== 'undefined' && window.__plWorking;
+    return '<div class="cluster gap-2 mt-3">' +
+      '<button class="btn btn--outline btn--sm" type="button" data-action="playlist.generate"' + (working ? ' disabled' : '') + '>' +
+        icon('sparkle', 14) + '<span>' + (working ? '正在排…' : (data ? '重新排一遍' : '让 DeepSeek 排一遍')) + '</span></button>' +
+      (data ? '<button class="btn btn--ghost btn--sm" type="button" data-action="playlist.publish" data-param=\'' +
+        JSON.stringify({ published: !data.published }) + '\'>' +
+        icon(data.published ? 'eyeOff' : 'eye', 14) + '<span>' + (data.published ? '撤回公布' : '公布歌单') + '</span></button>' : '') +
+      '<span class="text-xs text-muted">' + (pl && pl.aiConfigured ? '已配置 DeepSeek；排的时候会把票数和同学填的周几一起给它' : '没配 DeepSeek 密钥，会按票数排（在 data/deepseek.json 里配）') + '</span>' +
+    '</div>' + (empty ? '' : '');
+  }
+
+  /* ==================================================================
+     3 · 页面：版块 #/board/:id
+     ================================================================== */
+
+  /* 图片真的打不开时（404/地址错），把碎图换成能看懂的提示 + 真实地址 */
+  function installImgFailHandler() {
+    if (window.tfImgFail) return;
+    window.tfImgFail = function (img) {
+      try {
+        var url = img.getAttribute('data-full') || img.getAttribute('src') || '';
+        /* 打印到控制台（F12 能直接看到是哪张、什么地址） */
+        if (window.console && console.warn) console.warn('[图片打不开] ' + url);
+        var box = img.parentNode;
+        if (!box) return;
+        var note = document.createElement('span');
+        note.className = 'imgfail';
+        note.innerHTML = '图片打不开<br><b>' + esc(url) + '</b><br><span class="text-xs">（可能是文件被删了，或者地址不对）</span>';
+        box.replaceChild(note, img);
+      } catch (e) { /* 兜底失败就算了 */ }
+    };
+  }
+
+  function buildBoard(p) {
+    installImgFailHandler();
+    var q = p.query || {};
+    var board = ST.getBoard((p.param || {}).id);
+    if (!board) return { title: '版块没了', html: crumb([{ text: '论坛', href: '#/forum' }, { text: '版块没了' }]) + plain('这个版块不存在') };
+
+    var tag = str(q.tag);
+    var sort = SORTS.some(function (s) { return s.key === q.sort; }) ? q.sort : 'latest';
+    var page = toInt(q.page, 1);
+    var feed = ST.boardFeed(board.id);
+    var list = ST.listPosts({ boardId: board.id, tag: tag, sort: sort, page: page, size: PAGE_SIZE });
+    var s = board.stats || {};
+
+    var head = '<div class="boardhead"><div>' +
+      '<div class="boardhead__title">' + icon(board.icon || 'forum', 18) + '<span>' + esc(board.name) + '</span>' +
+        (board.locked ? UI.badge('只读', 'default') : '') + '</div>' +
+      '<div class="boardhead__desc">' + esc(board.desc || '') + '</div>' +
+      '</div><div class="cluster gap-2">' +
+        '<button type="button" class="btn" data-action="board.follow"' + dp({ id: board.id }) + '>' + icon('star', 14) + '<span>关注</span></button>' +
+        '<a class="btn btn--primary" href="' + attr(href('/new', { board: board.id })) + '">' + icon('edit', 14) + '<span>发帖</span></a>' +
+      '</div></div>';
+
+    var stats = '<div class="bbs-stats mt-3">' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(s.posts) + '</div><div class="bbs-stats__label">主题</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(s.today) + '</div><div class="bbs-stats__label">今天</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(s.followers) + '</div><div class="bbs-stats__label">关注</div></div>' +
+      '</div>';
+
+    var notice = '';
+    if (board.locked) notice += '<div class="noticebar mt-3">' + icon('lock', 15) + '<span>只读版块，只有版主和站长能发帖，其他人可以回复</span></div>';
+    if (canManage()) notice += '<div class="noticebar mt-3">' + icon('shield', 15) +
+      '<span>你是' + (ST.isAdmin() ? '站长' : '版主') + '，帖子里可以直接置顶、加精、锁定、下架</span></div>';
+
+    var tagBar = '<div class="text-sm text-muted mb-2">标签</div>' +
+      tagFilterHtml('/board/' + board.id, q, feed.hotTags, tag);
+
+    var rows = list.list.length
+      ? list.list.map(function (x, i) { return postRowHtml(x, { no: (list.page - 1) * list.size + i + 1 }); }).join('')
+      : plain(tag ? '这个标签下还没帖子' : '还没有帖子', tag ? '换个标签' : '来发第一帖');
+
+    var sideBoard = boxBlock('关于本版', '<div class="listmeta">' +
+      li('comment', '主题 ' + num(s.posts)) + li('clock', '今日 ' + num(s.today)) + li('users', num(s.followers) + ' 关注') +
+      '</div>', '<a class="block__more" href="' + attr(href('/notices', {})) + '">版规</a>');
+
+    var sideTags = boxBlock('本版标签', arr(feed.hotTags).length
+      ? '<div class="tagcloud">' + feed.hotTags.map(function (t) {
+          return '<a class="tagchip" href="' + attr(href('/board/' + board.id, { tag: t.tag })) + '">' + esc(t.tag) +
+            '<span class="tagchip__count">' + t.count + '</span></a>';
+        }).join('') + '</div>'
+      : plain('还没有标签'));
+
+    var recent = ST.listPosts({ boardId: board.id, size: 5 }).list;
+    var sideNew = boxBlock('最新回复', recent.length
+      ? '<div class="noticelist">' + recent.map(function (x) {
+          return noticeRow(href('/post/' + x.id), esc(x.title), rel(x.lastReplyAt || x.createdAt));
+        }).join('') + '</div>'
+      : plain('还没有回复'));
+
+    return {
+      title: board.name,
+      html: crumb([{ text: '论坛', href: '#/forum' }, { text: board.name }]) + head + stats + notice +
+        (isSongBoard(board) ? songPanelHtml(board, q) + playlistHtml(board) + playlistModalHtml() : '') +
+        '<div class="row mt-4"><div class="col">' +
+          sortNav('/board/' + board.id, q, sort) +
+          '<div class="mt-3">' + tagBar + '</div>' +
+          rowBlock('帖子', rows, '<span class="block__more">' + num(list.total) + ' 个主题</span>') +
+          pager('/board/' + board.id, withQ(q, { tag: tag, sort: sort }), list) +
+        '</div><aside class="col-side stack gap-5">' + sideBoard + sideTags + sideNew + '</aside></div>'
+    };
+  }
+
+  /* ==================================================================
+     4 · 页面：帖子 #/post/:id
+     ================================================================== */
+
+  var TH = { postId: '', locked: false, pageSize: 20 };
+
+  function likeBtnHtml(p, liked, likes) {
+    return '<button type="button" id="pf-like" class="btn ' + (liked ? 'btn--primary' : 'btn--ghost') + ' btn--sm"' +
+      ' data-action="post.like"' + dp({ id: p.id }) + '>' + icon('heart', 14) +
+      '<span>' + (liked ? '已赞 ' : '赞 ') + snum(likes) + '</span></button>';
+  }
+  function favBtnHtml(p, faved, favs) {
+    return '<button type="button" id="pf-fav" class="btn ' + (faved ? 'btn--primary' : 'btn--ghost') + ' btn--sm"' +
+      ' data-action="post.fav"' + dp({ id: p.id }) + '>' + icon('bookmark', 14) +
+      '<span>' + (faved ? '已收藏 ' : '收藏 ') + snum(favs) + '</span></button>';
+  }
+  function commentTotal(post, fallback) {
+    if (ST.countComments) {
+      var n = ST.countComments(post.id);
+      if (typeof n === 'number' && isFinite(n)) return n;
+    }
+    return fallback;
+  }
+
+  function likeCommentBtn(id, liked, likes) {
+    return '<button type="button" id="cl-' + attr(id) + '" class="btn btn--text btn--sm" data-action="comment.like"' +
+      dp({ id: id }) + '>' + icon('heart', 13) + '<span>' + (liked ? '已赞' : '赞') + '</span>' +
+      (likes ? ' <b>' + snum(likes) + '</b>' : '') + '</button>';
+  }
+  function floorActionsHtml(c) {
+    var u = me();
+    var liked = u ? arr(c.likedBy).indexOf(u.id) >= 0 : false;
+    return '<div class="commentitem__actions">' +
+      likeCommentBtn(c.id, liked, c.likes) +
+      '<button type="button" class="btn btn--text btn--sm" data-action="comment.reply"' + dp({ id: c.id }) + '>' + icon('comment', 13) + '<span>回复</span></button>' +
+      '<button type="button" class="btn btn--text btn--sm" data-action="report.open"' + dp({ type: 'comment', id: c.id }) + '>' + icon('flag', 13) + '<span>举报</span></button>' +
+      (u && (u.id === c.authorId || ST.isAdmin())
+        ? '<button type="button" class="btn btn--text btn--sm" data-action="comment.del"' + dp({ id: c.id }) + '>' + icon('trash', 13) + '<span>删除</span></button>' : '') +
+      '</div>';
+  }
+  function replyFormHtml(floor, o) {
+    if (!me() || o.locked) return '';
+    return '<form class="mt-2 is-hidden" id="reply-' + attr(floor.id) + '" data-action="comment.add">' +
+      '<input type="hidden" name="postId" value="' + attr(o.postId) + '">' +
+      '<input type="hidden" name="parentId" value="' + attr(floor.id) + '">' +
+      '<input type="hidden" name="replyTo" value="' + attr(nick(ST.getUser(floor.authorId))) + '">' +
+      '<textarea class="textarea" name="content" rows="2" maxlength="500" placeholder="回复 ' + attr(nick(ST.getUser(floor.authorId))) + '"></textarea>' +
+      '<div class="cluster gap-2 mt-2"><button class="btn btn--primary btn--sm" type="submit">发送</button>' +
+      '<button class="btn btn--ghost btn--sm" type="button" data-action="comment.cancelReply"' + dp({ id: floor.id }) + '>取消</button></div></form>';
+  }
+  /* 楼中楼（第二层）：parentId 恒指向顶层楼层，用 .quote 引用被回复的那条 */
+  function subReplyHtml(r) {
+    var author = ST.getUser(r.authorId);
+    var parent = r.parentId ? ST.getComment(r.parentId) : null;
+    var parentAuthor = parent ? ST.getUser(parent.authorId) : null;
+    var u = me();
+    var liked = u ? arr(r.likedBy).indexOf(u.id) >= 0 : false;
+    var showQuote = !!(r.replyToName && parent && parent.authorId !== r.authorId);
+    return '<div class="replyitem" id="c-' + attr(r.id) + '">' +
+      '<a href="' + attr(href('/u/' + r.authorId)) + '">' + av(author, 28, 'avatar--round') + '</a>' +
+      '<div class="commentitem__body">' +
+        '<div class="commentitem__head"><b>' + esc(nick(author)) + '</b>' + roleBadge(author) +
+          '<span>' + esc(rel(r.createdAt)) + '</span></div>' +
+        (showQuote ? '<div class="quote"><span class="quote__meta">@' + esc(nick(parentAuthor)) + '：</span>' +
+          esc(U.excerpt(parent.content, 60)) + '</div>' : '') +
+        '<div class="commentitem__content">' + U.md(r.content) + '</div>' +
+        '<div class="commentitem__actions">' + likeCommentBtn(r.id, liked, r.likes) +
+          '<button type="button" class="btn btn--text btn--sm" data-action="report.open"' + dp({ type: 'comment', id: r.id }) + '>' + icon('flag', 13) + '<span>举报</span></button>' +
+          (u && (u.id === r.authorId || ST.isAdmin())
+            ? '<button type="button" class="btn btn--text btn--sm" data-action="comment.del"' + dp({ id: r.id }) + '>' + icon('trash', 13) + '<span>删除</span></button>' : '') +
+        '</div>' +
+      '</div></div>';
+  }
+  function floorHtml(c, o) {
+    var author = ST.getUser(c.authorId);
+    var u = me();
+    /* 楼层：桌面用 .commentitem（头像 + 正文），手机由 mobile.css 的 .floor/.floor__side 接管间距 */
+    return '<div class="commentitem floor" id="c-' + attr(c.id) + '">' +
+      '<a class="floor__side" href="' + attr(href('/u/' + c.authorId)) + '">' + av(author, 36, 'avatar--round') + '</a>' +
+      '<div class="commentitem__body">' +
+        '<div class="commentitem__head">' +
+          '<b>#' + o.no + '</b>' +
+          (o.isOwner ? UI.badge('楼主', 'primary') : '') +
+          '<a href="' + attr(href('/u/' + c.authorId)) + '">' + esc(nick(author)) + '</a>' +
+          roleBadge(author) +
+          (c.status === 'hidden' ? UI.badge('已隐藏', 'warn') : '') +
+          '<span>' + esc(U.fmtTime(c.createdAt)) + '</span>' +
+        '</div>' +
+        '<div class="commentitem__content">' + U.md(c.content) + '</div>' +
+        floorActionsHtml(c) +
+        '<div id="replies-' + attr(c.id) + '">' + arr(o.replies).map(subReplyHtml).join('') + '</div>' +
+        replyFormHtml(c, o) +
+      '</div></div>';
+  }
+
+  function reportModalHtml() {
+    return UI.modal({
+      id: 'pf-report', title: '举报',
+      body: '<form data-action="report.submit">' +
+        '<input type="hidden" name="targetType" value="post">' +
+        '<input type="hidden" name="targetId" value="">' +
+        UI.selectField({ label: '理由', name: 'reason', required: true, options: REPORT_REASONS.map(function (r) { return { value: r, label: r }; }) }) +
+        '<div class="mt-3">' + UI.textarea({ label: '补充（选填）', name: 'detail', rows: 3, maxlength: 200, placeholder: '哪一句、哪张图' }) + '</div>' +
+        '<div class="cluster gap-2 mt-3"><button class="btn btn--danger" type="submit">提交</button>' +
+        '<button class="btn" type="button" data-modal-close>取消</button></div></form>'
+    });
+  }
+  function zoomModalHtml() {
+    return UI.modal({ id: 'pf-zoom', title: '看大图', size: 'lg', body: '<div class="center"><img id="pf-zoom-img" src="" alt="配图"></div>' });
+  }
+
+  function buildPost(p) {
+    installImgFailHandler();
+    var id = (p.param || {}).id;
+    var post = ST.getPost(id);
+    if (!post || post.status === 'deleted') {
+      return { title: '帖子没了', html: crumb([{ text: '论坛', href: '#/forum' }, { text: '帖子没了' }]) + plain('这帖子被删了，或者链接不对') };
+    }
+    var user = me();
+    var mine = !!(user && user.id === post.authorId);
+    var admin = ST.isAdmin();
+    if ((post.status === 'pending' || post.status === 'hidden') && !mine && !admin) {
+      return { title: '看不了', html: crumb([{ text: '论坛', href: '#/forum' }, { text: '看不了' }]) +
+        plain(post.status === 'pending' ? '还在审核，过了就能看' : '这帖被下架了') };
+    }
+    TH.postId = post.id;
+    TH.locked = !!post.locked;
+
+    var author = ST.getUser(post.authorId);
+    var board = ST.getBoard(post.boardId);
+    var liked = user ? arr(post.likedBy).indexOf(user.id) >= 0 : false;
+    var faved = user ? arr(post.favBy).indexOf(user.id) >= 0 : false;
+    var csort = p.query.csort === 'hot' ? 'hot' : 'old';
+    var cpage = toInt(p.query.cpage, 1);
+    var comments = ST.listComments(post.id, { sort: csort, page: cpage, size: TH.pageSize });
+    var total = commentTotal(post, comments.total);
+
+    var notice = '';
+    if (post.status === 'pending') notice = '<div class="noticebar mb-3">' + icon('clock', 15) + '<span>还在审核，别人暂时看不到' + (mine ? '，你可以接着改' : '') + '</span></div>';
+    else if (post.status === 'hidden') notice = '<div class="noticebar mb-3">' + icon('alert', 15) + '<span>这帖已下架' + (post.rejectReason ? '：' + esc(post.rejectReason) : '') + '</span></div>';
+    else if (post.locked) notice = '<div class="noticebar mb-3">' + icon('lock', 15) + '<span>已锁定，不能再回复</span></div>';
+
+    var images = arr(post.images);
+    /* 图片加载失败时不要只留一个碎图：显示成"这张图打不开 + 地址"，方便排查
+       （服务端 /uploads/ 是公开的，正常情况不可能打不开） */
+    var imgHtml = images.length
+      ? '<div class="upload__preview">' + images.map(function (src, i) {
+          var u = str(src);
+          return '<button type="button" class="upload__item" data-action="post.zoom"' + dp({ i: i }) + ' aria-label="看大图"' +
+            ' style="padding:0;border:0;background:none;cursor:zoom-in">' +
+            '<img src="' + attr(u) + '" alt="' + attr('配图 ' + (i + 1)) + '" loading="lazy"' +
+            ' data-full="' + attr(u) + '" onerror="tfImgFail(this)"></button>';
+        }).join('') + '</div>'
+      : '';
+
+    var ownerLine = '<div class="listmeta">' +
+      '<a class="listmeta__item" href="' + attr(href('/u/' + post.authorId)) + '">' + av(author, 28, 'avatar--round') + esc(nick(author)) + '</a>' +
+      roleBadge(author) +
+      li('clock', U.fmtTime(post.createdAt)) + li('eye', num(post.views) + ' 次浏览') +
+      li('comment', num(total) + ' 条回复') +
+      (author && author.grade ? li('user', author.grade + (author.klass ? ' · ' + author.klass : '')) : '') +
+      '</div>';
+
+    var actions = '<div class="commentitem__actions">' +
+      (user ? likeBtnHtml(post, liked, post.likes)
+            : '<a class="btn btn--ghost btn--sm" href="' + attr(href('/login', { redirect: '/post/' + post.id })) + '">' + icon('heart', 14) + '<span>登录后点赞</span></a>') +
+      (user ? favBtnHtml(post, faved, post.favorites) : '') +
+      '<button type="button" class="btn btn--ghost btn--sm" data-copy="' + attr(shareUrl('/post/' + post.id)) + '">' + icon('share', 14) + '<span>复制链接</span></button>' +
+      '<button type="button" class="btn btn--ghost btn--sm" data-action="report.open"' + dp({ type: 'post', id: post.id }) + '>' + icon('flag', 14) + '<span>举报</span></button>' +
+      (mine || admin ? '<a class="btn btn--ghost btn--sm" href="' + attr(href('/edit/' + post.id)) + '">' + icon('edit', 14) + '<span>编辑</span></a>' : '') +
+      (mine ? '<button type="button" class="btn btn--ghost btn--sm" data-action="post.del"' + dp({ id: post.id }) + '>' + icon('trash', 14) + '<span>删除</span></button>' : '') +
+      '<span class="spacer"></span>' + modBarHtml(post) +
+      '</div>';
+
+    var postBlock = notice + '<article class="block block--box"><div class="block__body">' +
+      '<h1 class="postrow__title">' + flagBadges(post) + '<span>' + esc(post.title) + '</span></h1>' +
+      '<div class="mt-2">' + ownerLine + '</div>' +
+      '<div class="markdown mt-4">' + U.md(post.content) + '</div>' +
+      (imgHtml ? '<div class="mt-4">' + imgHtml + '</div>' : '') +
+      (arr(post.tags).length ? '<div class="postrow__tags mt-4">' + tagsHtml(arr(post.tags), post.boardId) + '</div>' : '') +
+      '<div class="sigline">' + (author && author.bio ? esc(author.bio) : '这位同学没写签名') + '</div>' +
+      actions + '</div></article>';
+
+    var floors = comments.list.length
+      ? comments.list.map(function (c, i) {
+          return floorHtml(c, {
+            no: (comments.page - 1) * comments.size + i + 2,
+            postId: post.id, locked: post.locked,
+            isOwner: c.authorId === post.authorId,
+            replies: ST.listReplies(c.id)
+          });
+        }).join('')
+      : plain('还没人回复', '说点什么');
+
+    var composer = post.locked
+      ? '<div class="noticebar">' + icon('lock', 15) + '<span>已锁定，不能再回复</span></div>'
+      : (user
+        ? '<form data-action="comment.add">' +
+            '<input type="hidden" name="postId" value="' + attr(post.id) + '">' +
+            '<input type="hidden" name="parentId" value="">' +
+            '<textarea class="textarea" name="content" rows="3" maxlength="500" placeholder="回复楼主，支持 Markdown"></textarea>' +
+            '<div class="cluster gap-2 mt-2"><button class="btn btn--primary" type="submit">回复</button>' +
+            '<span class="text-xs text-muted">会通知楼主</span></div></form>'
+        : '<div class="listmeta">' + icon('lock', 13) + '<span><a href="' +
+            attr(href('/login', { redirect: '/post/' + post.id })) + '">登录</a> 后可以回复</span></div>');
+
+    var commentBlock = '<div class="block block--box">' +
+      '<div class="block__head"><h2 class="block__title">回复</h2>' +
+        '<span class="cluster gap-2">' +
+          '<span class="block__more" id="pf-floor-total">' + num(total) + ' 条</span>' +
+          (csort === 'old' ? '<span class="block__more">按时间</span>'
+            : '<a class="block__more" href="' + attr(href('/post/' + post.id, withQ(p.query, { csort: 'old', cpage: '' }))) + '">按时间</a>') +
+          (csort === 'hot' ? '<span class="block__more">按热度</span>'
+            : '<a class="block__more" href="' + attr(href('/post/' + post.id, withQ(p.query, { csort: 'hot', cpage: '' }))) + '">按热度</a>') +
+        '</span></div>' +
+      '<div class="block__body">' +
+        '<div id="pf-floors">' + floors + '</div>' +
+        /* 分页只给页码，不给 total：楼层数是顶层评论、回复数是含楼中楼，两个数字并排会打架 */
+        UI.pagination({
+          page: comments.page, pages: comments.pages,
+          makeHref: function (n) { return href('/post/' + post.id, withQ(p.query, { csort: csort, cpage: n })); }
+        }) +
+      '</div></div>';
+
+    var others = ST.listPosts({ authorId: post.authorId, size: 8 }).list.filter(function (x) { return x.id !== post.id; }).slice(0, 5);
+    var sameTags = arr(post.tags);
+    var related = ST.listPosts({ boardId: post.boardId, size: 12 }).list
+      .filter(function (x) { return x.id !== post.id; })
+      .sort(function (a, b) {
+        return arr(b.tags).filter(function (t) { return sameTags.indexOf(t) >= 0; }).length -
+          arr(a.tags).filter(function (t) { return sameTags.indexOf(t) >= 0; }).length;
+      }).slice(0, 5);
+    function miniList(items) {
+      return items.length
+        ? '<div class="noticelist">' + items.map(function (x) {
+            return noticeRow(href('/post/' + x.id), esc(x.title), rel(x.lastReplyAt || x.createdAt));
+          }).join('') + '</div>'
+        : plain('没有别的帖子');
+    }
+
+    var sideAuthor = boxBlock('楼主', '<div class="listmeta">' +
+      '<a class="userchip" href="' + attr(href('/u/' + post.authorId)) + '">' + av(author, 36, 'avatar--round') +
+        '<span class="userchip__text"><b>' + esc(nick(author)) + '</b><i>' +
+        esc((((author && author.grade) || '') + ' ' + ((author && author.klass) || '')).trim()) + '</i></span></a>' +
+      '</div><div class="listmeta mt-2">' +
+        li('edit', '发帖 ' + num(author && author.stats ? author.stats.posts : 0)) +
+        li('star', num(author ? author.points : 0) + ' 分') +
+      '</div>', '<a class="block__more" href="' + attr(href('/messages', { tab: 'pm', c: post.authorId })) + '">私信</a>');
+
+    var sideInfo = boxBlock('帖子信息', '<div class="listmeta">' +
+      li('grid', board ? board.name : '版块') +
+      li('clock', '发布 ' + U.fmtTime(post.createdAt)) +
+      (post.updatedAt && post.updatedAt !== post.createdAt ? li('refresh', '编辑 ' + U.fmtTime(post.updatedAt)) : '') +
+      li('heart', num(post.likes) + ' 个赞') +
+      '</div>');
+
+    return {
+      title: post.title,
+      html: crumb([
+        { text: '论坛', href: '#/forum' },
+        { text: board ? board.name : '版块', href: board ? href('/board/' + board.id) : '#/forum' },
+        { text: U.excerpt(post.title, 18) }
+      ]) +
+        '<div class="row"><div class="col">' + postBlock +
+          '<div class="mt-5 block block--box"><div class="block__head"><h2 class="block__title">写回复</h2></div>' +
+          '<div class="block__body">' + composer + '</div></div>' +
+          '<div class="mt-5">' + commentBlock + '</div>' +
+        '</div><aside class="col-side stack gap-5">' + sideAuthor +
+          boxBlock('同版帖子', miniList(related)) + boxBlock('TA 的其他帖子', miniList(others)) + sideInfo +
+        '</aside></div>' + reportModalHtml() + zoomModalHtml()
+    };
+  }
+
+  /* ==================================================================
+     5 · 页面：发帖 / 编辑 #/new #/edit/:id
+     ================================================================== */
+
+  var ED = { key: '', postId: '', tags: [], images: [] };
+
+  function previewHtml(text) {
+    var t = str(text).trim();
+    if (!t) return '<div class="text-sm text-muted">左边写完，这里看效果</div>';
+    return U.md(t);
+  }
+
+  function syncEditor() {
+    var ta = document.getElementById('pf-content');
+    var ti = document.getElementById('pf-title');
+    var prev = document.getElementById('pf-preview');
+    var cnt = document.getElementById('pf-title-count');
+    if (cnt && ti) cnt.textContent = '标题 ' + str(ti.value).length + '/60';
+    if (prev && ta) prev.innerHTML = previewHtml(ta.value);
+    saveDraft();
+  }
+  function saveDraft() {
+    if (!ED.key) return;
+    var ti = document.getElementById('pf-title');
+    var ta = document.getElementById('pf-content');
+    if (!ti && !ta) return;
+    var bd = document.querySelector('form[data-action="post.save"] select[name=boardId]');
+    writeDraft(ED.key, {
+      title: ti ? ti.value : '', content: ta ? ta.value : '',
+      tags: ED.tags.slice(0, MAX_TAGS), images: ED.images.slice(0, MAX_IMAGES),
+      boardId: bd ? bd.value : '', at: Date.now()
+    });
+  }
+  function renderTags() {
+    var boxEl = document.getElementById('pf-tags');
+    if (!boxEl) return;
+    boxEl.innerHTML = ED.tags.length
+      ? ED.tags.map(function (t) {
+          return '<button type="button" class="chip is-active" data-action="editor.delTag"' + dp({ tag: t }) +
+            ' title="点一下删掉">' + esc(t) + icon('close', 11) + '</button>';
+        }).join('')
+      : '<span class="text-xs text-muted">还没加标签</span>';
+  }
+  function renderImages() {
+    var boxEl = document.getElementById('pf-imgs');
+    if (boxEl) {
+      boxEl.innerHTML = ED.images.map(function (src, i) {
+        return '<span class="upload__item"><img src="' + attr(src) + '" alt="' + attr('配图 ' + (i + 1)) + '">' +
+          '<button type="button" class="upload__remove" data-action="editor.delImage"' + dp({ i: i }) +
+          ' aria-label="删掉这张">' + icon('close', 12) + '</button></span>';
+      }).join('');
+    }
+    var hint = document.getElementById('pf-img-hint');
+    if (hint) hint.textContent = ED.images.length ? ED.images.length + ' / ' + MAX_IMAGES + ' 张' : '';
+  }
+  function addTag() {
+    var input = document.getElementById('pf-tag');
+    var t = str(input ? input.value : '').trim().replace(/^#/, '').slice(0, 8);
+    if (!t) { toast('先输入标签', 'warn'); return; }
+    if (ED.tags.length >= MAX_TAGS) { toast('最多 ' + MAX_TAGS + ' 个标签', 'warn'); return; }
+    if (ED.tags.indexOf(t) >= 0) { toast('这个标签加过了', 'warn'); return; }
+    ED.tags.push(t);
+    if (input) { input.value = ''; input.focus(); }
+    renderTags(); saveDraft();
+  }
+  function formError(msg) {
+    var boxEl = document.getElementById('pf-form-err');
+    if (!boxEl) { toast(msg, 'error'); return; }
+    boxEl.innerHTML = icon('alert', 13) + '<span>' + esc(msg) + '</span>';
+    try { boxEl.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) { /* 忽略 */ }
+  }
+  function clearFormError() {
+    var boxEl = document.getElementById('pf-form-err');
+    if (boxEl) boxEl.innerHTML = '';
+  }
+
+  function buildEditor(p) {
+    var isEdit = p.page === 'edit';
+    var post = isEdit ? ST.getPost((p.param || {}).id) : null;
+    var user = me();
+    if (isEdit) {
+      if (!post || post.status === 'deleted') {
+        return { title: '帖子没了', html: crumb([{ text: '论坛', href: '#/forum' }, { text: '帖子没了' }]) + plain('要改的帖子已经删了') };
+      }
+      if (!user || (post.authorId !== user.id && !ST.isAdmin())) {
+        return { title: '改不了', html: crumb([{ text: '论坛', href: '#/forum' }, { text: '改不了' }]) + plain('只能改自己发的帖子') };
+      }
+    }
+
+    var key = draftKey(isEdit ? post.id : 'new');
+    var draft = readDraft(key);
+    var boardId = str((p.query || {}).board) || (post ? post.boardId : '') || (ST.listBoards()[0] || {}).id || '';
+    var title = post ? post.title : '';
+    var content = post ? post.content : '';
+    var tags = post ? arr(post.tags).slice() : [];
+    var images = post ? arr(post.images).slice() : [];
+    var restored = false;
+    if (draft && (!isEdit || Number(draft.at || 0) > Number(post ? (post.updatedAt || post.createdAt) : 0))) {
+      title = str(draft.title); content = str(draft.content);
+      tags = arr(draft.tags).slice(0, MAX_TAGS); images = arr(draft.images).slice(0, MAX_IMAGES);
+      boardId = str(draft.boardId) || boardId;
+      restored = true;
+    }
+    ED.key = key;
+    ED.postId = isEdit ? post.id : '';
+    ED.tags = tags.slice(0, MAX_TAGS);
+    ED.images = images.slice(0, MAX_IMAGES);
+
+    var boardOptions = [{ value: '', label: '选个版块' }].concat(ST.listBoards().map(function (b) {
+      return { value: b.id, label: b.name + (b.locked ? '（只读）' : '') };
+    }));
+
+    var tools = [['bold', '加粗'], ['italic', '斜体'], ['h3', '小标题'], ['quote', '引用'], ['list', '列表'],
+      ['code', '代码'], ['link', '链接'], ['image', '图片']].map(function (t) {
+      return '<button type="button" class="btn btn--ghost btn--sm" data-action="editor.md"' + dp({ type: t[0] }) + '>' + esc(t[1]) + '</button>';
+    }).join('');
+
+    var targetBoard = ST.getBoard(boardId);
+    var lockedBar = targetBoard && targetBoard.locked && !canManage()
+      ? '<div class="noticebar mb-3">' + icon('lock', 15) + '<span>「' + esc(targetBoard.name) + '」是只读版块，只有版主和站长能发帖</span></div>'
+      : '';
+
+    var form = '<form data-action="post.save">' + lockedBar +
+      '<div class="formgrid">' +
+        UI.selectField({ label: '版块', name: 'boardId', value: boardId, options: boardOptions, required: true }) +
+        UI.field({ id: 'pf-title', label: '标题', name: 'title', value: title, maxlength: 60, required: true, placeholder: '比如：求高二数学月考前两章的复习提纲' }) +
+      '</div>' +
+      '<div class="mt-3">' +
+        '<label class="field__label" for="pf-content">正文 <span class="req">*</span></label>' +
+        /* .editorbar：手机上横向滚动，不折成两排（mobile.css 提供） */
+        '<div class="editorbar mt-2 mb-1">' + tools + '</div>' +
+        '<div class="text-xs text-muted mb-2" id="pf-title-count">标题 0/60</div>' +
+        '<div class="grid grid--2">' +
+          '<textarea class="textarea" id="pf-content" name="content" rows="16" maxlength="8000" ' +
+            'placeholder="支持 Markdown：**加粗**、`代码`、- 列表、> 引用、[文字](链接)">' + esc(content) + '</textarea>' +
+          '<div class="markdown markdown--preview" id="pf-preview">' + previewHtml(content) + '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="mt-3">' +
+        '<label class="field__label" for="pf-tag">标签</label>' +
+        '<div class="cluster gap-2 mt-2">' +
+          '<input class="input" id="pf-tag" name="tagInput" maxlength="8" placeholder="回车加标签，比如 月考">' +
+          '<button class="btn" type="button" data-action="editor.addTag">添加</button>' +
+        '</div>' +
+        '<div class="field__hint">最多 ' + MAX_TAGS + ' 个，一个标签 8 个字以内</div>' +
+        '<div class="cluster gap-2 mt-2" id="pf-tags"></div>' +
+      '</div>' +
+      '<div class="mt-3">' +
+        '<label class="field__label">配图</label>' +
+        /* 文件输入框做成**覆盖在按钮上的透明层**（原生点击，最可靠）。
+           不要用"按钮 JS 触发隐藏输入框"或"<label for> + 隐藏输入框"：
+           Chrome 会拒绝为隐藏/程序触发的 input[type=file] 打开选择器，
+           而且点在表单内的文件输入框还会触发隐式提交（帖子会被直接发出去）。 */
+        '<div class="upload-wrap mt-2">' +
+          '<button class="upload upload--file" type="button" tabindex="-1" aria-hidden="true">' + icon('image', 20) +
+            '<b>选图片</b><div class="text-xs text-muted">最多 ' + MAX_IMAGES + ' 张，自动压到 1280px</div></button>' +
+          '<input class="upload__file" id="pf-images" type="file" accept="image/*" multiple ' +
+            'aria-label="选择配图" title="选图片" data-action-change="editor.pickImages">' +
+        '</div>' +
+        '<div class="cluster gap-2 mt-2"><span class="text-xs text-muted" id="pf-img-hint"></span></div>' +
+        '<div class="upload__preview" id="pf-imgs"></div>' +
+      '</div>' +
+      '<div id="pf-form-err" class="field__error mt-3"></div>' +
+      '<div class="cluster gap-2 mt-4">' +
+        '<button class="btn btn--primary btn--lg btn--block" type="submit">' + (isEdit ? '保存' : '发布') + '</button>' +
+        '<button class="btn" type="button" data-action="app.back">取消</button>' +
+        '<span class="spacer"></span><span class="text-xs text-muted">草稿存在本机</span>' +
+      '</div>' +
+      /* 文件输入框放表单外面：点表单内的 file 输入框会触发隐式提交（帖子被直接发出去）。
+         app.js 里也有守卫，但结构上更稳妥的做法就是挪出来。 */
+      '</form>';
+
+    var side = '';
+    if (restored) {
+      side += '<div class="noticebar">' + icon('refresh', 15) + '<span>接上了 ' + esc(rel(draft.at)) + '存的草稿' +
+        '<div class="mt-2"><button class="btn btn--sm" type="button" data-action="editor.dropDraft">扔掉草稿</button></div></span></div>';
+    } else if (isEdit && draft) {
+      side += '<div class="noticebar">' + icon('refresh', 15) + '<span>本机还有 ' + esc(rel(draft.at)) + '的草稿，比线上新' +
+        '<div class="cluster gap-2 mt-2"><button class="btn btn--sm" type="button" data-action="editor.loadDraft">用草稿</button>' +
+        '<button class="btn btn--text btn--sm" type="button" data-action="editor.dropDraft">扔掉</button></div></span></div>';
+    }
+    var st = settings();
+    side += boxBlock('发帖前看一眼', '<ul class="stack gap-2 text-sm">' +
+      '<li>标题写清楚：什么事、什么时候、要什么</li>' +
+      '<li>正文补细节：班级、时间、地点、试过什么办法</li>' +
+      '<li>别写同学的真名、住址、手机号</li>' +
+      '<li>广告、代写、刷分会被下架</li></ul>') +
+      boxBlock('规则', '<div class="listmeta">' +
+        li('shield', '敏感词 ' + num(arr(st.sensitiveWords).length) + ' 个') +
+        li('clock', st.needAudit ? '发帖要审核' : '发帖直接公开') +
+        '</div>');
+
+    return {
+      title: isEdit ? '编辑帖子' : '发帖',
+      html: crumb([{ text: '论坛', href: '#/forum' }, { text: isEdit ? '编辑' : '发帖' }]) +
+        '<div class="row"><div class="col">' + boxBlock(isEdit ? '编辑帖子' : '发新帖', form) + '</div>' +
+        '<aside class="col-side stack gap-5">' + side + '</aside></div>',
+      onMount: function () {
+        var ta = document.getElementById('pf-content');
+        var ti = document.getElementById('pf-title');
+        var sync = U.debounce(function () { syncEditor(); }, 180);
+        if (ta) ta.addEventListener('input', sync);
+        if (ti) ti.addEventListener('input', sync);
+        var tag = document.getElementById('pf-tag');
+        if (tag) tag.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addTag(); } });
+        renderTags(); renderImages(); syncEditor();
+      }
+    };
+  }
+
+  /* ==================================================================
+     6 · 页面：个人主页 #/u/:id #/me
+     ================================================================== */
+
+  function commentsOf(userId) {
+    var out = [];
+    try {
+      arr(ST.state().comments).forEach(function (c) {
+        if (c.authorId !== userId || c.status === 'deleted') return;
+        if (c.status === 'hidden' && !(ST.isAdmin() || (me() && me().id === userId))) return;
+        out.push(c);
+      });
+    } catch (e) { out = []; }
+    return out.sort(function (a, b) { return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0); });
+  }
+
+  function profileModal(user) {
+    return UI.modal({
+      id: 'pf-profile-edit', title: '改资料',
+      body: '<form data-action="profile.editSubmit">' +
+        UI.field({ label: '昵称', name: 'nickname', value: user.nickname, maxlength: 16, required: true, hint: '同学看到的就是这个' }) +
+        '<div class="mt-3">' + UI.field({ label: '真实姓名', name: 'realName', value: user.realName || '', maxlength: 20, required: true, hint: (user.hasRealName && !user.realName ? '已实名，要改就填新的；' : '') + '2~20 个字，只有管理员能看到' }) + '</div>' +
+        '<div class="mt-3">' + UI.textarea({ label: '签名', name: 'bio', value: user.bio || '', rows: 3, maxlength: 120, placeholder: '一句话，别人点进主页能看到' }) + '</div>' +
+        '<div class="formgrid mt-3">' +
+          UI.selectField({ label: '年级', name: 'grade', value: user.grade || '', options: GRADES.map(function (g) { return { value: g, label: g }; }), hint: '年级是公开的' }) +
+          UI.selectField({ label: '班级', name: 'klass', value: user.klass || '1班', required: true, options: KLASS_OPTIONS.map(function (k) { return { value: k, label: k }; }), hint: '只能选 1~10 班，只有管理员能看到' }) +
+        '</div>' +
+        '<div class="mt-3">' + UI.field({ label: '学号', name: 'studentNo', value: user.studentNo || '', required: true, inputmode: 'numeric', maxlength: 12, placeholder: '20240101', hint: (user.hasStudentNo && !user.studentNo ? '已填过，要改就填新的；' : '') + '4~12 位数字，只有管理员能看到' }) + '</div>' +
+        '<div class="mt-3">' + UI.radioCards({ name: 'sex', value: user.sex || '', options: [{ value: '男', label: '男' }, { value: '女', label: '女' }, { value: '', label: '不说' }] }) + '</div>' +
+        '<div class="cluster gap-2 mt-4"><button class="btn btn--primary" type="submit">保存</button>' +
+        '<button class="btn" type="button" data-modal-close>取消</button></div></form>'
+    });
+  }
+
+  function buildProfile(p) {
+    var self = p.page === 'me';
+    var user = self ? me() : ST.getUser((p.param || {}).id);
+    if (!user) return { title: '没这个人', html: crumb([{ text: '论坛', href: '#/forum' }, { text: '没这个人' }]) + plain('找不到这位同学') };
+
+    var isSelf = !!(me() && me().id === user.id);
+    var tab = ['posts', 'comments', 'fav', 'about'].indexOf(str(p.query.tab)) >= 0 ? p.query.tab : 'posts';
+    var page = toInt(p.query.page, 1);
+    var stats = user.stats || {};
+    var lv = ST.levelInfo ? ST.levelInfo(user.points || 0) : { level: user.level || 1, percent: 0, need: 0, next: null };
+    var favCount = arr(user.favorites).length;
+
+    var head = '<div class="bbs-head"><div class="cluster gap-3">' + av(user, 56, 'avatar--round') +
+      '<div>' +
+        '<div class="bbs-head__title">' + esc(nick(user)) + roleBadge(user) +
+          (user.level ? UI.badge('Lv.' + user.level, 'default') : '') +
+          /* 只有「已实名但看不到姓名」的别人主页才给这个标记：不泄露内容，也不留占位 */
+          (user.hasRealName && !user.realName ? UI.badge('已实名', 'success') : '') +
+          (user.banned ? UI.badge('封禁中', 'danger') : '') + '</div>' +
+        '<div class="bbs-head__desc">' + esc(user.bio || '@' + user.username) + '</div>' +
+        '<div class="listmeta mt-2">' +
+          li('at', '@' + user.username) +
+          li('user', (user.grade || '没填年级') + (user.klass ? ' · ' + user.klass : '')) +
+          li('calendar', '加入于 ' + U.fmtDate(user.createdAt)) +
+          (isSelf ? li('clock', '上次登录 ' + rel(user.lastLoginAt)) : '') +
+        '</div>' +
+      '</div></div>' +
+      '<div class="cluster gap-2">' +
+        (isSelf
+          ? '<button type="button" class="btn" data-action="profile.editOpen">' + icon('edit', 14) + '<span>改资料</span></button>' +
+            '<a class="btn btn--ghost" href="#/settings">' + icon('settings', 14) + '<span>设置</span></a>'
+          : '<a class="btn btn--ghost" href="' + attr(href('/messages', { tab: 'pm', c: user.id })) + '">' + icon('mail', 14) + '<span>私信</span></a>') +
+      '</div></div>';
+
+    var statBar = '<div class="bbs-stats mt-3">' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(stats.posts) + '</div><div class="bbs-stats__label">帖子</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(stats.comments) + '</div><div class="bbs-stats__label">回复</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(stats.likes) + '</div><div class="bbs-stats__label">获赞</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(favCount) + '</div><div class="bbs-stats__label">收藏</div></div>' +
+      '<div class="bbs-stats__item"><div class="bbs-stats__value">' + num(user.points) + '</div><div class="bbs-stats__label">积分</div></div>' +
+      '</div>';
+
+    var nav = '<nav class="bbs-nav">' + [
+      ['posts', '帖子', stats.posts || 0], ['comments', '回复', stats.comments || 0],
+      ['fav', '收藏', favCount], ['about', '资料', '']
+    ].map(function (t) {
+      return '<a class="bbs-nav__item' + (t[0] === tab ? ' is-active' : '') + '" href="' +
+        attr(href(p.path, withQ(p.query, { tab: t[0], page: '' }))) + '">' + esc(t[1]) +
+        (t[2] !== '' ? '<span class="bbs-nav__count">' + num(t[2]) + '</span>' : '') + '</a>';
+    }).join('') + '</nav>';
+
+    var body = '';
+    if (tab === 'posts') {
+      var res = ST.listPosts({ authorId: user.id, status: isSelf ? 'all' : 'published', page: page, size: PAGE_SIZE });
+      body = res.list.length
+        ? '<div class="block block--box block--flush"><div class="block__body">' +
+            res.list.map(function (x) { return postRowHtml(x, { showBoard: true }); }).join('') + '</div></div>' +
+          pager(p.path, withQ(p.query, { tab: 'posts' }), res)
+        : plain(isSelf ? '你还没发过帖子' : 'TA 还没发过帖子');
+    } else if (tab === 'comments') {
+      var all = commentsOf(user.id);
+      var pages = Math.max(1, Math.ceil(all.length / 15));
+      var cur = Math.min(page, pages);
+      var slice = all.slice((cur - 1) * 15, cur * 15);
+      body = slice.length
+        ? '<div class="block block--box"><div class="block__body">' + slice.map(function (c) {
+            var post = ST.getPost(c.postId, { view: false });
+            return '<div class="commentitem"><div class="commentitem__body">' +
+              '<div class="commentitem__head">' + icon('comment', 13) +
+                (post ? '<a href="' + attr(href('/post/' + post.id)) + '">' + esc(post.title) + '</a>' : '<span>帖子已删除</span>') +
+                '<span>' + esc(rel(c.createdAt)) + '</span>' +
+                (c.status === 'hidden' ? UI.badge('已隐藏', 'warn') : '') + '</div>' +
+              '<div class="commentitem__content">' + U.md(c.content) + '</div>' +
+              '<div class="commentitem__actions">' + li('heart', num(c.likes) + ' 个赞') + '</div>' +
+              '</div></div>';
+          }).join('') + '</div></div>' +
+          UI.pagination({
+            page: cur, pages: pages, total: all.length,
+            makeHref: function (n) { return href(p.path, withQ(p.query, { tab: 'comments', page: n })); }
+          })
+        : plain(isSelf ? '你还没回过帖' : 'TA 还没回过帖');
+    } else if (tab === 'fav') {
+      var favs = ST.favoritePosts(user.id);
+      body = favs.length
+        ? '<div class="block block--box block--flush"><div class="block__body">' +
+            favs.map(function (x) { return postRowHtml(x, { showBoard: true }); }).join('') + '</div></div>'
+        : plain(isSelf ? '你还没收藏帖子' : 'TA 还没收藏帖子');
+    } else {
+      var recent = ST.listPosts({ authorId: user.id, status: isSelf ? 'all' : 'published', size: 5 }).list;
+      body = '<div class="block block--box"><div class="block__body">' +
+        '<div class="listmeta">' +
+          li('user', '昵称：' + nick(user)) + li('at', '用户名：@' + user.username) +
+          li('user', '年级：' + (user.grade || '没填')) +
+          /* 班级与真实姓名都是隐私字段：服务端只给本人和超管，空值就整行不渲染 */
+          (user.klass ? li('user', '班级：' + user.klass) : '') +
+          (user.realName ? li('shield', '真实姓名：' + user.realName) : '') +
+          (user.studentNo ? li('user', '学号：' + user.studentNo) : '') +
+          (isSelf && (!user.realName || !user.klass || !user.studentNo) ? li('alert', '真实姓名 / 班级 / 学号 还有没填的，点下面「改资料」补上') : '') +
+          li('heart', '性别：' + U.sexLabel(user.sex)) +
+          li('calendar', '注册：' + U.fmtTime(user.createdAt)) +
+          li('clock', '上次登录：' + U.fmtTime(user.lastLoginAt)) +
+          li('star', '积分：' + num(user.points) + ' · Lv.' + num(user.level) +
+            (lv.next ? '，差 ' + num(lv.need) + ' 分升级' : '')) +
+        '</div>' +
+        '<div class="mt-3">' + UI.progress(lv.percent, 100) + '</div>' +
+        '<div class="sigline">' + esc(user.bio || '这位同学没写签名') + '</div>' +
+        (isSelf ? '<div class="mt-3"><button class="btn btn--sm" type="button" data-action="profile.editOpen">改资料</button></div>' : '') +
+        '</div></div>' +
+        (recent.length ? '<div class="mt-5">' + boxBlock('最近发帖', '<div class="noticelist">' + recent.map(function (x) {
+          return noticeRow(href('/post/' + x.id), esc(x.title), rel(x.createdAt));
+        }).join('') + '</div>') + '</div>' : '');
+    }
+
+    var side = boxBlock('统计', '<div class="listmeta">' +
+      li('edit', '发帖 ' + num(stats.posts || 0)) + li('comment', '回复 ' + num(stats.comments || 0)) +
+      li('heart', '获赞 ' + num(stats.likes || 0)) + li('bookmark', '收藏 ' + num(favCount)) +
+      '</div>') +
+      (isSelf ? boxBlock('我的', '<div class="noticelist">' +
+        noticeRow('#/messages', '消息中心') + noticeRow('#/settings', '账号设置') + '</div>') : '');
+
+    return {
+      title: nick(user) + ' 的主页',
+      html: crumb([{ text: '论坛', href: '#/forum' }, { text: nick(user) }]) + head + statBar +
+        '<div class="mt-4">' + nav + '</div>' +
+        '<div class="row"><div class="col">' + body + '</div><aside class="col-side stack gap-5">' + side + '</aside></div>' +
+        (isSelf ? profileModal(user) : '')
+    };
+  }
+
+  /* ==================================================================
+     7 · 页面：消息 #/messages
+     ================================================================== */
+
+  function pmThread(peerId) {
+    var user = me();
+    if (!user || !peerId) return [];
+    var out = [];
+    var full = null;
+    try { full = ST.state(); } catch (e) { full = null; }
+    if (full && arr(full.messages).length) {
+      arr(full.messages).forEach(function (m) {
+        if (m.type !== 'pm') return;
+        if (m.userId === user.id && m.fromId === peerId) out.push({ m: m, mine: false });
+        else if (m.fromId === user.id && m.userId === peerId) out.push({ m: m, mine: true });
+      });
+    } else {
+      ST.listMessages({ box: 'inbox', size: 200 }).list.forEach(function (m) {
+        if (m.fromId === peerId) out.push({ m: m, mine: false });
+      });
+    }
+    return out.sort(function (a, b) { return (Number(a.m.createdAt) || 0) - (Number(b.m.createdAt) || 0); });
+  }
+
+  /* 私信：收件人不用手打用户名 —— 给一个「最近活跃同学」的下拉，也可以手填昵称。
+     服务端四种写法都认：用户 id（纯数字也行）/ 用户名 / 昵称。 */
+  function composeModalHtml() {
+    var people = [];
+    try { people = (ST.listUsers ? ST.listUsers({ sort: 'points', size: 30 }).list : []) || []; } catch (e) { people = []; }
+    var meId = (me() || {}).id;
+    people = people.filter(function (u) { return u && str(u.id) !== str(meId); });
+    var optionHtml = people.map(function (u) {
+      var name = (u.nickname || u.username) + (u.username ? '（@' + u.username + '）' : '') + (u.grade ? ' · ' + u.grade : '');
+      return '<option value="' + attr(u.username || '') + '" data-uid="' + attr(str(u.id)) + '" data-nick="' + attr(u.nickname || u.username || '') + '">' + esc(name) + '</option>';
+    }).join('');
+    var picker = people.length
+      ? '<div class="field"><label class="field__label" for="pf-pm-to">发给谁</label>' +
+        '<select class="select" id="pf-pm-to" name="toPick"><option value="">— 选一位同学 —</option>' + optionHtml + '</select>' +
+        '<div class="field__hint">从列表里选一位（更不容易出错）</div></div>' +
+        '<div class="mt-3">' + UI.field({ label: '或者手填', name: 'to', placeholder: '用户名或昵称都行，比如：小眠', hint: '上面选了就这里可以留空' }) + '</div>'
+      : UI.field({ label: '收件人', name: 'to', required: true, placeholder: '用户名或昵称都行', hint: '填对方的用户名或昵称都可以' });
+    return UI.modal({
+      id: 'pf-pm', title: '发私信',
+      body: '<form data-action="message.send">' + picker +
+        '<input type="hidden" name="toId" value="">' +
+        '<div class="mt-3">' + UI.field({ label: '主题', name: 'title', maxlength: 40, placeholder: '关于什么' }) + '</div>' +
+        '<div class="mt-3">' + UI.textarea({ label: '内容', name: 'body', rows: 5, maxlength: 500 }) + '</div>' +
+        '<div class="cluster gap-2 mt-4"><button class="btn btn--primary" type="submit">发送</button>' +
+        '<button class="btn" type="button" data-modal-close>取消</button></div></form>'
+    });
+  }
+
+  function notifRow(m) {
+    var kind = { system: '通知', audit: '审核', reply: '回复', like: '赞', at: '提到你', pm: '私信' }[m.type] || '通知';
+    var link = str(m.link);
+    var inner = '<span class="noticerow__title">' + (m.read ? '' : '<i class="unread-dot"></i> ') +
+      '<b>' + esc(m.title || kind) + '</b> <span class="text-muted">' + esc(U.excerpt(m.body || '', 70)) + '</span></span>' +
+      '<span class="noticerow__time">' + esc(rel(m.createdAt)) + '</span>';
+    if (link) return '<a class="noticerow" href="' + attr(link) + '" data-action="message.read"' + dp({ id: m.id }) + '>' + inner + '</a>';
+    return '<button type="button" class="noticerow w-full" data-action="message.read"' + dp({ id: m.id }) + '>' + inner + '</button>';
+  }
+
+  function buildMessages(p) {
+    var user = me();
+    if (!user) return { title: '消息', html: '' };
+    var tab = p.query.tab === 'notice' ? 'notice' : 'pm';
+    var convs = ST.conversations();
+    var curId = str(p.query.c);
+    var unread = ST.unreadCount ? (ST.unreadCount() || 0) : 0;
+    var systemList = ST.listMessages({ box: 'system', size: 30 }).list;
+    var interact = ST.listMessages({ box: 'inbox', size: 50 }).list.filter(function (m) {
+      return m.type === 'reply' || m.type === 'like' || m.type === 'at' || m.type === 'audit';
+    });
+    var unreadPm = convs.reduce(function (n, c) { return n + (c.unread || 0); }, 0);
+    var unreadNotice = systemList.filter(function (m) { return !m.read; }).length + interact.filter(function (m) { return !m.read; }).length;
+
+    var head = '<div class="bbs-head"><div>' +
+      '<div class="bbs-head__title">' + icon('bell', 18) + '<span>消息</span></div>' +
+      '<div class="bbs-head__desc">' + (unread ? unread + ' 条没读' : '都读完了') + ' · ' + convs.length + ' 个会话</div>' +
+      '</div><div class="cluster gap-2">' +
+      '<button type="button" class="btn btn--ghost" data-action="message.compose">' + icon('send', 14) + '<span>发私信</span></button>' +
+      '<button type="button" class="btn btn--ghost" data-action="message.readAll">' + icon('check', 14) + '<span>全部已读</span></button>' +
+      '</div></div>';
+
+    var nav = '<nav class="bbs-nav mt-4">' +
+      '<a class="bbs-nav__item' + (tab === 'pm' ? ' is-active' : '') + '" href="' + attr(href('/messages', { tab: 'pm' })) + '">私信' +
+        (unreadPm ? '<span class="bbs-nav__count">' + unreadPm + '</span>' : '') + '</a>' +
+      '<a class="bbs-nav__item' + (tab === 'notice' ? ' is-active' : '') + '" href="' + attr(href('/messages', { tab: 'notice' })) + '">通知' +
+        (unreadNotice ? '<span class="bbs-nav__count">' + unreadNotice + '</span>' : '') + '</a></nav>';
+
+    var body = '';
+    if (tab === 'pm') {
+      var listHtml = convs.length
+        ? convs.map(function (c) {
+            var u = c.user || ST.getUser(c.userId) || {};
+            var last = c.last || {};
+            return '<a class="noticerow' + (c.userId === curId ? ' is-active' : '') + '" href="' +
+              attr(href('/messages', { tab: 'pm', c: c.userId })) + '">' + av(u, 28, 'avatar--round') +
+              '<span class="noticerow__title"><b>' + esc(nick(u)) + '</b> <span class="text-muted">' +
+                esc(U.excerpt(last.body || last.title || '', 24)) + '</span>' + (c.unread ? ' <i class="unread-dot"></i>' : '') + '</span>' +
+              '<span class="noticerow__time">' + esc(rel(last.createdAt)) + '</span></a>';
+          }).join('')
+        : plain('还没有私信', '给同学发一条');
+
+      var thread;
+      if (!curId) {
+        thread = '<div class="block block--box"><div class="block__body">' + plain('选左边一个同学，看聊天记录') + '</div></div>';
+      } else {
+        var peer = ST.getUser(curId);
+        var msgs = pmThread(curId);
+        thread = '<div class="block block--box"><div class="block__head"><h2 class="block__title">' + esc(nick(peer)) + '</h2>' +
+          '<a class="block__more" href="' + attr(href('/u/' + curId)) + '">TA 的主页</a></div>' +
+          '<div class="block__body">' +
+          (msgs.length ? msgs.map(function (it) {
+            var m = it.m;
+            return '<div class="commentitem"><a href="' + attr(href('/u/' + (it.mine ? user.id : curId))) + '">' +
+              av(it.mine ? user : peer, 28, 'avatar--round') + '</a>' +
+              '<div class="commentitem__body">' +
+                '<div class="commentitem__head"><b>' + esc(it.mine ? '我' : nick(peer)) + '</b>' +
+                  (m.title ? '<span>' + esc(m.title) + '</span>' : '') +
+                  '<span>' + esc(U.fmtTime(m.createdAt)) + '</span></div>' +
+                '<div class="commentitem__content">' + U.md(m.body || '') + '</div>' +
+              '</div></div>';
+          }).join('') : plain('还没聊过')) +
+          '<form class="mt-3" data-action="message.send">' +
+            '<input type="hidden" name="toId" value="' + attr(curId) + '">' +
+            '<input type="hidden" name="to" value="">' +
+            '<textarea class="textarea" name="body" rows="3" maxlength="500" placeholder="发给 ' + attr(nick(peer)) + '"></textarea>' +
+            '<div class="cluster gap-2 mt-2"><button class="btn btn--primary" type="submit">发送</button></div>' +
+          '</form></div></div>';
+      }
+      body = '<div class="row"><div class="col-side">' + rowBlock('会话', listHtml) + '</div>' +
+        '<div class="col">' + thread + '</div></div>';
+    } else {
+      body = rowBlock('通知', systemList.length ? systemList.map(notifRow).join('') : plain('没有新通知', '公告和审核结果会出现在这儿')) +
+        '<div class="mt-5">' + rowBlock('谁理过你', interact.length ? interact.map(notifRow).join('') : plain('还没人回复或提到你')) + '</div>';
+    }
+
+    return {
+      title: '消息',
+      html: head + nav + body + composeModalHtml(),
+      onMount: function () {
+        if (tab === 'pm' && curId) {
+          pmThread(curId).forEach(function (it) { if (!it.mine) ST.markRead(it.m.id); });
+          if (TF.app && TF.app.data) TF.app.data.unread = ST.unreadCount ? (ST.unreadCount() || 0) : 0;
+        }
+      }
+    };
+  }
+
+  /* ==================================================================
+     8 · 页面：设置 #/settings
+     ================================================================== */
+
+  function strength(pwd) {
+    var s = str(pwd);
+    if (!s) return 0;
+    var n = 0;
+    if (s.length >= 6) n++;
+    if (s.length >= 10) n++;
+    if (/[A-Za-z]/.test(s) && /\d/.test(s)) n++;
+    if (/[^A-Za-z0-9]/.test(s)) n++;
+    return Math.min(4, n);
+  }
+
+  function buildSettings() {
+    var user = me();
+    if (!user) return { title: '设置', html: '' };
+    var pref = readPrefs();
+    var notify = pref.notify || {};
+    var mode = document.documentElement.getAttribute('data-theme-mode') || 'light';
+    if (['light', 'dark', 'auto'].indexOf(mode) < 0) mode = 'light';
+    var hasAvatarImg = !!avatarUrlOf(user);
+
+    var head = '<div class="bbs-head"><div>' +
+      '<div class="bbs-head__title">' + icon('settings', 18) + '<span>设置</span></div>' +
+      '<div class="bbs-head__desc">资料、头像、密码、外观、提醒</div>' +
+      '</div><a class="btn btn--ghost" href="' + attr(href('/u/' + user.id)) + '">' + icon('user', 14) + '<span>我的主页</span></a></div>';
+
+    var avatarGrid = '<div class="radiocards mt-2">' + [0, 1, 2, 3, 4, 5, 6, 7].map(function (i) {
+      var on = Number(user.avatar) === i && !hasAvatarImg;
+      return '<label class="radiocard' + (on ? ' is-active' : '') + '">' +
+        '<input type="radio" name="avatar" value="' + i + '"' + (on ? ' checked' : '') + '>' +
+        UI.avatar({ id: user.id, nickname: user.nickname, avatar: i }, 32, 'avatar--round') +
+        '<span><b>头像 ' + (i + 1) + '</b></span></label>';
+    }).join('') + '</div>';
+
+    var profileForm = '<form id="pf-profile" data-action="settings.profile">' +
+      '<div class="formgrid">' +
+        UI.field({ label: '昵称', name: 'nickname', value: user.nickname, maxlength: 16, required: true, hint: '2~16 个字，同学看到的就是这个' }) +
+        UI.field({ label: '真实姓名', name: 'realName', value: user.realName || '', maxlength: 20, required: true, hint: '2~20 个字，只有管理员能看到' }) +
+      '</div>' +
+      '<div class="formgrid mt-3">' +
+        UI.selectField({ label: '年级', name: 'grade', value: user.grade || '', options: GRADES.map(function (g) { return { value: g, label: g }; }), hint: '年级是公开的' }) +
+        UI.selectField({ label: '班级', name: 'klass', value: user.klass || '1班', required: true, options: KLASS_OPTIONS.map(function (k) { return { value: k, label: k }; }), hint: '只能选 1~10 班，只有管理员能看到' }) +
+      '</div>' +
+      '<div class="mt-3">' + UI.field({ label: '学号', name: 'studentNo', value: user.studentNo || '', required: true, inputmode: 'numeric', maxlength: 12, placeholder: '20240101', hint: '4~12 位数字，只有管理员能看到' }) + '</div>' +
+      '<div class="mt-3">' + UI.field({ label: '邮箱', name: 'email', type: 'email', value: user.email || '', placeholder: 'name@example.com', hint: '忘了密码时用' }) + '</div>' +
+      '<div class="mt-3">' + UI.radioCards({ name: 'sex', value: user.sex || '', options: [{ value: '男', label: '男' }, { value: '女', label: '女' }, { value: '', label: '不说' }] }) + '</div>' +
+      '<div class="mt-3">' + UI.textarea({ label: '签名', name: 'bio', value: user.bio || '', rows: 3, maxlength: 120, placeholder: '别人点进主页能看到' }) + '</div>' +
+      '<div class="mt-3"><div class="field__label">头像</div>' +
+        '<div class="field__hint">上传的图片会存到服务器，换设备、别人看你的主页都是这张</div>' +
+        (hasAvatarImg ? '<div class="cluster gap-3 mt-2">' + av(user, 36, 'avatar--round') +
+          '<span class="text-sm text-muted">正在用你上传的照片</span>' +
+          '<button class="btn btn--text btn--sm" type="button" data-action="settings.avatarReset">换回预设头像</button></div>' : '') +
+        avatarGrid +
+        '<div class="upload-wrap mt-3">' +
+          /* 与发帖页配图同一套结构：<input type=file> 做成覆盖在按钮上的透明层，
+             用户点到哪都是浏览器原生点击（最可靠）。详见 CSS 里 .upload__file 的注释。 */
+          '<button class="upload upload--file" type="button" tabindex="-1" aria-hidden="true">' +
+            icon('camera', 18) + '<b>传自己的照片</b>' +
+            '<div class="text-xs text-muted">JPG / PNG，会自动压到 256px</div>' +
+          '</button>' +
+          '<input class="upload__file" id="pf-avatar" type="file" accept="image/*" ' +
+            'aria-label="上传头像" title="传自己的照片" data-action-change="settings.avatarFile">' +
+        '</div>' +
+      '</div>' +
+      '<div class="cluster gap-2 mt-4"><button class="btn btn--primary" type="submit">保存资料</button>' +
+      '<a class="btn" href="' + attr(href('/u/' + user.id)) + '">取消</a></div></form>';
+
+    var pwdForm = '<form data-action="settings.pwd">' +
+      UI.field({ id: 'pf-oldpwd', label: '现在的密码', name: 'oldPwd', type: 'password', required: true, autocomplete: 'current-password' }) +
+      '<div class="mt-3">' + UI.field({ id: 'pf-newpwd', label: '新密码', name: 'newPwd', type: 'password', required: true, autocomplete: 'new-password', hint: '至少 6 位' }) + '</div>' +
+      '<div class="pwstrength" id="pf-strength"><span class="pwstrength__bar"></span><span class="pwstrength__bar"></span><span class="pwstrength__bar"></span><span class="pwstrength__bar"></span></div>' +
+      '<div class="field__hint" id="pf-strength-tip">字母加数字更稳</div>' +
+      '<div class="mt-3">' + UI.field({ id: 'pf-newpwd2', label: '再输一遍', name: 'newPwd2', type: 'password', required: true, autocomplete: 'new-password' }) + '</div>' +
+      '<div class="cluster gap-2 mt-4"><button class="btn btn--primary" type="submit">改密码</button>' +
+      '<span class="text-xs text-muted">改完下次用新密码登录</span></div></form>';
+
+    /* 安全问题：设了它，"忘记密码"才能自助重置（不设就只能找站长） */
+    var hasSec = !!user.hasSecurity;
+    var secForm = '<form data-action="settings.security">' +
+      '<div class="text-xs text-muted mb-3">' +
+      (hasSec ? '已经设过了，想改就填新的。' : '还没设。设一个，忘了密码就能在登录页自己重置，不用等站长。') +
+      '（答案别写太明显，同学容易猜到）</div>' +
+      UI.field({ label: '问题', name: 'question', maxlength: 60, value: user.securityQuestion || '',
+        placeholder: '例如：我小学班主任姓什么' }) +
+      '<div class="mt-3">' + UI.field({ label: '答案', name: 'answer', maxlength: 60,
+        placeholder: '只有你自己知道的答案' }) + '</div>' +
+      '<div class="cluster gap-2 mt-4"><button class="btn btn--primary" type="submit">' +
+      (hasSec ? '改安全问题' : '设置安全问题') + '</button>' +
+      (hasSec ? '<button class="btn btn--text" type="button" data-action="settings.security.clear">取消设置</button>' : '') +
+      '</div></form>';
+
+    var themeCards = ['light', 'dark', 'auto'].map(function (m) {
+      var label = { light: '浅色', dark: '深色', auto: '跟系统' }[m];
+      var desc = { light: '白天用', dark: '晚上不刺眼', auto: '跟设备的深浅色走' }[m];
+      var on = m === mode;
+      return '<label class="radiocard' + (on ? ' is-active' : '') + '">' +
+        '<input type="radio" name="theme" value="' + m + '"' + (on ? ' checked' : '') +
+          ' data-action-change="settings.theme"' + dp({ mode: m }) + '>' +
+        '<span class="radiocard__icon">' + icon(m === 'dark' ? 'moon' : m === 'auto' ? 'palette' : 'sun', 15) + '</span>' +
+        '<span><b>' + esc(label) + '</b><i>' + esc(desc) + '</i></span></label>';
+    }).join('');
+
+    function switchRow(name, label, desc, on) {
+      return '<div class="settingrow">' +
+        '<span><b>' + esc(label) + '</b><div class="text-xs text-muted">' + esc(desc) + '</div></span>' +
+        '<label class="switch tap-target"><input type="checkbox" name="' + attr(name) + '"' + (on ? ' checked' : '') +
+          ' data-action-change="settings.pref"' + dp({ key: name }) + ' aria-label="' + attr(label) + '">' +
+          '<span class="switch__dot"></span></label></div>';
+    }
+
+    return {
+      title: '设置',
+      html: head +
+        '<div class="row mt-4"><div class="col stack gap-5">' +
+          '<div class="settinggroup"><div class="settinggroup__head">' + icon('user', 16) + '<span>资料</span></div>' +
+            '<div class="settinggroup__body">' + profileForm + '</div></div>' +
+          '<div class="settinggroup"><div class="settinggroup__head">' + icon('key', 16) + '<span>密码</span></div>' +
+            '<div class="settinggroup__body">' + pwdForm + '</div></div>' +
+        '</div><aside class="col-side stack gap-5">' +
+          '<div class="settinggroup"><div class="settinggroup__head">' + icon('palette', 16) + '<span>外观</span></div>' +
+            '<div class="settinggroup__body"><div class="radiocards">' + themeCards + '</div></div></div>' +
+          '<div class="settinggroup"><div class="settinggroup__head">' + icon('bell', 16) + '<span>提醒</span></div>' +
+            '<div class="settinggroup__body">' +
+              switchRow('notifyReply', '回复提醒', '有人回你的帖子', notify.notifyReply !== false) +
+              switchRow('notifyLike', '点赞提醒', '有人赞你', notify.notifyLike !== false) +
+              switchRow('notifyAt', '提到我', '有人在帖子里 @ 你', notify.notifyAt !== false) +
+              '<div class="field__hint mt-3">只影响本机浏览器，站内消息一直都在</div>' +
+            '</div></div>' +
+          '<div class="settinggroup"><div class="settinggroup__head">' + icon('shield', 16) + '<span>账号</span></div>' +
+            '<div class="settinggroup__body">' +
+              '<div class="listmeta">' + li('at', '@' + user.username) +
+                li('shield', user.role === 'admin' ? '站长' : user.role === 'mod' ? '版主' : '学生') +
+                li('star', num(user.points) + ' 分 · Lv.' + num(user.level)) +
+                li('calendar', '注册于 ' + U.fmtTime(user.createdAt)) + '</div>' +
+              '<div class="mt-3"><button class="btn btn--danger btn--block" type="button" data-action="settings.logout">退出登录</button></div>' +
+            '</div></div>' +
+        '</aside></div>',
+      onMount: function () {
+        var np = document.getElementById('pf-newpwd');
+        if (!np) return;
+        np.addEventListener('input', function () {
+          var n = strength(np.value);
+          var bars = document.querySelectorAll('#pf-strength .pwstrength__bar');
+          var cls = ['', 'is-weak', 'is-fair', 'is-good', 'is-strong'];
+          for (var i = 0; i < bars.length; i++) bars[i].className = 'pwstrength__bar' + (i < n ? ' ' + cls[n] : '');
+          var tip = document.getElementById('pf-strength-tip');
+          if (tip) tip.textContent = n === 0 ? '至少 6 位' : ['', '太短了', '一般般', '还行', '挺稳'][n];
+        });
+      }
+    };
+  }
+
+  /* ==================================================================
+     9 · 页面：搜索 #/search
+     ================================================================== */
+
+  function boardTableHtml(boards, q) {
+    return '<div class="forumtable">' + boards.map(function (b) {
+      return '<div class="forumtable__row"><span class="forumtable__icon">' + icon(b.icon || 'forum', 16) + '</span>' +
+        '<span class="forumtable__name"><a href="' + attr(href('/board/' + b.id)) + '">' +
+          (q ? U.highlight(b.name, q) : esc(b.name)) + '</a>' +
+        '<div class="forumtable__desc">' + (q ? U.highlight(b.desc || '', q) : esc(b.desc || '')) + '</div></span>' +
+        '<span class="forumtable__stat"><span>主题<b>' + num((b.stats || {}).posts) + '</b></span></span></div>';
+    }).join('') + '</div>';
+  }
+
+  function buildSearch(p) {
+    var q = str(p.query.q).trim();
+    var type = ['all', 'post', 'user', 'board'].indexOf(str(p.query.type)) >= 0 ? p.query.type : 'all';
+    var page = toInt(p.query.page, 1);
+    var counts = ST.counts();
+
+    var head = '<div class="bbs-head"><div>' +
+      '<div class="bbs-head__title">' + icon('search', 18) + '<span>搜索</span></div>' +
+      '<div class="bbs-head__desc">' + (q ? '关键词「' + esc(q) + '」' : '帖子、同学、版块都能搜') + '</div>' +
+      '</div><form class="bbs-head__search" data-action="search.go">' +
+      '<input class="input" name="q" type="search" value="' + attr(q) + '" placeholder="搜什么" aria-label="搜索">' +
+      '<button class="btn btn--primary" type="submit">搜索</button></form></div>';
+
+    if (!q) {
+      return {
+        title: '搜索',
+        html: head +
+          '<div class="mt-4">' + boxBlock('试试这些', counts.tags.length
+            ? '<div class="tagcloud">' + counts.tags.map(function (t) {
+                return '<a class="tagchip" href="' + attr(href('/search', { q: t.tag })) + '">' + esc(t.tag) +
+                  '<span class="tagchip__count">' + t.count + '</span></a>';
+              }).join('') + '</div>'
+            : plain('还没有标签')) + '</div>' +
+          '<div class="mt-5">' + rowBlock('版块', boardTableHtml(ST.listBoards(), '')) + '</div>'
+      };
+    }
+
+    var res = ST.search(q, 'all');
+    var posts = arr(res.posts), users = arr(res.users), boards = arr(res.boards);
+    var total = posts.length + users.length + boards.length;
+
+    var nav = '<nav class="bbs-nav mt-4">' + [
+      ['all', '全部', total], ['post', '帖子', posts.length], ['user', '同学', users.length], ['board', '版块', boards.length]
+    ].map(function (t) {
+      return '<a class="bbs-nav__item' + (t[0] === type ? ' is-active' : '') + '" href="' +
+        attr(href('/search', { q: q, type: t[0] })) + '">' + esc(t[1]) + '<span class="bbs-nav__count">' + t[2] + '</span></a>';
+    }).join('') + '</nav>';
+
+    if (!total) {
+      return {
+        title: '搜索：' + q,
+        html: head + nav + '<div class="mt-4">' + boxBlock('没搜到', '<div class="text-sm text-muted">换个词，或者少写几个字</div>' +
+          (counts.tags.length ? '<div class="tagcloud mt-3">' + counts.tags.slice(0, 8).map(function (t) {
+            return '<a class="tagchip" href="' + attr(href('/search', { q: t.tag })) + '">' + esc(t.tag) + '</a>';
+          }).join('') + '</div>' : '')) + '</div>'
+      };
+    }
+
+    function postCards() {
+      var pages = Math.max(1, Math.ceil(posts.length / PAGE_SIZE));
+      var cur = Math.min(page, pages);
+      var slice = posts.slice((cur - 1) * PAGE_SIZE, cur * PAGE_SIZE);
+      return slice.map(function (x) { return postCardHtml(x, { showBoard: true, hl: q }); }).join('') +
+        (pages > 1 ? UI.pagination({
+          page: cur, pages: pages, total: posts.length,
+          makeHref: function (n) { return href('/search', { q: q, type: 'post', page: n }); }
+        }) : '');
+    }
+    function userRows(limit) {
+      return '<div class="noticelist">' + users.slice(0, limit).map(function (u) {
+        return '<div class="noticerow">' +
+          '<a class="userchip" href="' + attr(href('/u/' + u.id)) + '">' + av(u, 28, 'avatar--round') +
+            '<span class="userchip__text"><b>' + U.highlight(u.nickname, q) + '</b><i>' + U.highlight('@' + u.username, q) +
+            ' · ' + esc(((u.grade || '') + ' ' + (u.klass || '')).trim()) + '</i></span></a>' +
+          '<span class="spacer"></span>' + roleBadge(u) +
+          '<span class="noticerow__time">' + esc(num(u.points) + ' 分') + '</span></div>';
+      }).join('') + '</div>';
+    }
+
+    var body;
+    if (type === 'post') body = block('帖子 ' + posts.length, posts.length ? postCards() : plain('没有匹配的帖子'));
+    else if (type === 'user') body = rowBlock('同学 ' + users.length, users.length ? userRows(users.length) : plain('没有匹配的同学'));
+    else if (type === 'board') body = rowBlock('版块 ' + boards.length, boards.length ? boardTableHtml(boards, q) : plain('没有匹配的版块'));
+    else {
+      body =
+        (posts.length ? block('帖子 ' + posts.length, posts.slice(0, 5).map(function (x) { return postCardHtml(x, { showBoard: true, hl: q }); }).join('') +
+          (posts.length > 5 ? '<div class="mt-3"><a class="block__more" href="' + attr(href('/search', { q: q, type: 'post' })) + '">全部 ' + posts.length + ' 篇</a></div>' : '')) : '') +
+        (users.length ? '<div class="mt-5">' + rowBlock('同学 ' + users.length, userRows(4) +
+          (users.length > 4 ? '<div class="mt-3"><a class="block__more" href="' + attr(href('/search', { q: q, type: 'user' })) + '">全部 ' + users.length + ' 位</a></div>' : '')) + '</div>' : '') +
+        (boards.length ? '<div class="mt-5">' + rowBlock('版块 ' + boards.length, boardTableHtml(boards.slice(0, 3), q)) + '</div>' : '');
+    }
+
+    return { title: '搜索：' + q, html: head + nav + '<div class="mt-4">' + body + '</div>' };
+  }
+
+  /* ==================================================================
+     10 · 页面包装
+     ================================================================== */
+
+  var PAGE_BUILD = {
+    forum: buildForum, board: buildBoard, post: buildPost, new: buildEditor, edit: buildEditor,
+    profile: buildProfile, me: buildProfile, messages: buildMessages, settings: buildSettings, search: buildSearch
+  };
+  function makePage(name) {
+    return function (ctx) {
+      ctx = ctx || {};
+      var p = {
+        page: name,
+        path: str(ctx.path || (TF.route && TF.route.path) || '/' + name),
+        param: ctx.params || (TF.route && TF.route.param) || {},
+        query: ctx.query || (TF.route && TF.route.query) || {}
+      };
+      if (!TF.util || !TF.store || !TF.ui) {
+        return { html: '<div class="page" ' + PAGES[name] + '>' + plain('页面加载失败，刷新一下') + '</div>' };
+      }
+      var out = PAGE_BUILD[name](p) || {};
+      /* 歌单是异步来的（首次打开要等一次接口），首屏先渲染"还没有歌单"，
+         拿到数据后自己刷一次页面。只刷一次，避免死循环。 */
+      var mount = out.onMount;
+      var needPlaylist = (name === 'board');
+      return {
+        title: out.title,
+        html: '<div class="page" ' + PAGES[name] + '>' + (out.html || '') + '</div>',
+        onMount: function (root, ctx2) {
+          if (needPlaylist && ST.refreshPlaylist && !window.__plPulled) {
+            window.__plPulled = true;
+            var before = ST.playlistData ? ST.playlistData() : null;
+            ST.refreshPlaylist(function (d) {
+              var after = d || null;
+              if (JSON.stringify(before && before.playlist) !== JSON.stringify(after && after.playlist)) {
+                if (TF.app && TF.app.refresh) TF.app.refresh();
+              }
+            });
+          }
+          if (typeof mount === 'function') return mount(root, ctx2);
+          return undefined;
+        }
+      };
+    };
+  }
+
+  /* ==================================================================
+     11 · 交互（顶层 TF.app.on 注册）
+     ================================================================== */
+
+  function refreshHeaderUnread() {
+    var n = ST.unreadCount ? (ST.unreadCount() || 0) : 0;
+    if (TF.app && TF.app.data) TF.app.data.unread = n;
+    var dots = document.querySelectorAll('.iconbtn__dot');
+    for (var i = 0; i < dots.length; i++) if (!n && dots[i].parentNode) dots[i].parentNode.removeChild(dots[i]);
+  }
+  function setFloorTotal() {
+    var el = document.getElementById('pf-floor-total');
+    if (!el || !ST.countComments || !TH.postId) return;
+    el.textContent = num(ST.countComments(TH.postId)) + ' 条';
+  }
+
+  /* 版块 */
+  TF.app.on('board.follow', function (ctx) {
+    var b = ST.getBoard(ctx.param.id);
+    toast('已关注「' + (b ? b.name : '版块') + '」，本版有新帖会提醒你', 'success', 3000);
+  });
+
+  /* 帖子 */
+  TF.app.on('post.like', function (ctx) {
+    if (!me()) { toast('先登录再点赞', 'warn'); return; }
+    var res = ST.toggleLike(ctx.param.id);
+    if (!res.ok) { toast(res.error, 'error'); return; }
+    var post = ST.getPost(ctx.param.id, { view: false });
+    var btn = document.getElementById('pf-like');
+    if (post && btn) replaceOuter(btn, likeBtnHtml(post, res.liked, res.likes));
+  });
+  TF.app.on('post.fav', function (ctx) {
+    if (!me()) { toast('先登录再收藏', 'warn'); return; }
+    var res = ST.toggleFavorite(ctx.param.id);
+    if (!res.ok) { toast(res.error, 'error'); return; }
+    var post = ST.getPost(ctx.param.id, { view: false });
+    var btn = document.getElementById('pf-fav');
+    if (post && btn) replaceOuter(btn, favBtnHtml(post, res.faved, res.favorites));
+  });
+  TF.app.on('post.del', function (ctx) {
+    var post = ST.getPost(ctx.param.id, { view: false });
+    if (!post) return;
+    UI.modal.confirm({ title: '删掉这篇？', body: '删了就找不回来，底下的回复也会一起隐藏', okText: '删掉', danger: true })
+      .then(function (ok) {
+        if (!ok) return;
+        var res = ST.deletePost(ctx.param.id);
+        if (!res.ok) { toast(res.error, 'error'); return; }
+        toast('删掉了', 'success');
+        go('/forum');
+      });
+  });
+  TF.app.on('post.zoom', function (ctx) {
+    var img = ctx.el ? ctx.el.querySelector('img') : null;
+    var big = document.getElementById('pf-zoom-img');
+    if (img && big) { big.src = img.getAttribute('src') || ''; big.alt = img.getAttribute('alt') || '配图'; }
+    UI.modal.open('pf-zoom');
+  });
+
+  /* 版主 / 站长：置顶、加精、锁定、下架（学生看不到按钮，这里再拦一次） */
+  TF.app.on('mod.act', function (ctx) {
+    if (!canManage()) { toast('只有版主和站长能操作', 'warn'); return; }
+    var id = ctx.param.id, act = ctx.param.act;
+    var post = ST.getPost(id, { view: false });
+    if (!post) { toast('帖子不见了', 'error'); return; }
+    var label = { pin: '置顶', unpin: '取消置顶', feature: '加精', unfeature: '取消加精', hide: '下架', publish: '恢复' };
+    if (act === 'lock' || act === 'unlock') {
+      var r0 = ST.adminSave('post', { id: id, locked: act === 'lock' });
+      if (!r0.ok) { toast(r0.error, 'error'); return; }
+      toast(act === 'lock' ? '锁了，不能再回复' : '解锁了', 'success');
+      refresh();
+      return;
+    }
+    if (!label[act]) { toast('不认识这个操作', 'error'); return; }
+    var run = function () {
+      var r = ST.adminBatch('post', [id], act);
+      if (!r.ok) { toast(r.error || '操作失败', 'error'); return; }
+      toast('已' + label[act], 'success');
+      refresh();
+    };
+    if (act === 'hide') {
+      UI.modal.confirm({ title: '下架这篇？', body: '《' + post.title + '》会被隐藏，作者会收到通知', okText: '下架', danger: true })
+        .then(function (ok) { if (ok) run(); });
+    } else run();
+  });
+
+  /* 每周点歌：点歌 / 投票 / 选入播放清单（数据层同步代理，成功后整页刷新保证票数与榜单最新） */
+  TF.app.on('song.add', function (ctx) {
+    if (!me()) { toast('先登录再点歌', 'warn'); return; }
+    if (!ST.addSong) { toast('点歌功能正在上线', 'warn'); return; }
+    var v = ctx.values() || {};
+    var title = str(v.title).trim();
+    if (!title) { toast('歌名不能为空', 'error'); return; }
+    var res = ST.addSong({
+      slot: str(v.slot) || 'noon',
+      title: title,
+      artist: str(v.artist).trim(),
+      link: str(v.link).trim(),
+      note: str(v.note).trim(),
+      day: toInt(v.day, 0)          /* 想让它周几放：0=都行，1~5=周一~周五 */
+    });
+    if (!res || !res.ok) { toast((res && res.error) || '点歌没成功，再试一次', 'error'); return; }
+    toast('点好了，版块里已经有一篇帖子', 'success');
+    refresh();
+  });
+  TF.app.on('song.vote', function (ctx) {
+    if (!me()) { toast('先登录再投票', 'warn'); return; }
+    if (!ST.toggleSongVote) { toast('投票功能正在上线', 'warn'); return; }
+    var res = ST.toggleSongVote(ctx.param.id);
+    if (!res || !res.ok) { toast((res && res.error) || '投票没成功，再试一次', 'error'); return; }
+    toast(res.voted ? '投了一票' : '取消了一票', 'success', 1600);
+    refresh();
+  });
+  TF.app.on('song.pick', function (ctx) {
+    if (!canManage()) { toast('只有版主和站长能选歌', 'warn'); return; }
+    if (!ST.pickSong) { toast('选歌功能正在上线', 'warn'); return; }
+    var res = ST.pickSong(ctx.param.id, !!ctx.param.picked);
+    if (!res || !res.ok) { toast((res && res.error) || '没选上，再试一次', 'error'); return; }
+    toast(ctx.param.picked ? '放进播放清单了' : '移出播放清单了', 'success');
+    refresh();
+  });
+
+  /* 管理员 / 版主：删掉一首点歌 */
+  TF.app.on('song.delete', function (ctx) {
+    if (!canManage()) { toast('只有管理员和版主能删歌', 'warn'); return; }
+    if (!ST.deleteSong) { toast('这个功能正在上线', 'warn'); return; }
+    var title = str(ctx.param.title);
+    var doIt = function () {
+      var res = ST.deleteSong(ctx.param.id);
+      if (!res || !res.ok) { toast((res && res.error) || '没删掉，再试一次', 'error'); return; }
+      toast('删掉了' + (title ? '《' + title + '》' : ''), 'success');
+      refresh();
+    };
+    if (UI.modal && UI.modal.confirm) {
+      UI.modal.confirm({
+        title: '删掉这首歌？',
+        body: (title ? '《' + title + '》' : '这首歌') + ' 会从榜单里消失，对应的帖子也一起下架（票数清零）。',
+        okText: '删除', danger: true
+      }).then(function (ok) { if (ok) doIt(); });
+    } else if (window.confirm('删掉《' + title + '》？')) {
+      doIt();
+    }
+  });
+
+  /* 管理员 / 版主：提前结束本周投稿（或重新开放） */
+  TF.app.on('song.closeWeek', function (ctx) {
+    if (!canManage()) { toast('只有管理员和版主能结束本周投稿', 'warn'); return; }
+    if (!ST.closeSongWeek) { toast('这个功能正在上线', 'warn'); return; }
+    var reopen = !!(ctx.param && ctx.param.reopen);
+    var res = ST.closeSongWeek(reopen);
+    if (!res || !res.ok) { toast((res && res.error) || '没成功，再试一次', 'error'); return; }
+    toast(reopen ? '已重新开放本周投稿' : '已提前结束本周投稿，同学暂时投不了了', 'success', 3200);
+    refresh();
+  });
+
+  /* 当周歌单：排 / 公布 / 复制 */
+  TF.app.on('playlist.generate', function () {
+    if (!canManage()) { toast('只有管理员和版主能排歌单', 'warn'); return; }
+    if (!ST.generatePlaylist) { toast('这个功能正在上线', 'warn'); return; }
+    var btn = document.querySelector('[data-action="playlist.generate"]');
+    if (window.__plWorking) return;
+    window.__plWorking = true;
+    if (btn) { btn.disabled = true; btn.innerHTML = icon('clock', 14) + '<span>正在排…（DeepSeek 要十几秒）</span>'; }
+    toast('开始排歌单，稍等一下…', 'info', 4000);
+    ST.generatePlaylist({ publish: true }, function (r) {
+      window.__plWorking = false;
+      if (!r || (!r.playlist && !r.ok)) { toast((r && r.error) || '没排成功', 'error', 4000); refresh(); return; }
+      if (r.source === 'deepseek') toast('DeepSeek 排好了，已公布', 'success', 3000);
+      else if (r.warn) toast('DeepSeek 没排成功（' + String(r.warn).slice(0, 40) + '），已按票数排好', 'warn', 5000);
+      else toast('排好了，已公布', 'success', 3000);
+      refresh();
+    });
+  });
+
+  TF.app.on('playlist.publish', function (ctx) {
+    if (!canManage()) { toast('只有管理员和版主能公布歌单', 'warn'); return; }
+    var on = !(ctx.param && ctx.param.published === false);
+    ST.publishPlaylist(on, function (r) {
+      if (!r || (!r.playlist && !r.ok)) { toast((r && r.error) || '没成功', 'error'); return; }
+      toast(on ? '歌单已公布' : '已撤回公布', 'success');
+      refresh();
+    });
+  });
+
+  TF.app.on('playlist.copy', function () {
+    var pl = playlistOf();
+    if (!pl || !pl.playlist) { toast('还没有歌单', 'warn'); return; }
+    var text = playlistText(pl.playlist);
+    if (U.copy) {
+      U.copy(text).then(function () { toast('歌单已复制，粘到群里就行', 'success'); },
+        function () { toast('复制失败，可以手动选中复制', 'warn'); });
+    } else {
+      toast('复制失败，可以手动选中复制', 'warn');
+    }
+  });
+
+  TF.app.on('playlist.open', function () {
+    var pl = playlistOf();
+    if (!pl || !pl.playlist) { toast('还没有歌单', 'warn'); return; }
+    if (!document.getElementById('pf-playlist')) { refresh(); return; }
+    UI.modal.open('pf-playlist');
+  });
+
+  /* 举报 */
+  TF.app.on('report.open', function (ctx) {
+    if (!me()) { toast('先登录再举报', 'warn'); return; }
+    var ov = document.getElementById('pf-report');
+    if (!ov) return;
+    var t = ov.querySelector('input[name="targetType"]');
+    var i = ov.querySelector('input[name="targetId"]');
+    if (t) t.value = ctx.param.type || 'post';
+    if (i) i.value = ctx.param.id || '';
+    UI.modal.open('pf-report');
+  });
+  TF.app.on('report.submit', function (ctx) {
+    var v = ctx.values() || {};
+    var res = ST.addReport({ targetType: v.targetType, targetId: v.targetId, reason: v.reason, detail: v.detail });
+    if (!res.ok) { toast(res.error, 'error'); return; }
+    UI.modal.close('pf-report');
+    toast('收到了，版主会看', 'success');
+  });
+
+  /* 回复 */
+  TF.app.on('comment.add', function (ctx) {
+    if (!me()) { toast('先登录再回复', 'warn'); return; }
+    var v = ctx.values() || {};
+    var postId = v.postId || TH.postId;
+    var parentId = str(v.parentId);
+    var content = str(v.content).trim();
+    var replyTo = str(v.replyTo).trim();
+    if (content.length < 2) { toast('至少写 2 个字', 'error'); return; }
+    if (replyTo && content.indexOf('@' + replyTo) !== 0) content = '@' + replyTo + ' ' + content;
+    var res = ST.addComment({ postId: postId, parentId: parentId || null, content: content });
+    if (!res.ok) { toast(res.error, 'error'); return; }
+    var c = res.comment;
+    if (parentId) {
+      var boxEl = document.getElementById('replies-' + parentId);
+      if (boxEl) boxEl.insertAdjacentHTML('beforeend', subReplyHtml(c));
+      else refresh();
+      var form = document.getElementById('reply-' + parentId);
+      if (form) { form.classList.add('is-hidden'); var ta = form.querySelector('textarea'); if (ta) ta.value = ''; }
+    } else {
+      var host = document.getElementById('pf-floors');
+      var n = ST.countComments ? ST.countComments(postId) : 0;
+      if (host) {
+        var ph = host.querySelector('.empty--plain');
+        if (ph && ph.parentNode) ph.parentNode.removeChild(ph);
+        host.insertAdjacentHTML('beforeend', floorHtml(c, { no: n + 1, postId: postId, locked: false, replies: [] }));
+      } else refresh();
+    }
+    setFloorTotal();
+    toast('发出去了', 'success');
+  });
+  TF.app.on('comment.like', function (ctx) {
+    if (!me()) { toast('先登录再点赞', 'warn'); return; }
+    var id = ctx.param.id;
+    var res = ST.toggleCommentLike(id);
+    if (!res.ok) { toast(res.error, 'error'); return; }
+    var c = ST.getComment(id);
+    var btn = document.getElementById('cl-' + id);
+    if (c && btn) replaceOuter(btn, likeCommentBtn(c.id, res.liked, res.likes));
+  });
+  TF.app.on('comment.del', function (ctx) {
+    var id = ctx.param.id;
+    UI.modal.confirm({ title: '删掉这条回复？', body: '删了就没了', okText: '删掉', danger: true }).then(function (ok) {
+      if (!ok) return;
+      var res = ST.deleteComment(id);
+      if (!res.ok) { toast(res.error, 'error'); return; }
+      var el = document.getElementById('c-' + id);
+      if (el) el.remove(); else refresh();
+      setFloorTotal();
+      toast('删掉了', 'success');
+    });
+  });
+  TF.app.on('comment.reply', function (ctx) {
+    if (!me()) { toast('先登录再回复', 'warn'); return; }
+    var form = document.getElementById('reply-' + ctx.param.id);
+    if (!form) return;
+    form.classList.remove('is-hidden');
+    var ta = form.querySelector('textarea');
+    if (ta) { try { ta.focus(); } catch (e) { /* 忽略 */ } }
+  });
+  TF.app.on('comment.cancelReply', function (ctx) {
+    var form = document.getElementById('reply-' + ctx.param.id);
+    if (!form) return;
+    form.classList.add('is-hidden');
+    var ta = form.querySelector('textarea');
+    if (ta) ta.value = '';
+  });
+
+  /* 编辑器 */
+  TF.app.on('editor.md', function (ctx) {
+    var map = {
+      bold: ['**', '**', '加粗'], italic: ['*', '*', '斜体'], h3: ['### ', '', '小标题'],
+      quote: ['> ', '', '引用'], list: ['- ', '', '列表'], code: ['`', '`', 'code'],
+      link: ['[', '](https://)', '文字'], image: ['![', '](https://)', '说明']
+    };
+    var conf = map[ctx.param.type];
+    var ta = document.getElementById('pf-content');
+    if (!conf || !ta) return;
+    var s = ta.selectionStart || 0, e = ta.selectionEnd || 0, val = ta.value;
+    var sel = val.slice(s, e) || conf[2];
+    ta.value = val.slice(0, s) + conf[0] + sel + conf[1] + val.slice(e);
+    var pos = s + conf[0].length + sel.length + conf[1].length;
+    try { ta.focus(); ta.setSelectionRange(pos, pos); } catch (err) { /* 忽略 */ }
+    syncEditor();
+  });
+  TF.app.on('editor.addTag', function () { addTag(); });
+  TF.app.on('editor.delTag', function (ctx) {
+    var i = ED.tags.indexOf(str(ctx.param.tag));
+    if (i < 0) return;
+    ED.tags.splice(i, 1);
+    renderTags(); saveDraft();
+  });
+  TF.app.on('editor.pickImages', function (ctx) {
+    var el = ctx.el;
+    if (!el || el.tagName !== 'INPUT') {
+      var opener = document.getElementById('pf-images');
+      if (opener) { try { opener.click(); } catch (e) { /* 忽略 */ } }
+      return;
+    }
+    var files = el.files ? Array.prototype.slice.call(el.files) : [];
+    if (!files.length) return;
+    var room = MAX_IMAGES - ED.images.length;
+    if (room <= 0) { toast('最多 ' + MAX_IMAGES + ' 张图', 'warn'); el.value = ''; return; }
+    var take = files.slice(0, room);
+    if (files.length > room) toast('只收前 ' + room + ' 张', 'warn');
+    UI.loading(true, '压图片…');
+    Promise.all(take.map(function (f) {
+      return U.fileToDataUrl(f).then(function (u) { return u || ''; }, function () { return ''; });
+    })).then(function (urls) {
+      UI.loading(false);
+      urls.forEach(function (u) { if (u && ED.images.length < MAX_IMAGES) ED.images.push(u); });
+      renderImages(); saveDraft();
+      if (ED.images.length) toast('图加好了', 'success');
+      else toast('图片读不出来，换一张', 'error');
+    });
+    el.value = '';
+  });
+  TF.app.on('editor.delImage', function (ctx) {
+    var i = Number(ctx.param.i);
+    if (!isFinite(i) || i < 0 || i >= ED.images.length) return;
+    ED.images.splice(i, 1);
+    renderImages(); saveDraft();
+  });
+  TF.app.on('editor.dropDraft', function () {
+    if (!ED.key) return;
+    clearDraft(ED.key);
+    toast('草稿扔了', 'success');
+    refresh();
+  });
+  TF.app.on('editor.loadDraft', function () {
+    var d = readDraft(ED.key);
+    if (!d) { toast('没有草稿', 'warn'); return; }
+    var ti = document.getElementById('pf-title');
+    var ta = document.getElementById('pf-content');
+    var bd = document.querySelector('form[data-action="post.save"] select[name=boardId]');
+    if (ti) ti.value = str(d.title);
+    if (ta) ta.value = str(d.content);
+    if (bd && d.boardId) bd.value = str(d.boardId);
+    ED.tags = arr(d.tags).slice(0, MAX_TAGS);
+    ED.images = arr(d.images).slice(0, MAX_IMAGES);
+    renderTags(); renderImages(); syncEditor();
+    toast('草稿接上了', 'success');
+  });
+  TF.app.on('post.save', function (ctx) {
+    if (!me()) { toast('先登录再发帖', 'warn'); return; }
+    clearFormError();
+    var v = ctx.values() || {};
+    var title = str(v.title).trim();
+    var content = str(v.content).trim();
+    var boardId = str(v.boardId);
+    var err = '';
+    if (!boardId) err = '选个版块';
+    else if (title.length < 4) err = '标题至少 4 个字';
+    else if (title.length > 60) err = '标题别超过 60 个字';
+    else if (content.length < 10) err = '正文至少 10 个字';
+    if (err) { formError(err); toast(err, 'error'); return; }
+    var hit = sensitiveHit(title + ' ' + content + ' ' + ED.tags.join(' '), arr(settings().sensitiveWords));
+    if (hit) { var m = '有敏感词「' + hit + '」，改一下'; formError(m); toast(m, 'error'); return; }
+    var ck = ST.canPost();
+    if (ck && ck.ok === false) { formError(ck.msg); toast(ck.msg, 'error'); return; }
+    var payload = { boardId: boardId, title: title, content: content, tags: ED.tags.slice(0, MAX_TAGS), images: ED.images.slice(0, MAX_IMAGES) };
+    var res = ED.postId ? ST.updatePost(ED.postId, payload) : ST.createPost(payload);
+    if (!res.ok) { formError(res.error); toast(res.error, 'error'); return; }
+    clearDraft(ED.key);
+    if (res.pending) toast('提交了，审核过了就公开', 'success', 3000);
+    else toast(ED.postId ? '改好了' : '发出去了', 'success');
+    go('/post/' + res.post.id);
+  });
+
+  /* 资料 */
+  TF.app.on('profile.editOpen', function () {
+    if (!me()) { toast('先登录', 'warn'); return; }
+    UI.modal.open('pf-profile-edit');
+  });
+  TF.app.on('profile.editSubmit', function (ctx) {
+    var v = ctx.values() || {};
+    if (!str(v.realName).trim()) { toast('请填写真实姓名（2~20 个字）', 'error'); return; }
+    if (!/^([1-9]|10)班$/.test(str(v.klass).trim())) { toast('班级请选 1~10 班', 'error'); return; }
+    if (!/^\d{4,12}$/.test(str(v.studentNo).trim())) { toast('学号填 4~12 位数字', 'error'); return; }
+    var res = saveProfile({ nickname: v.nickname, realName: v.realName, bio: v.bio, grade: v.grade, klass: v.klass, studentNo: v.studentNo, sex: v.sex });
+    if (!res || !res.ok) { toast((res && res.error) || '没存上，再试一次', 'error'); return; }
+    UI.modal.close('pf-profile-edit');
+    toast('改好了', 'success');
+    refresh();
+  });
+
+  /* 设置 */
+  TF.app.on('settings.profile', function (ctx) {
+    var v = ctx.values() || {};
+    if (!str(v.realName).trim()) { toast('请填写真实姓名（2~20 个字，只有管理员能看到）', 'error'); return; }
+    if (!/^([1-9]|10)班$/.test(str(v.klass).trim())) { toast('班级请选 1~10 班', 'error'); return; }
+    if (!/^\d{4,12}$/.test(str(v.studentNo).trim())) { toast('请填写学号（4~12 位数字，只有管理员能看到）', 'error'); return; }
+    var patch = {
+      nickname: v.nickname, realName: v.realName, bio: v.bio,
+      grade: v.grade, klass: v.klass, studentNo: v.studentNo, sex: v.sex, email: v.email
+    };
+    if (v.avatar !== undefined && v.avatar !== '') patch.avatar = Number(v.avatar);
+    var res = saveProfile(patch);
+    if (!res || !res.ok) { toast((res && res.error) || '没存上，再试一次', 'error'); return; }
+    toast('存好了', 'success');
+    refresh();
+  });
+  /* 头像上传按钮不需要单独 handler：文件输入框透明覆盖在按钮上，点它就是原生点击，
+     change 事件由 document 上的 data-action-change 委托交给 settings.avatarFile。 */
+  /* 头像：真的传到服务器（store.uploadAvatar 优先，退回 api.upload），拿到 url 再写进资料 */
+  TF.app.on('settings.avatarFile', function (ctx) {
+    var input = ctx.el;
+    var f = input && input.files && input.files[0];
+    if (!f) return;
+    if (!/^image\//.test(f.type || '')) { toast('要图片文件', 'error'); input.value = ''; return; }
+    if (f.size > 5 * 1024 * 1024) { toast('图片太大，换一张 5MB 以内的', 'error'); input.value = ''; return; }
+    UI.loading(true, '正在上传头像…');
+    U.fileToDataUrl(f, 256).then(function (dataUrl) {
+      if (!dataUrl) throw new Error('图片读不出来，换一张');
+      return uploadAvatarFile(f);
+    }).then(function (res) {
+      if (res && typeof res === 'object' && res.ok === false) throw new Error(res.error || '头像上传失败');
+      var url = uploadedUrl(res);
+      if (!url) throw new Error((res && res.error) || '服务器没返回图片地址');
+      var r = saveProfile({ avatarUrl: url });
+      if (!r || !r.ok) throw new Error((r && r.error) || '头像地址没存上');
+      UI.loading(false);
+      toast('头像换好了', 'success');
+      refresh();
+    }).catch(function (e) {
+      UI.loading(false);
+      toast((e && (e.error || e.message)) || '头像没换成，再试一次', 'error', 3200);
+    });
+    input.value = '';
+  });
+  TF.app.on('settings.avatarReset', function () {
+    var u = me();
+    if (!u) return;
+    if (!avatarUrlOf(u)) { toast('现在就是预设头像', 'warn'); return; }
+    var res = saveProfile({ avatarUrl: '' });
+    if (!res || !res.ok) { toast((res && res.error) || '没换成，再试一次', 'error'); return; }
+    toast('换回预设头像', 'success');
+    refresh();
+  });
+  TF.app.on('settings.pwd', function (ctx) {
+    var v = ctx.values() || {};
+    var res = ST.changePassword(v.oldPwd, v.newPwd, v.newPwd2);
+    if (!res.ok) { toast(res.error, 'error'); return; }
+    toast('密码改好了', 'success');
+    refresh();
+  });
+  /* 安全问题：设了它，忘了密码才能在登录页自助重置 */
+  TF.app.on('settings.security', function (ctx) {
+    var v = ctx.values() || {};
+    var res = ST.setSecurityQuestion ? ST.setSecurityQuestion(v.question, v.answer) : { ok: false, error: '这个功能还没上线' };
+    if (!res || !res.ok) { toast((res && res.error) || '没存上', 'error'); return; }
+    toast('安全问题设好了，忘了密码可以自己重置', 'success', 3200);
+    refresh();
+  });
+  TF.app.on('settings.security.clear', function () {
+    UI.modal.confirm({
+      title: '取消安全问题？', body: '取消之后，忘了密码就只能找站长帮你重置了', okText: '取消设置', danger: true
+    }).then(function (ok) {
+      if (!ok) return;
+      var res = ST.setSecurityQuestion('', '');
+      if (!res || !res.ok) { toast((res && res.error) || '没成功', 'error'); return; }
+      toast('已取消安全问题', 'success');
+      refresh();
+    });
+  });
+  TF.app.on('settings.theme', function (ctx) {
+    var m = str(ctx.param.mode);
+    if (['light', 'dark', 'auto'].indexOf(m) < 0) m = 'light';
+    if (UI.theme && UI.theme.set) UI.theme.set(m);   /* design.js 负责存 tf.theme */
+    toast(m === 'dark' ? '深色' : m === 'auto' ? '跟系统走' : '浅色', 'success', 1500);
+    refresh();
+  });
+  TF.app.on('settings.pref', function (ctx) {
+    var key = str(ctx.param.key);
+    if (!key) return;
+    var n = readPrefs().notify || {};
+    n[key] = !!(ctx.el && ctx.el.checked);
+    savePrefs({ notify: n });
+  });
+  TF.app.on('settings.logout', function () {
+    UI.modal.confirm({ title: '退出登录？', body: '下次进来要重新输密码', okText: '退出', danger: true }).then(function (ok) {
+      if (!ok) return;
+      ST.logout();
+      toast('退了', 'success');
+      go('/home');
+    });
+  });
+
+  /* 消息 */
+  TF.app.on('message.compose', function () {
+    if (!me()) { toast('先登录', 'warn'); return; }
+    UI.modal.open('pf-pm');
+  });
+  TF.app.on('message.send', function (ctx) {
+    if (!me()) { toast('先登录再发私信', 'warn'); return; }
+    var v = ctx.values() || {};
+    /* 下拉里选了人 → 直接读选项上的 data-uid（用户 id，最可靠）；
+       没选就用文本框里的用户名/昵称。
+       ⚠️ 别再用用户列表反查：快照里常常没有这个人，反查失败就会把 id 当用户名发出去，
+       服务端回"没找到 [2] 这个同学"。 */
+    var picked = str(v.toPick);
+    var pickedId = '';
+    var pickedName = '';
+    if (picked) {
+      var sel = ctx.form ? ctx.form.querySelector('select[name="toPick"]') : null;
+      var opt = (sel && sel.selectedIndex >= 0) ? sel.options[sel.selectedIndex] : null;
+      if (opt) {
+        pickedId = str(opt.getAttribute('data-uid')) || '';
+        pickedName = str(opt.getAttribute('data-nick')) || str(opt.textContent).trim();
+      }
+      if (!pickedId && /^\d+$/.test(picked)) pickedId = picked;
+    }
+    /* 会话页那个"发给 XX"的输入框直接给的是用户 id（hidden toId），这里照收 */
+    var hiddenId = str(v.toId);
+    if (!pickedId && hiddenId) pickedId = hiddenId;
+    var to = str(v.to).trim() || pickedName || picked;
+    if (!to && !pickedId) { toast('选一位同学，或者填上用户名/昵称', 'error'); return; }
+    var res = ST.sendMessage({ to: to, toId: pickedId, title: v.title, body: v.body });
+    if (!res.ok) { toast(res.error, 'error'); return; }
+    UI.modal.close('pf-pm');
+    var who = (res.data && res.data.toName) || res.toName || to || '对方';
+    toast('已发给 ' + who, 'success');
+    refresh();
+  });
+  TF.app.on('message.read', function (ctx) {
+    if (!ctx.param.id) return;
+    ST.markRead(ctx.param.id);
+    refreshHeaderUnread();
+    var a = ctx.el && ctx.el.closest ? ctx.el.closest('a') : null;
+    var target = a ? str(a.getAttribute('href')) : '';
+    var cur = '#' + str(location.hash).replace(/^#/, '');
+    if (!target || target === cur) refresh();
+  });
+  TF.app.on('message.readAll', function () {
+    ST.markRead();
+    refreshHeaderUnread();
+    toast('都标成已读了', 'success');
+    refresh();
+  });
+
+  /* 搜索 */
+  TF.app.on('search.go', function (ctx) {
+    var q = str((ctx.values() || {}).q).trim();
+    if (!q) { toast('输入关键词', 'warn'); return; }
+    go('/search', { q: q, type: 'all' });
+  });
+
+  /* ==================================================================
+     12 · 顶层注册
+     ================================================================== */
+
+  TF.app.register('/forum', makePage('forum'));
+  TF.app.register('/board/:id', makePage('board'));
+  TF.app.register('/post/:id', makePage('post'));
+  TF.app.register('/new', makePage('new'));
+  TF.app.register('/edit/:id', makePage('edit'));
+  TF.app.register('/u/:id', makePage('profile'));
+  TF.app.register('/me', makePage('me'));
+  TF.app.register('/messages', makePage('messages'));
+  TF.app.register('/settings', makePage('settings'));
+  TF.app.register('/search', makePage('search'));
+})();

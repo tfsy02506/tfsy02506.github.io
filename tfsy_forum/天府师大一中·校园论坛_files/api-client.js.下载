@@ -1,0 +1,497 @@
+/* 天府师大一中·校园论坛 — 前端 API 客户端 TF.api（SERVER-CONTRACT §5）
+ * 职责：统一 fetch 封装（自动带 Cookie）、内存快照（snapshot）、登录态（user）、
+ *      写操作的同步/异步双通道（同步 XHR 优先，保证页面同步拿到真实结果）。
+ * 纯原生 JS，classic script，无依赖、无构建。装载顺序：util.js → api-client.js → store.js
+ */
+(function () {
+  'use strict';
+  var TF = (window.TF = window.TF || {});
+  TF.extend = TF.extend || function (n, o) { TF[n] = Object.assign(TF[n] || {}, o); return TF[n]; };
+
+  var BASE = '/api';
+
+  /* ---------------------------------------------------------------- 空快照 */
+  function emptySnapshot() {
+    return {
+      boards: [], posts: [], comments: [], users: [], notifications: [],
+      reports: [], logs: [], visits: [], notices: [], settings: {},
+      meta: { userId: null, role: '', serverTime: Date.now(), totalPosts: 0, version: 0 }
+    };
+  }
+
+  function str(v) { return v === null || v === undefined ? '' : String(v); }
+  function num(v, d) { var n = Number(v); return isFinite(n) ? n : (d || 0); }
+  function arr(v) { return Array.isArray(v) ? v : []; }
+  function bool(v) { return v === true || v === 1 || v === '1' || v === 'true'; }
+
+  function parseTags(v) {
+    if (Array.isArray(v)) return v.map(str).filter(Boolean);
+    var s = str(v);
+    if (!s) return [];
+    try { var j = JSON.parse(s); if (Array.isArray(j)) return j.map(str).filter(Boolean); } catch (e) { /* 不是 JSON */ }
+    return s.split(/[,，\s]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+  }
+
+  function parseImages(v) {
+    if (Array.isArray(v)) return v.map(str).filter(Boolean);
+    var s = str(v);
+    if (!s) return [];
+    try { var j = JSON.parse(s); if (Array.isArray(j)) return j.map(str).filter(Boolean); } catch (e) { /* 不是 JSON */ }
+    return [];
+  }
+
+  /* 服务端快照 → 前端结构（§4）：驼峰、字符串 id、补齐页面依赖的派生字段 */
+  function normalizeSnapshot(src) {
+    var s = src && typeof src === 'object' ? src : {};
+    var me = s.meta && s.meta.userId ? str(s.meta.userId) : '';
+    var out = emptySnapshot();
+    out.settings = s.settings && typeof s.settings === 'object' ? s.settings : {};
+    out.meta = {
+      userId: me || null,
+      role: str(s.meta && s.meta.role),
+      serverTime: num(s.meta && s.meta.serverTime, Date.now()),
+      totalPosts: num(s.meta && s.meta.totalPosts, 0),
+      version: num(s.meta && s.meta.version, 1)
+    };
+
+    out.boards = arr(s.boards).map(function (b) {
+      return {
+        id: str(b.id), slug: str(b.slug), name: str(b.name),
+        group: str(b.group !== undefined ? b.group : b.group_name) || '校园',
+        icon: str(b.icon) || 'comment', color: num(b.color, 0),
+        order: num(b.order !== undefined ? b.order : b.order_no, 100),
+        desc: str(b.desc), minRole: str(b.minRole) || 'student', locked: bool(b.locked),
+        createdAt: num(b.createdAt),
+        stats: {
+          posts: num(b.stats && b.stats.posts, 0),
+          today: num(b.stats && b.stats.today, 0),
+          followers: num(b.stats && b.stats.followers, 0)
+        }
+      };
+    });
+
+    out.posts = arr(s.posts).map(function (p) {
+      var liked = p.likedByMe !== undefined ? bool(p.likedByMe) : false;
+      var faved = p.favedByMe !== undefined ? bool(p.favedByMe) : false;
+      return {
+        id: str(p.id), boardId: str(p.boardId), authorId: str(p.authorId),
+        title: str(p.title), content: str(p.content),
+        tags: parseTags(p.tags), images: parseImages(p.images),
+        createdAt: num(p.createdAt), updatedAt: num(p.updatedAt, num(p.createdAt)),
+        pinned: bool(p.pinned), featured: bool(p.featured), locked: bool(p.locked),
+        status: str(p.status) || 'published', rejectReason: str(p.rejectReason),
+        views: num(p.views), likes: num(p.likes), favorites: num(p.favorites),
+        commentCount: num(p.commentCount), lastReplyAt: num(p.lastReplyAt, num(p.createdAt)),
+        likedBy: liked && me ? [me] : [],
+        favBy: faved && me ? [me] : [],
+        likedByMe: liked, favedByMe: faved
+      };
+    });
+
+    out.comments = arr(s.comments).map(function (c) {
+      var liked = c.likedByMe !== undefined ? bool(c.likedByMe) : false;
+      var author = null;
+      return {
+        id: str(c.id), postId: str(c.postId),
+        parentId: c.parentId === null || c.parentId === undefined || c.parentId === 0 ? null : str(c.parentId),
+        authorId: str(c.authorId), content: str(c.content),
+        createdAt: num(c.createdAt), status: str(c.status) || 'published',
+        likes: num(c.likes), likedBy: liked && me ? [me] : [], likedByMe: liked,
+        replyToName: str(c.replyToName), isAdmin: bool(c.isAdmin) || (author && author.role === 'admin')
+      };
+    });
+
+    out.users = arr(s.users).map(function (u) {
+      var st = u.stats || {};
+      var points = num(u.points);
+      var realName = str(u.realName !== undefined ? u.realName : u.real_name);
+      var avatarUrl = str(u.avatarUrl !== undefined ? u.avatarUrl : u.avatar_url);
+      return {
+        id: str(u.id), username: str(u.username), nickname: str(u.nickname),
+        role: str(u.role) || 'student', avatar: num(u.avatar), sex: str(u.sex),
+        grade: str(u.grade), klass: str(u.klass), bio: str(u.bio), email: str(u.email),
+        /* 真实姓名 / 上传头像：服务端按隐私规则给（看不到时 realName/klass 是空串，
+           hasRealName 仍是真实布尔，用来显示「已实名」标记而不泄露内容） */
+        realName: realName,
+        hasRealName: u.hasRealName !== undefined ? bool(u.hasRealName) : !!realName,
+        avatarUrl: avatarUrl,
+        points: points, level: num(u.level, 1),
+        createdAt: num(u.createdAt), lastLoginAt: num(u.lastLoginAt),
+        banned: bool(u.banned), banReason: str(u.banReason),
+        /* 学生认证状态：老账号/没这个字段时按已认证学生处理（和服务端默认一致） */
+        studentStatus: str(u.studentStatus !== undefined ? u.studentStatus : u.student_status) || 'student',
+        stats: { posts: num(st.posts), comments: num(st.comments), likes: num(st.likes) },
+        favorites: arr(u.favorites).map(str)
+      };
+    });
+
+    out.notifications = arr(s.notifications).map(function (m) {
+      return {
+        id: str(m.id), userId: str(m.userId), type: str(m.type) || 'system',
+        fromId: str(m.fromId), title: str(m.title), body: str(m.body), link: str(m.link),
+        read: m.read !== undefined ? bool(m.read) : bool(m.is_read), createdAt: num(m.createdAt)
+      };
+    });
+
+    out.reports = arr(s.reports).map(function (r) {
+      return {
+        id: str(r.id), targetType: str(r.targetType), targetId: str(r.targetId),
+        reporterId: str(r.reporterId), reason: str(r.reason), detail: str(r.detail),
+        status: str(r.status) || 'pending', createdAt: num(r.createdAt),
+        handledBy: str(r.handledBy), handledAt: num(r.handledAt), handleNote: str(r.handleNote)
+      };
+    });
+
+    out.logs = arr(s.logs).map(function (g) {
+      return { id: str(g.id), actorId: str(g.actorId), action: str(g.action), target: str(g.target), detail: str(g.detail), createdAt: num(g.createdAt) };
+    });
+
+    out.visits = arr(s.visits).map(function (v) {
+      var d = v.date !== undefined ? v.date : v.day;
+      return { date: str(d), pv: num(v.pv), uv: num(v.uv) };
+    });
+
+    /* 公告：服务端若给了 notices 就用；没有则由 store 从「校园公告」版块的帖子派生（见 store.js） */
+    out.notices = arr(s.notices).map(function (n) {
+      return {
+        id: str(n.id), title: str(n.title), content: str(n.content),
+        level: str(n.level) || 'info', createdAt: num(n.createdAt),
+        authorId: str(n.authorId), top: bool(n.top)
+      };
+    });
+
+    return out;
+  }
+
+  /* -------------------------------------------------------------- 请求核心 */
+  function buildQuery(q) {
+    if (!q) return '';
+    var parts = [];
+    Object.keys(q).forEach(function (k) {
+      var v = q[k];
+      if (v === undefined || v === null || v === '') return;
+      parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)));
+    });
+    return parts.length ? '?' + parts.join('&') : '';
+  }
+
+  function apiError(message, status, code) {
+    var e = new Error(message || '请求失败');
+    e.status = status || 0;
+    e.error = message || '请求失败';
+    e.code = code || '';
+    return e;
+  }
+
+  var api = {
+    BASE: BASE,
+    online: false,
+    user: null,
+    settings: {},
+    serverTime: 0,
+    lastError: '',
+    ready: null,
+    snapshot: emptySnapshot()
+  };
+
+  /* 把 /api/session、/api/snapshot 的返回吸进内存（两种形状都兼容）
+   * 注意：登录态只由 /api/session、login、register、logout 决定，这里**不**从快照的
+   * meta.userId 反推 user——否则一个早发出的旧快照响应会把已登出的会话"复活"。 */
+  function absorb(data) {
+    if (!data || typeof data !== 'object') return api;
+    var snap = data.snapshot && typeof data.snapshot === 'object' ? data.snapshot : (data.boards || data.posts || data.meta ? data : null);
+    if (snap) api.snapshot = normalizeSnapshot(snap);
+    if (Object.prototype.hasOwnProperty.call(data, 'user')) api.user = data.user || null;
+    if (data.settings && typeof data.settings === 'object') api.settings = data.settings;
+    if (data.serverTime) api.serverTime = num(data.serverTime, Date.now());
+    return api;
+  }
+
+  /* 快照响应可能乱序回来：只接受"最新发出"的那一次，旧的直接丢弃 */
+  var reqSeq = 0, appliedSeq = 0;
+  function stale(my) { return my < appliedSeq; }
+  function markApplied(my) { if (my > appliedSeq) appliedSeq = my; }
+
+  function request(method, path, body) {
+    var init = { method: method, credentials: 'same-origin', headers: { accept: 'application/json' } };
+    if (body !== undefined && body !== null) {
+      init.headers['content-type'] = 'application/json; charset=utf-8';
+      init.body = JSON.stringify(body);
+    }
+    return fetch(BASE + path, init).then(function (res) {
+      return res.text().then(function (text) {
+        var json = null;
+        try { json = text ? JSON.parse(text) : {}; } catch (e) { json = null; }
+        if (!json) throw apiError('服务器返回的内容看不懂（HTTP ' + res.status + '）', res.status);
+        if (!res.ok || json.ok === false) throw apiError(json.error || ('请求失败（HTTP ' + res.status + '）'), res.status, json.code);
+        api.online = true;
+        return json.data === undefined ? json : json.data;
+      });
+    });
+  }
+
+  api.call = function (method, path, body) { return request(String(method || 'GET').toUpperCase(), path, body); };
+  api.get = function (path) { return request('GET', path); };
+  api.post = function (path, body) { return request('POST', path, body); };
+  api.put = function (path, body) { return request('PUT', path, body); };
+  api.del = function (path) { return request('DELETE', path); };
+
+  /* 同步通道：浏览器里用同步 XHR 拿真实结果（页面是同步写法，不能等 Promise）。
+     返回 {ok:true,data} / {ok:false,error,status} / {__net:true,error} / null（环境不支持）。 */
+  api.callSync = function (method, path, body) {
+    if (typeof XMLHttpRequest !== 'function') return null;
+    var xhr = new XMLHttpRequest();
+    try {
+      xhr.open(String(method || 'GET').toUpperCase(), BASE + path, false);
+      try { xhr.withCredentials = true; } catch (e) { /* 忽略 */ }
+      xhr.setRequestHeader('accept', 'application/json');
+      if (body !== undefined && body !== null) xhr.setRequestHeader('content-type', 'application/json; charset=utf-8');
+      xhr.send(body === undefined || body === null ? null : JSON.stringify(body));
+    } catch (e) {
+      api.online = false;
+      return { __net: true, error: '连不上服务器，检查一下后端有没有在跑' };
+    }
+    if (xhr.status === 0) {
+      api.online = false;
+      return { __net: true, error: '连不上服务器，检查一下后端有没有在跑' };
+    }
+    var json = null;
+    try { json = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch (e) { json = null; }
+    if (!json) return { __net: true, error: '服务器返回的内容看不懂（HTTP ' + xhr.status + '）' };
+    if (xhr.status >= 200 && xhr.status < 300 && json.ok !== false) {
+      api.online = true;
+      return { ok: true, status: xhr.status, data: json.data === undefined ? json : json.data };
+    }
+    return { ok: false, status: xhr.status, error: json.error || ('请求失败（HTTP ' + xhr.status + '）'), code: json.code || '' };
+  };
+
+  /* 同步拉一次快照并替换内存；环境不支持或失败返回 null（调用方自行降级） */
+  api.refreshSync = function (query) {
+    var my = ++reqSeq;
+    var r = api.callSync('GET', '/snapshot' + buildQuery(query), null);
+    if (!r || !r.ok) return null;
+    markApplied(my);
+    absorb(r.data);
+    return api.snapshot;
+  };
+
+  api.refresh = function (query) {
+    var my = ++reqSeq;
+    return api.get('/snapshot' + buildQuery(query)).then(function (data) {
+      if (stale(my)) return api.snapshot;      // 有更新的快照已经落地，丢弃这次旧响应
+      markApplied(my);
+      absorb(data);
+      return api.snapshot;
+    });
+  };
+
+  /* 启动：GET /api/session。服务器连不上也必须 resolve（离线空站，不白屏） */
+  var readySeq = ++reqSeq;
+  api.ready = request('GET', '/session').then(function (data) {
+    markApplied(readySeq);
+    absorb(data);
+    api.online = true;
+    api.lastError = '';
+    return api.snapshot;
+  }, function (e) {
+    api.online = false;
+    api.lastError = (e && (e.error || e.message)) || '连不上服务器';
+    return api.snapshot;
+  });
+
+  /* 登录 / 注册 / 登出：先拿 user，再刷新快照（带 Cookie） */
+  function afterAuth(user) {
+    return api.refresh().then(function () { return api.user || user || null; },
+      function () { return api.user || user || null; });
+  }
+
+  api.login = function (username, password) {
+    return api.post('/auth/login', { username: username, password: password }).then(function (data) {
+      absorb(data);
+      return afterAuth(data && data.user);
+    });
+  };
+
+  api.register = function (data) {
+    return api.post('/auth/register', data || {}).then(function (res) {
+      absorb(res);
+      return afterAuth(res && res.user);
+    });
+  };
+
+  api.logout = function () {
+    return api.post('/auth/logout', {}).then(function () {
+      api.user = null;
+      return api.refresh().then(function () { return true; }, function () { return true; });
+    }, function (e) {
+      api.user = null;
+      throw e;
+    });
+  };
+
+  api.changePassword = function (oldPwd, newPwd, newPwd2) {
+    return api.post('/auth/password', { oldPwd: oldPwd, newPwd: newPwd, newPwd2: newPwd2 });
+  };
+
+  api.securityQuestion = function (username) {
+    return api.get('/auth/question?username=' + encodeURIComponent(username));
+  };
+
+  api.resetPassword = function (data) {
+    return api.post('/auth/reset', data || {});
+  };
+
+  /* 图片上传：普通用户 /upload，管理员 /admin/upload-image */
+  api.upload = function (file, opts) {
+    var path = opts && opts.admin ? '/admin/upload-image' : '/upload';
+    var fd = new FormData();
+    fd.append('file', file, (file && file.name) || 'image.png');
+    return fetch(BASE + path, { method: 'POST', body: fd, credentials: 'same-origin' }).then(function (res) {
+      return res.text().then(function (text) {
+        var json = null;
+        try { json = text ? JSON.parse(text) : {}; } catch (e) { json = null; }
+        if (!json) throw apiError('上传失败（HTTP ' + res.status + '）', res.status);
+        if (!res.ok || json.ok === false) throw apiError(json.error || '上传失败', res.status);
+        var data = json.data === undefined ? json : json.data;
+        return (data && data.url) || '';
+      });
+    });
+  };
+
+  /* 每周点歌投票
+   *   GET  /api/songs?week=&slot=      → {weekKey, slot, list, top, myVotesUsed, votesLeft, limitPerDay, pickCount, canManage}
+   *   POST /api/songs                  → {song, postId}（同时在「听歌点歌」版块生成一篇帖子）
+   *   POST /api/songs/:id/vote         → {song, voted, votesLeft}（幂等切换：再投一次=取消）
+   *   POST /api/admin/songs/:id/pick   → {song}（仅 mod/admin；picked=false 表示移出，不给则切换） */
+  api.songs = {
+    get: function (opts) {
+      opts = opts || {};
+      return api.get('/songs' + buildQuery({ week: opts.week, slot: opts.slot }));
+    },
+    add: function (data) { return api.post('/songs', data || {}); },
+    vote: function (id) { return api.post('/songs/' + encodeURIComponent(str(id)) + '/vote', {}); },
+    pick: function (id, picked) {
+      var body = {};
+      if (picked === true || picked === false) body.picked = picked;
+      return api.post('/admin/songs/' + encodeURIComponent(str(id)) + '/pick', body);
+    }
+  };
+
+  /* 当周歌单（排到 周一到周五 × 中午/晚上，每格 3 首）
+   *   GET  /api/playlist?week=        → {playlist, submits, canManage, aiConfigured, ...}
+   *   POST /api/playlist/generate     → 让 DeepSeek 排一遍（没配 key 就按票数排）
+   *   POST /api/playlist/save         → 手工改完保存
+   *   POST /api/playlist/publish      → 公布 / 撤回 */
+  api.playlist = {
+    get: function (opts) {
+      opts = opts || {};
+      return api.get('/playlist' + buildQuery({ week: opts.week }));
+    },
+    generate: function (week, publish) {
+      return api.post('/playlist/generate', { week: week ? String(week) : '', publish: publish !== false });
+    },
+    save: function (plan, opts) {
+      opts = opts || {};
+      return api.post('/playlist/save', { week: opts.week ? String(opts.week) : '', plan: plan, note: opts.note || '', publish: !!opts.publish });
+    },
+    publish: function (week, published) {
+      return api.post('/playlist/publish', { week: week ? String(week) : '', published: published !== false });
+    }
+  };
+
+  /* 删歌（管理员及以上；负责「听歌点歌」版块的版主也可以） */
+  api.deleteSong = function (id) { return api.del('/songs/' + encodeURIComponent(str(id))); };
+
+  /* ============================================================ 棋牌娱乐
+   * 所有写操作都由服务端校验房间成员身份、座位、轮次和规则；前端只提交操作。
+   *   GET  /api/games/catalog          → {games:[{id,name,seats,ruleName,...}]}
+   *   POST /api/games/match {game?}    → {picked,mode,queue}（不带 game = 服务端随机抽）
+   *   POST /api/games/match/cancel     → {cancelled}
+   *   GET  /api/games/queue            → {queue:{inQueue,game,count,seats,waitedMs,needsMore}}
+   *   GET  /api/games/rooms?game=      → {rooms:[...]}
+   *   POST /api/games/rooms {game,name,password,seats} → {room}
+   *   GET  /api/games/room/:id         → {room}（同时续心跳）
+   *   POST /api/games/room/:id/join {password?} / leave / ready{ready} / start
+   *   POST /api/games/room/:id/action {action} → {room,result,ended}
+   *   POST /api/games/room/:id/forfeit
+   *   GET  /api/games/history          → {list}
+   *   GET  /api/games/stream           → SSE（房间/匹配/开局/结束实时推送） */
+  api.games = {
+    catalog: function () { return api.get('/games/catalog'); },
+    queue: function () { return api.get('/games/queue'); },
+    match: function (game) { return api.post('/games/match', game ? { game: str(game) } : {}); },
+    cancelMatch: function () { return api.post('/games/match/cancel', {}); },
+    rooms: function (game) { return api.get('/games/rooms' + buildQuery({ game: game || '' })); },
+    createRoom: function (data) { return api.post('/games/rooms', data || {}); },
+    room: function (id) { return api.get('/games/room/' + encodeURIComponent(str(id))); },
+    join: function (id, password) { return api.post('/games/room/' + encodeURIComponent(str(id)) + '/join', password ? { password: str(password) } : {}); },
+    leave: function (id) { return api.post('/games/room/' + encodeURIComponent(str(id)) + '/leave', {}); },
+    ready: function (id, ready) { return api.post('/games/room/' + encodeURIComponent(str(id)) + '/ready', { ready: !!ready }); },
+    start: function (id) { return api.post('/games/room/' + encodeURIComponent(str(id)) + '/start', {}); },
+    action: function (id, action) { return api.post('/games/room/' + encodeURIComponent(str(id)) + '/action', { action: action || {} }); },
+    forfeit: function (id) { return api.post('/games/room/' + encodeURIComponent(str(id)) + '/forfeit', {}); },
+    history: function () { return api.get('/games/history'); }
+  };
+
+  /* ============================================================ 学生认证
+   * 注册后默认是「校外人员」，只能玩娱乐中心；拍校卡照片交给管理员审核，
+   * 通过后才能看帖/发帖/评论。照片存在服务器私有目录，只有管理员接口能看。 */
+  api.student = {
+    status: function () { return api.get('/student/status'); },
+    /* 一步提交：校卡照片 + 可选的真实姓名/班级/学号（multipart） */
+    submit: function (file, extra) {
+      var fd = new FormData();
+      fd.append('file', file, (file && file.name) || 'card.png');
+      extra = extra || {};
+      ['realName', 'klass', 'studentNo'].forEach(function (k) {
+        if (extra[k]) fd.append(k, String(extra[k]));
+      });
+      return fetch(BASE + '/student/card', { method: 'POST', body: fd, credentials: 'same-origin' }).then(function (res) {
+        return res.text().then(function (text) {
+          var json = null;
+          try { json = text ? JSON.parse(text) : {}; } catch (e) { json = null; }
+          if (!json) throw apiError('提交失败（HTTP ' + res.status + '）', res.status);
+          if (!res.ok || json.ok === false) throw apiError(json.error || '提交失败', res.status);
+          return json.data === undefined ? json : json.data;
+        });
+      });
+    }
+  };
+  api.adminStudent = {
+    list: function (status) { return api.get('/admin/student/list' + buildQuery({ status: status || 'pending' })); },
+    verify: function (id, approve, reason) {
+      return api.post('/admin/student/verify', { id: id, approve: !!approve, reason: reason || '' });
+    },
+    cardUrl: function (id) { return BASE + '/admin/student/card/' + encodeURIComponent(str(id)); }
+  };
+
+  api.emptySnapshot = emptySnapshot;
+  api.normalizeSnapshot = normalizeSnapshot;
+  api.absorb = absorb;
+  api.buildQuery = buildQuery;
+
+  /* 单条实体的归一化（写接口/后台列表的返回值可能是 snake_case，统一走这里） */
+  function curMeta() {
+    var m = api.snapshot && api.snapshot.meta;
+    return { userId: m && m.userId ? m.userId : null, role: (m && m.role) || '', serverTime: Date.now(), totalPosts: 0, version: 1 };
+  }
+  function one(kind, raw) {
+    if (!raw || typeof raw !== 'object') return raw || null;
+    var box = { meta: curMeta() };
+    box[kind] = [raw];
+    return normalizeSnapshot(box)[kind][0];
+  }
+  api.norm = {
+    post: function (p) { return one('posts', p); },
+    comment: function (c) { return one('comments', c); },
+    user: function (u) { return one('users', u); },
+    board: function (b) { return one('boards', b); },
+    notice: function (n) { return one('notices', n); },
+    report: function (r) { return one('reports', r); },
+    log: function (g) { return one('logs', g); },
+    message: function (m) { return one('notifications', m); },
+    visit: function (v) { return one('visits', v); }
+  };
+
+  TF.api = api;
+})();

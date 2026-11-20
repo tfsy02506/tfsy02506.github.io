@@ -1,0 +1,989 @@
+/* 天府师大一中·校园论坛 — 应用外壳 / 路由 / 守卫 / data-action 事件总线
+ * 装载顺序（CONTRACT §1 修订 R3）：util → store → seed → design → **app** → pages-core → pages-forum → admin
+ * 本文件在顶部即创建 TF.app，因此页面模块可在模块顶层安全调用 TF.app.on / TF.app.register；
+ * 真正的启动（boot）在 DOMContentLoaded 执行。
+ * 本文件由 Lead 维护。页面模块通过 TF.app.register / TF.app.on / TF.app.go 使用。
+ */
+(function () {
+  'use strict';
+
+  var TF = (window.TF = window.TF || {});
+  TF.extend = TF.extend || function (n, o) { TF[n] = Object.assign(TF[n] || {}, o); return TF[n]; };
+  TF.route = TF.route || { param: {}, query: {}, path: '' };
+
+  /* ------------------------------------------------------------------ 小工具 */
+  function guarded(name, fn) {
+    return function () {
+      var m = TF[name];
+      if (!m) return undefined;
+      try { return fn.apply(null, arguments); } catch (e) { return undefined; }
+    };
+  }
+  var store = {
+    init: guarded('store', function () { return TF.store.init(); }),
+    currentUser: guarded('store', function () { return TF.store.currentUser(); }),
+    isLogin: guarded('store', function () { return !!(TF.store.currentUser && TF.store.currentUser()); }),
+    isAdmin: guarded('store', function () { return !!(TF.store.isAdmin && TF.store.isAdmin()); }),
+    isMod: guarded('store', function () { return !!(TF.store.isMod && TF.store.isMod()); }),
+    /* 学生认证：external 校外人员 / pending 审核中 / student 已认证 / rejected 被驳回。
+       兼容旧版 store.js（没有 isVerified 方法）：**按已认证处理**，绝不把老用户误锁在门外。
+       真正的拦截在服务端（403 needStudentVerify），前端只是体验。 */
+    isVerified: function () {
+      if (!TF.store || typeof TF.store.isVerified !== 'function') return true;
+      return !!TF.store.isVerified();
+    },
+    studentStatus: function () {
+      if (!TF.store || typeof TF.store.studentStatus !== 'function') return 'student';
+      return TF.store.studentStatus() || 'student';
+    },
+    canManage: guarded('store', function () { return !!(TF.store.canManage && TF.store.canManage()); }),
+    unreadCount: guarded('store', function () { return TF.store.unreadCount() || 0; }),
+    listBoards: guarded('store', function () { return TF.store.listBoards() || []; }),
+    listNotices: guarded('store', function () { return TF.store.listNotices(5) || []; }),
+    getSettings: guarded('store', function () { return TF.store.getSettings() || {}; }),
+    logout: guarded('store', function () { return TF.store.logout(); }),
+    log: guarded('store', function (a, t, d) { return TF.store.log(a, t, d); })
+  };
+  var ui = {
+    icon: function (n, s, c) { return TF.ui && TF.ui.icon ? TF.ui.icon(n, s, c) : ''; },
+    toast: function (m, t, ms) {
+      if (TF.ui && TF.ui.toast) return TF.ui.toast(m, t, ms);
+    },
+    init: function (root) { if (TF.ui && TF.ui.init) try { TF.ui.init(root); } catch (e) {} },
+    modal: function () { return TF.ui && TF.ui.modal ? TF.ui.modal : null; },
+    theme: function () { return TF.ui && TF.ui.theme ? TF.ui.theme : null; },
+    loading: function (on, text) { if (TF.ui && TF.ui.loading) try { TF.ui.loading(on, text); } catch (e) {} }
+  };
+
+  function go(path, query) {
+    path = String(path || '/home');
+    if (path.charAt(0) !== '/') path = '/' + path;
+    var qs = serializeQuery(query);
+    location.hash = '#' + path + (qs ? '?' + qs : '');
+  }
+  function goBack() {
+    if ((window.history && history.length) > 1) history.back();
+    else go('/home');
+  }
+  function serializeQuery(obj) {
+    if (!obj) return '';
+    var parts = [];
+    Object.keys(obj).forEach(function (k) {
+      var v = obj[k];
+      if (v === undefined || v === null || v === '') return;
+      parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+    });
+    return parts.join('&');
+  }
+  function parseHash() {
+    var raw = String(location.hash || '').replace(/^#/, '');
+    var qIdx = raw.indexOf('?');
+    var path = qIdx >= 0 ? raw.slice(0, qIdx) : raw;
+    var query = {};
+    if (qIdx >= 0) {
+      raw.slice(qIdx + 1).split('&').forEach(function (kv) {
+        if (!kv) return;
+        var i = kv.indexOf('=');
+        var k = i < 0 ? kv : kv.slice(0, i);
+        var v = i < 0 ? '' : kv.slice(i + 1);
+        try { query[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, ' ')); }
+        catch (e) { query[k] = v; }
+      });
+    }
+    path = path.replace(/\/+$/, '') || '/home';
+    return { path: path, query: query };
+  }
+  function match(pattern, path) {
+    var p = pattern.split('/').filter(Boolean);
+    var s = path.split('/').filter(Boolean);
+    if (p.length > s.length) return null;
+    for (var i = 0; i < p.length; i++) {
+      if (p[i].charAt(0) === ':') continue;
+      if (p[i].toLowerCase() !== s[i].toLowerCase()) return null;
+    }
+    var rest = s.slice(p.length);
+    var params = { rest: rest, splat: rest.join('/') };
+    for (var j = 0; j < p.length; j++) {
+      if (p[j].charAt(0) === ':') params[p[j].slice(1)] = s[j];
+    }
+    return { params: params, rest: rest, exact: rest.length === 0 };
+  }
+
+  /* ---------------------------------------------------------------- 注册表 */
+  var routes = [];
+  function register(pattern, render) {
+    if (typeof pattern !== 'string' || typeof render !== 'function') return;
+    routes.push({ pattern: pattern, render: render });
+  }
+  var actions = {};
+  function on(action, handler) {
+    if (!action || typeof handler !== 'function') return;
+    (actions[action] = actions[action] || []).push(handler);
+  }
+
+  /* ------------------------------------------------------------- 顶栏 / 布局 */
+
+  /* 校标：学校校标图片（assets/img/logo.png）。加载失败时自动换成书本图标，不会出现裂图。 */
+  function logoHTML(size) {
+    var s = size || 28;
+    var fallback = TF.util.attr('<span class="brand__logo-fallback">' + TF.ui.icon('book', Math.round(s * 0.7)) + '</span>');
+    return '<img class="brand__img" src="assets/img/logo.png" alt="" width="' + s + '" height="' + s +
+      '" onerror="this.onerror=null;this.outerHTML=this.dataset.fb" data-fb="' + fallback + '" ' +
+      'style="width:' + s + 'px;height:' + s + 'px;object-fit:contain;display:block">';
+  }
+  var NAV = [
+    { path: '/home', label: '首页', icon: 'home' },
+    { path: '/forum', label: '论坛', icon: 'forum' },
+    /* 棋牌娱乐入口（新增模块，最小改动加进导航） */
+    { path: '/games', label: '娱乐', icon: 'sparkle' },
+    { path: '/notices', label: '公告', icon: 'megaphone' },
+    { path: '/search', label: '搜索', icon: 'search' }
+  ];
+  function roleBadge(u) {
+    if (!u) return '';
+    if (u.role === 'admin') return '<span class="badge badge--danger">站长</span>';
+    if (u.role === 'mod') return '<span class="badge badge--mod">版主</span>';
+    return '';
+  }
+  function headerHTML(route, user, settings) {
+    var verified = !user || store.isVerified();
+    /* 校外人员（未认证）只有三个入口：首页 / 娱乐 / 学生认证；其余入口先藏起来，
+       点了也会被守卫送到认证页（服务端接口同样拒绝）。 */
+    var effNav = verified ? NAV : [
+      { path: '/home', label: '首页', icon: 'home' },
+      { path: '/games', label: '娱乐', icon: 'sparkle' },
+      { path: '/verify', label: '学生认证', icon: 'shield' }
+    ];
+    var boardList = verified ? store.listBoards().slice(0, 12) : [];
+    var boardLinks = boardList.map(function (b) {
+      return '<a class="usermenu__item" href="#/board/' + encodeURIComponent(b.id) + '">' +
+        TF.ui.icon('tag', 15) + '<span>' + TF.util.esc(b.name) + '</span>' +
+        '<span class="text-xs text-muted">' + (b.stats ? TF.util.num(b.stats.posts || 0) : 0) + '</span></a>';
+    }).join('');
+    var nav = effNav.map(function (n) {
+      var active = route.path === n.path || (n.path === '/notices' && route.path.indexOf('/notice') === 0) ||
+        (n.path === '/verify' && route.path.indexOf('/verify') === 0);
+      return '<a class="nav__item' + (active ? ' is-active' : '') + '" href="#' + n.path + '">' +
+        TF.ui.icon(n.icon, 16) + '<span>' + n.label + '</span></a>';
+    }).join('');
+    var unread = user ? store.unreadCount() : 0;
+    var statusBadge = !user ? '' : (verified ? '' : '<span class="badge badge--warn" title="完成学生认证后解锁论坛">校外访客</span>');
+    var right;
+    if (user) {
+      right =
+        (verified ? '<a class="iconbtn" href="#/new" title="发帖" aria-label="发帖">' + TF.ui.icon('plus', 18) + '</a>' : '') +
+        (verified ? '<a class="iconbtn" href="#/messages" title="消息" aria-label="消息">' + TF.ui.icon('bell', 18) +
+          (unread > 0 ? '<i class="iconbtn__dot"></i>' : '') + '</a>' : '') +
+        '<a class="iconbtn" href="#/settings" title="设置" aria-label="设置">' + TF.ui.icon('settings', 18) + '</a>' +
+        (store.isAdmin() ? '<a class="btn btn--primary btn--sm" href="#/admin">' + TF.ui.icon('shield', 16) + '<span>管理后台</span></a>' : '') +
+        '<div class="usermenu" data-menu>' +
+          '<button class="usermenu__trigger" data-action="shell.menu" aria-haspopup="menu">' +
+            TF.ui.avatar(user, 32) +
+            '<span class="usermenu__name">' + TF.util.esc(user.nickname || user.username) + '</span>' +
+            TF.ui.icon('chevronDown', 14) +
+          '</button>' +
+          '<div class="usermenu__panel">' +
+            '<div class="usermenu__head">' + TF.ui.avatar(user, 44) +
+              '<div><b>' + TF.util.esc(user.nickname || user.username) + '</b> ' + roleBadge(user) + ' ' + statusBadge +
+              '<div class="text-xs text-muted">' + TF.util.esc(user.grade || '') + ' ' + TF.util.esc(user.klass || '') + ' · ' + TF.util.num(user.points || 0) + ' 积分</div></div>' +
+            '</div>' +
+            (verified
+              ? '<a class="usermenu__item" href="#/me">' + TF.ui.icon('user', 15) + '<span>我的主页</span></a>' +
+                '<a class="usermenu__item" href="#/new">' + TF.ui.icon('edit', 15) + '<span>发新帖</span></a>' +
+                '<a class="usermenu__item" href="#/messages">' + TF.ui.icon('mail', 15) + '<span>消息中心</span>' +
+                  (unread > 0 ? '<span class="badge badge--danger">' + unread + '</span>' : '') + '</a>'
+              : '<a class="usermenu__item" href="#/verify">' + TF.ui.icon('shield', 15) +
+                '<span>学生认证' + (store.studentStatus() === 'pending' ? '（审核中）' : '') + '</span></a>') +
+            '<a class="usermenu__item" href="#/settings">' + TF.ui.icon('settings', 15) + '<span>账号设置</span></a>' +
+            (store.isAdmin() || store.isMod() ? '<a class="usermenu__item" href="#/admin">' + TF.ui.icon('shield', 15) + '<span>' + (store.isAdmin() ? '管理后台' : '内容管理') + '</span></a>' : '') +
+            (boardLinks ? '<div class="usermenu__sep"></div><div class="usermenu__label">我的版块</div>' + boardLinks : '') +
+            '<div class="usermenu__sep"></div>' +
+            '<button class="usermenu__item" data-action="auth.logout">' + TF.ui.icon('logout', 15) + '<span>退出登录</span></button>' +
+          '</div>' +
+        '</div>';
+    } else {
+      right =
+        '<button class="iconbtn" data-action="theme.toggle" title="切换主题" aria-label="切换主题">' + TF.ui.icon('moon', 18) + '</button>' +
+        '<a class="btn btn--ghost btn--sm" href="#/login">登录</a>' +
+        '<a class="btn btn--primary btn--sm" href="#/register">免费注册</a>';
+    }
+    return '' +
+      '<header class="header">' +
+        '<div class="header__inner container">' +
+          '<a class="brand" href="#/home">' +
+            '<span class="brand__logo" aria-hidden="true">' + logoHTML(28) + '</span>' +
+            '<span class="brand__name">' + TF.util.esc(settings.siteName || '天府师大一中·校园论坛') + '</span>' +
+          '</a>' +
+          '<form class="searchbar" data-action="shell.search" role="search">' +
+            '<span class="searchbar__icon">' + TF.ui.icon('search', 16) + '</span>' +
+            '<input class="searchbar__input" name="q" type="search" placeholder="搜索帖子、同学、版块…" value="' + TF.util.attr(route.query.q || '') + '" aria-label="站内搜索">' +
+            '<kbd class="kbd">Enter</kbd>' +
+          '</form>' +
+          '<nav class="nav">' + nav + '</nav>' +
+          '<div class="header__right">' +
+            /* 手机上：搜索收成图标（点进 /search 页），其余入口交给底部 Tab 栏 */
+            '<a class="iconbtn iconbtn--search" href="#/search" aria-label="搜索">' + TF.ui.icon('search', 20) + '</a>' +
+            '<button class="iconbtn navToggle" data-action="shell.navToggle" aria-label="菜单">' + TF.ui.icon('menu', 20) + '</button>' +
+            right +
+          '</div>' +
+        '</div>' +
+        '<div class="header__mobile">' + nav + '</div>' +
+      '</header>' +
+      mobileTabbarHTML(route, user, unread);
+  }
+
+  /* ------------------------------------------------------- 手机底部 Tab 栏
+   * 只在 ≤620px 显示（桌面 CSS 里 display:none）。
+   * 5 个位置：首页 / 论坛 / 发帖(中间凸起) / 娱乐 / 我的。未登录时最后一个换成"登录"。
+   * 「消息」不放这里（图标和「我的」容易混），改由顶栏铃铛进入（带未读小红点），
+   * 这样底部能腾出一格给「娱乐」。
+   * 这是手机上最主要的导航方式，解决"顶栏折两行、入口点不到"的问题。 */
+  function mobileTabbarHTML(route, user, unread) {
+    var p = route.path || '/home';
+    var is = function (a) { return p === a || (a !== '/home' && p.indexOf(a) === 0); };
+    var item = function (href, icon, label, active, badge) {
+      return '<a class="tabbar__item' + (active ? ' is-active' : '') + '" href="' + href + '"' +
+        (active ? ' aria-current="page"' : '') + '>' +
+        '<span class="tabbar__icon">' + TF.ui.icon(icon, 22) +
+          (badge ? '<i class="tabbar__badge">' + (badge > 99 ? '99+' : badge) + '</i>' : '') +
+        '</span><span class="tabbar__label">' + label + '</span></a>';
+    };
+    /* 校外访客（未认证）：底部只留 首页 / 娱乐 / 学生认证 / 我的。
+       发帖、论坛、消息这些先不给入口，点了也会被守卫送到认证页。 */
+    if (user && !store.isVerified()) {
+      return '' +
+        '<nav class="tabbar" aria-label="主导航">' +
+          item('#/home', 'home', '首页', p === '/home') +
+          item('#/games', 'sparkle', '娱乐', is('/games')) +
+          item('#/verify', 'shield', '认证', is('/verify')) +
+          item('#/me', 'user', '我的', is('/me') || is('/settings')) +
+        '</nav>';
+    }
+    return '' +
+      '<nav class="tabbar" aria-label="主导航">' +
+        item('#/home', 'home', '首页', p === '/home') +
+        item('#/forum', 'forum', '论坛', is('/forum') || is('/board') || is('/post')) +
+        '<a class="tabbar__fab" href="' + (user ? '#/new' : '#/login') + '" aria-label="发帖">' +
+          TF.ui.icon('plus', 24) + '</a>' +
+        item('#/games', 'sparkle', '娱乐', is('/games')) +
+        (user
+          ? item('#/me', 'user', '我的', is('/me') || is('/u/') || is('/settings'))
+          : item('#/login', 'user', '登录', is('/login'))) +
+      '</nav>';
+  }
+  function footerHTML(settings, stats) {
+    var desc = settings.footerText || '本站由本校学生自主搭建与维护，不是学校官方站点。';
+    return '' +
+      '<footer class="footer">' +
+        '<div class="container footer__inner">' +
+          '<div class="footer__col footer__brand">' +
+            '<a class="brand" href="#/home"><span class="brand__logo">' + logoHTML(28) + '</span>' +
+            '<span class="brand__name">' + TF.util.esc(settings.siteName || '天府师大一中·校园论坛') + '</span></a>' +
+            '<p class="text-2 text-sm">' + TF.util.esc(settings.slogan || '同一个校园，同一个论坛') + '</p>' +
+            '<p class="text-muted text-xs">' + TF.util.esc(desc) + '</p>' +
+          '</div>' +
+          '<div class="footer__col">' +
+            '<h4>逛论坛</h4>' +
+            '<a href="#/forum">全部版块</a><a href="#/new">发帖</a><a href="#/search">搜索</a><a href="#/notices">公告</a>' +
+          '</div>' +
+          '<div class="footer__col">' +
+            '<h4>关于</h4>' +
+            '<a href="#/home">站点说明</a><a href="#/notice/n1">版规</a><a href="#/forum">站务反馈</a>' +
+            (stats ? '<span class="text-muted text-xs">' + TF.util.num(stats.posts || 0) + ' 帖 · ' + TF.util.num(stats.users || 0) + ' 位同学</span>' : '') +
+          '</div>' +
+          '<div class="footer__col">' +
+            '<h4>联系</h4>' +
+            '<span class="text-sm text-2">' + TF.util.esc(settings.contact || 'admin@tfsyz.cn') + '</span>' +
+            '<span class="text-muted text-xs">' + TF.util.esc(settings.icp || '川ICP备2025000000号-1') + '</span>' +
+            '<span class="text-muted text-xs">学生自制，不是学校官方站点</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="footer__bar"><div class="container">© ' + new Date().getFullYear() + ' 天府师大一中学生技术社' +
+          '　<a class="text-xs text-muted" href="#/settings?debug=form" title="出问题时打开，把控制台里的 [tf] 行发给管理员">诊断模式</a>' +
+        '</div></div>' +
+      '</footer>';
+  }
+  function authShellHTML(user, settings) {
+    return '' +
+      '<div class="authpage">' +
+        '<div class="authcard">' +
+          '<aside class="authcard__side">' +
+            '<div class="authbg" aria-hidden="true"><span class="blob blob--1"></span><span class="blob blob--2"></span><span class="blob blob--3"></span></div>' +
+            '<div class="authcard__brand">' +
+              '<a class="brand" href="#/home"><span class="brand__logo">' + logoHTML(28) + '</span>' +
+              '<span class="brand__name">' + TF.util.esc(settings.siteName || '天府师大一中·校园论坛') + '</span></a>' +
+              '<h2 class="authcard__slogan">' + TF.util.esc(settings.slogan || '同一个校园，同一个论坛') + '</h2>' +
+              '<p class="authcard__desc">帖子、评论、点歌都存到学校这台服务器上，换台电脑登录也还在。</p>' +
+              '<ul class="authcard__points">' +
+                '<li>' + TF.ui.icon('check', 15) + '注册只要用户名和密码，不用手机号</li>' +
+                '<li>' + TF.ui.icon('check', 15) + '发帖、评论、失物招领、每周点歌都在这里</li>' +
+                '<li>' + TF.ui.icon('check', 15) + '真实姓名和班级只有管理员能看到</li>' +
+              '</ul>' +
+            '</div>' +
+            '<div class="authcard__foot text-xs text-2">' + TF.util.esc(settings.schoolName || '四川天府新区师一学校') + ' 初中部</div>' +
+          '</aside>' +
+          '<div class="authcard__form" id="page-host"></div>' +
+        '</div>' +
+      '</div>';
+  }
+  function appShellHTML(route, user, settings, stats) {
+    return '' +
+      headerHTML(route, user, settings) +
+      '<main class="main"><div class="container" id="page-host"></div></main>' +
+      footerHTML(settings, stats);
+  }
+  function adminShellHTML(route, user, settings) {
+    var isSuper = !!(user && user.role === 'admin');
+    var nav = [
+      { group: '概览' },
+      { key: 'dashboard', label: '数据总览', icon: 'chart' },
+      { group: '内容管理' },
+      { key: 'posts', label: '帖子管理', icon: 'edit' },
+      { key: 'comments', label: '评论管理', icon: 'comment' },
+      { key: 'boards', label: '版块管理', icon: 'grid', superOnly: true },
+      { key: 'notices', label: '公告管理', icon: 'megaphone' },
+      { group: '用户与安全' },
+      { key: 'verify', label: '学生认证', icon: 'shield', superOnly: true },
+      { key: 'users', label: '用户管理', icon: 'users', superOnly: true },
+      { key: 'reports', label: '举报处理', icon: 'flag' },
+      { key: 'logs', label: '操作日志', icon: 'list', superOnly: true },
+      { group: '站点' },
+      { key: 'messages', label: '消息推送', icon: 'send', superOnly: true },
+      { key: 'settings', label: '站点设置', icon: 'settings', superOnly: true },
+      { key: 'profile', label: '我的账号', icon: 'user' }
+    ].filter(function (n) { return n.group || !n.superOnly || isSuper; });
+    var current = route.params.section || 'dashboard';
+    var links = '';
+    var pendingGroup = '';
+    var pendingGroupHasItem = false;
+    var flushGroup = function () {
+      if (pendingGroupHasItem) links += '<div class="sidebar__group">' + pendingGroup + '</div>';
+      pendingGroup = '';
+      pendingGroupHasItem = false;
+    };
+    nav.forEach(function (n) {
+      if (n.group) { flushGroup(); pendingGroup = n.group; return; }
+      pendingGroupHasItem = true;
+      var active = current === n.key;
+      links += '<a class="sidebar__link' + (active ? ' is-active' : '') + '" href="#/admin/' + n.key + '">' +
+        TF.ui.icon(n.icon, 17) + '<span>' + n.label + '</span></a>';
+    });
+    flushGroup();
+    return '' +
+      '<div class="app__adminwrap">' +
+        '<aside class="sidebar" id="sidebar">' +
+          '<a class="sidebar__brand" href="#/home">' +
+            '<span class="brand__logo">' + TF.ui.icon('shield', 18) + '</span>' +
+            '<span><b>管理后台</b><i class="text-xs text-muted">' + TF.util.esc(settings.siteName || '校园论坛') + '</i></span>' +
+          '</a>' +
+          '<nav class="sidebar__nav">' + links + '</nav>' +
+          '<div class="sidebar__foot">' +
+            '<a class="sidebar__link" href="#/home">' + TF.ui.icon('arrowLeft', 17) + '<span>返回前台</span></a>' +
+            '<button class="sidebar__link" data-action="auth.logout">' + TF.ui.icon('logout', 17) + '<span>退出登录</span></button>' +
+          '</div>' +
+        '</aside>' +
+        '<div class="main main--admin">' +
+          '<header class="admin-top">' +
+            '<button class="iconbtn" data-action="shell.navToggle" aria-label="菜单">' + TF.ui.icon('menu', 20) + '</button>' +
+            '<a class="brand brand--sm" href="#/home"><span class="brand__logo">' + logoHTML(24) + '</span>' +
+              '<span class="brand__name">' + TF.util.esc(settings.siteName || '校园论坛') + '</span></a>' +
+            '<div class="spacer"></div>' +
+            '<button class="iconbtn" data-action="theme.toggle" title="切换主题">' + TF.ui.icon('moon', 18) + '</button>' +
+            '<a class="iconbtn" href="#/home" title="查看前台">' + TF.ui.icon('eye', 18) + '</a>' +
+            '<div class="authorline">' + TF.ui.avatar(user, 30) +
+              '<div><b class="text-sm">' + TF.util.esc(user ? (user.nickname || user.username) : '管理员') + '</b>' +
+              '<div class="text-xs text-muted">' + (user && user.role === 'admin' ? '超级管理员' : '版主') + '</div></div>' +
+            '</div>' +
+          '</header>' +
+          '<div class="container container--wide" id="page-host"></div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function refreshData() {
+    var d = TF.app.data;
+    d.settings = store.getSettings() || {};
+    d.boards = store.listBoards();
+    d.notices = store.listNotices(6);
+    d.unread = store.unreadCount();
+    var s = { posts: 0, users: 0, today: 0 };
+    if (TF.store) {
+      try { var c = TF.store.counts(); s.posts = c.total; s.today = c.today || 0; } catch (e) {}
+      try { s.users = TF.store.listUsers({ size: 1 }).total; } catch (e) {}
+    }
+    d.stats = s;
+    return d;
+  }
+
+  /* ------------------------------------------------------------------ 渲染 */
+  var current = { path: '', render: null, ctx: null, host: null, cleanup: null };
+  function resolve(path) {
+    for (var i = 0; i < routes.length; i++) {
+      var m = match(routes[i].pattern, path);
+      if (m) return { route: routes[i], params: m.params };
+    }
+    /* 未命中任何路由 → 回落到页面模块注册的 404 页（契约 §7：404 由 pages-core 提供）。
+     * 这样「刷新/分享一个坏链接」也能看到设计好的 404，而不是内置兜底。 */
+    if (path !== '/404') {
+      for (var j = 0; j < routes.length; j++) {
+        if (routes[j].pattern === '/404') return { route: routes[j], params: { rest: path } };
+      }
+    }
+    return null;
+  }
+  /* 需要登录才能访问的路由（框架级兜底，不依赖页面模块是否声明 meta.auth）。
+   * '/new' 覆盖发帖，'/edit' 覆盖 /edit/:id，两者都必须登录。 */
+  var AUTH_PATHS = ['/me', '/messages', '/settings', '/new', '/edit'];
+  function needAuth(path) {
+    for (var i = 0; i < AUTH_PATHS.length; i++) {
+      var p = AUTH_PATHS[i];
+      if (path === p || path.indexOf(p + '/') === 0) return true;
+    }
+    return false;
+  }
+  /* 学生认证（新增）：校外人员只能用娱乐中心；首页/认证页/自己的资料页是允许的 */
+  var VERIFY_ALLOWED_PATHS = ['/home', '/verify', '/games', '/login', '/register', '/forgot', '/me', '/settings'];
+  function needVerify(path) {
+    for (var i = 0; i < VERIFY_ALLOWED_PATHS.length; i++) {
+      var p = VERIFY_ALLOWED_PATHS[i];
+      if (path === p || (p !== '/home' && path.indexOf(p + '/') === 0)) return false;
+    }
+    return true;
+  }
+  /* 守卫判定（纯逻辑，便于单测与自查）：
+   * 返回 {allow:boolean, redirect:string, reason:'guest-admin'|'not-admin'|'guest-auth'|'need-verify'|''}
+   * verified 传 false 表示「校外人员」；前端跳转只是体验，服务端还有同样的强制闸门。 */
+  function guardPlan(routePath, user, isAdminUser, verified) {
+    var isAdminArea = routePath === '/admin' || routePath.indexOf('/admin/') === 0;
+    /* 后台区（R5）：需要版主或超级管理员 */
+    var backstageOk = !!user && (user.role === 'admin' || user.role === 'mod');
+    if (isAdminArea && !backstageOk) {
+      if (!user) return { allow: false, redirect: '/login', reason: 'guest-admin' };
+      return { allow: false, redirect: '/home', reason: 'not-admin' };
+    }
+    /* 后台里仅超级管理员可用的分区（R5） */
+    if (isAdminArea && user && user.role !== 'admin') {
+      var SUPER_ONLY = ['users', 'boards', 'messages', 'settings', 'logs', 'verify'];
+      var sec = (routePath.split('/')[2] || 'dashboard').toLowerCase();
+      if (SUPER_ONLY.indexOf(sec) >= 0) return { allow: false, redirect: '/admin/dashboard', reason: 'not-super' };
+    }
+    if (needAuth(routePath) && !user) return { allow: false, redirect: '/login', reason: 'guest-auth' };
+    /* 校外人员：看帖/发帖/评论/消息/搜索/别人主页都要先认证 */
+    if (user && verified === false && !isAdminArea && needVerify(routePath)) {
+      return { allow: false, redirect: '/verify', reason: 'need-verify' };
+    }
+    return { allow: true, redirect: '', reason: '' };
+  }
+  function guard(routePath, ctx) {
+    return true;
+  }
+  function render() {
+    try { startDiagnostics(); } catch (e) { /* 诊断失败不影响页面 */ }
+    var parsed = parseHash();
+    var hit = resolve(parsed.path);
+    var app = document.getElementById('app');
+    if (!app) return;
+    var settings = store.getSettings() || {};
+    var user = store.currentUser();
+
+    if (!hit) {
+      // 未注册路由：交给兜底（pages-core 的 404），否则显示内置 404
+      var fallback = resolve('/404');
+      if (fallback) hit = fallback;
+      else {
+        app.innerHTML = headerHTML({ path: parsed.path, query: parsed.query, params: {} }, user, settings) +
+          '<main class="main"><div class="container"><div class="page" data-page="404">' +
+          TF.ui.empty({ icon: 'alert', title: '页面不存在', desc: '地址 ' + parsed.path + ' 没有对应的页面', action: '<a class="btn btn--primary" href="#/home">返回首页</a>' }) +
+          '</div></div></main>' + footerHTML(settings, null);
+        return;
+      }
+    }
+    var meta = hit.route.meta || {};
+    TF.route = { param: hit.params || {}, query: parsed.query, path: parsed.path, meta: meta };
+    var ctx = { path: parsed.path, query: parsed.query, params: hit.params || {}, meta: meta, route: hit.route.pattern };
+    if (!guard(parsed.path, ctx)) return;
+
+    ui.loading(true);
+    var out;
+    try {
+      out = hit.route.render(ctx);
+    } catch (err) {
+      ui.loading(false);
+      renderCrash(err, ctx);
+      return;
+    }
+    if (out && typeof out.then === 'function') {
+      out.then(function (v) { paint(v, ctx, hit, settings, user, app); })
+        .catch(function (e) { ui.loading(false); renderCrash(e, ctx); });
+      return;
+    }
+    paint(out, ctx, hit, settings, user, app);
+  }
+  function paint(out, ctx, hit, settings, user, app) {
+    ui.loading(false);
+    if (typeof out === 'string') out = { html: out };
+    if (!out) out = { html: '' };
+    /* 释放上一页的 onMount 清理函数（定时器/全局监听器），避免切换页面后泄漏 */
+    if (current && typeof current.cleanup === 'function') {
+      try { current.cleanup(); } catch (e) { catchLog('cleanup', e); }
+    }
+    current.path = ctx.path;
+    current.ctx = ctx;
+    current.cleanup = null;
+    var isAdminArea = ctx.path === '/admin' || ctx.path.indexOf('/admin/') === 0;
+    var isAuthArea = ctx.path === '/login' || ctx.path === '/register' || ctx.path === '/forgot';
+    if (isAdminArea) app.innerHTML = adminShellHTML({ params: ctx.params || {}, path: ctx.path }, user, settings);
+    else if (isAuthArea) { app.classList.add('app--auth'); app.innerHTML = authShellHTML(user, settings); }
+    else { app.classList.remove('app--auth'); app.innerHTML = appShellHTML({ path: ctx.path, query: ctx.query, params: ctx.params }, user, settings, TF.app.data.stats); }
+    var host = document.getElementById('page-host');
+    if (host) host.innerHTML = out.html || '';
+    current.path = ctx.path;
+    current.ctx = ctx;
+    current.host = host;
+    document.body.classList.remove('nav-open');
+    if (out.title) document.title = out.title + ' · ' + (settings.siteName || '天府师大一中·校园论坛');
+    else document.title = (settings.siteName || '天府师大一中·校园论坛');
+    if (host) {
+      ui.init(host);
+      ui.init(document.getElementById('app'));
+      if (typeof out.onMount === 'function') {
+        /* onMount 可以返回一个清理函数：下次渲染前会被调用（定时器/监听器请在此释放），
+         * 例如轮播：onMount: function (root) { var t = setInterval(...); return function () { clearInterval(t); }; } */
+        try {
+          var ret = out.onMount(host, ctx);
+          if (typeof ret === 'function') current.cleanup = ret;
+          else if (ret && typeof ret.dispose === 'function') current.cleanup = function () { ret.dispose(); };
+        } catch (e) { catchLog('onMount', e); }
+      }
+      var f = host.querySelector('input:not([type=hidden]),textarea');
+      if (f && ctx.meta && ctx.meta.focus) try { f.focus(); } catch (e) {}
+    }
+    if (!(ctx.meta && ctx.meta.keepScroll)) window.scrollTo(0, 0);
+  }
+  function renderCrash(err, ctx) {
+    try { console.error('[TF] 页面渲染失败', ctx && ctx.path, err); } catch (e) {}
+    var app = document.getElementById('app');
+    if (!app) return;
+    if (app.querySelector('.crash')) return;
+    var box = document.createElement('div');
+    box.className = 'page crash';
+    box.setAttribute('data-page', 'error');
+    box.innerHTML = '<div class="container"><div class="card card--pad" style="margin:48px auto;max-width:620px;text-align:center">' +
+      '<div class="empty__icon">' + TF.ui.icon('alert', 34) + '</div>' +
+      '<h2>这个页面出了点问题</h2>' +
+      '<p class="text-2 muted">错误信息：' + TF.util.esc(err && err.message ? err.message : String(err)) + '</p>' +
+      '<p class="text-muted text-sm">可以先返回首页，或刷新页面重试。你的帖子都存在服务器上，不会丢。</p>' +
+      '<div class="cluster center"><button class="btn btn--primary" data-action="app.home">返回首页</button>' +
+      '<button class="btn btn--outline" data-action="app.reload">刷新页面</button></div></div></div>';
+    var main = app.querySelector('.main');
+    if (main) main.innerHTML = '' , main.appendChild(box);
+    else app.appendChild(box);
+  }
+  function catchLog(where, e) {
+    try { console.error('[TF] 挂载失败 @' + where, e); } catch (x) {}
+    ui.toast('部分交互初始化失败：' + (e && e.message ? e.message : e), 'warn');
+  }
+
+  function refresh() { render(); }
+  function refreshUser() {
+    var app = document.getElementById('app');
+    if (!app) return;
+    render();
+  }
+
+  /* ------------------------------------------------------- data-action 总线 */
+  function readValues(scope) {
+    var out = {};
+    if (!scope) return out;
+    var nodes = scope.querySelectorAll('input[name],select[name],textarea[name]');
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var name = n.getAttribute('name');
+      if (!name) continue;
+      if (n.type === 'checkbox') {
+        if (n.checked) out[name] = n.value || true;
+        else if (!(name in out)) out[name] = '';
+      } else if (n.type === 'radio') {
+        if (n.checked) out[name] = n.value;
+      } else if (n.tagName === 'SELECT' && n.multiple) {
+        out[name] = Array.prototype.filter.call(n.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
+      } else {
+        out[name] = n.value;
+      }
+    }
+    return out;
+  }
+  function dispatch(action, el, event) {
+    var handlers = actions[action];
+    var form = el.closest ? el.closest('form') : null;
+    var param = {};
+    var raw = el.getAttribute && el.getAttribute('data-param');
+    if (raw) { try { param = JSON.parse(raw) || {}; } catch (e) { param = {}; } }
+    var ctx = {
+      action: action,
+      el: el,
+      event: event,
+      param: param,
+      data: el.dataset || {},
+      form: form,
+      values: function (scope) { return readValues(scope || form || el); },
+      route: TF.route
+    };
+    if (!handlers || !handlers.length) {
+      try { console.warn('[TF] 未注册的 data-action：' + action, el); } catch (e) {}
+      return;
+    }    for (var i = 0; i < handlers.length; i++) {
+      try { handlers[i](ctx); }
+      catch (e) { catchLog(action, e); }
+    }
+  }
+  function bindGlobal() {
+    document.addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      /* **关键修复（用户实测反馈的那条 bug）**：
+         表单的 data-action 只能在"提交"时触发，不能在点击时触发。
+         以前这里用 closest('[data-action]')，点到输入框时会命中外层的
+         <form data-action="settings.profile">，于是"点一下输入框 = 点了一次提交" ——
+         用户看到的就是"一选中输入框就自动保存 / 自动发送"。
+         现在：点击只认**元素自己**的 data-action（按钮、链接等）；表单提交走 submit 事件。 */
+      var el = t.closest('[data-action]');
+      if (el && el.tagName === 'FORM') el = null;
+      if (!el) {
+        var inFormCtrl = /^(INPUT|TEXTAREA|SELECT|LABEL|OPTION)$/.test(t.tagName);
+        if (inFormCtrl && t.closest('form[data-action]')) return;   /* 表单控件交给 submit/focus 处理 */
+        var m = t.closest('[data-menu]');
+        document.querySelectorAll('.usermenu.is-open').forEach(function (n) {
+          if (!m || n !== m) n.classList.remove('is-open');
+        });
+        return;
+      }
+      var action = el.getAttribute('data-action');
+      var tag = el.tagName;
+      if (tag === 'A' && el.getAttribute('href') && el.getAttribute('href').charAt(0) === '#') { /* 路由跳转交给浏览器 */ }
+      else if (tag === 'A' && !el.getAttribute('href')) ev.preventDefault();
+      if (tag === 'BUTTON' && !el.getAttribute('type') && el.closest('form')) el.setAttribute('type', 'button');
+      dispatch(action, el, ev);
+    }, false);
+
+    /* 文件输入框的点击在捕获阶段掐掉：只让它打开文件选择器，
+       绝不允许它冒泡或触发"表单隐式提交"。
+       背景：点表单里的 <label for>（关联隐藏 file 输入框）或 <input type=file> 时，
+       浏览器会触发**隐式提交**，用户看到的是"点选图片，帖子/资料就被提交了"。 */
+    document.addEventListener('click', function (ev) {
+      var el = ev.target;
+      if (el && el.tagName === 'INPUT' && el.type === 'file') ev.stopPropagation();
+    }, true);
+
+    /* 提交处理：只认「用户真的点了提交按钮」和「脚本派发的合成 submit」。
+       隐式提交（点 label / radio / checkbox / file 输入框）一律忽略并阻止 —— 见下面判定。
+       另外做防重：一次点击只处理一次（曾经"点一次发布发出两篇帖子"）。 */
+    var lastHandledSubmitAt = 0;
+
+    document.addEventListener('submit', function (ev) {
+      var form = ev.target;
+      if (!form || !form.getAttribute) return;
+      var action = form.getAttribute('data-action');
+      if (!action) return;
+      /* 一律不让浏览器真的提交（避免页面跳走），是否处理看下面的判定 */
+      ev.preventDefault();
+      var sub = ev.submitter || null;
+      var viaButton = !!(sub && sub.tagName === 'BUTTON' && String(sub.getAttribute('type') || 'submit') === 'submit');
+      /* 脚本派发的合成事件（isTrusted=false）也算用户意图：
+         既方便自动化测试，也兼容浏览器扩展/自动化工具。 */
+      var synthetic = (ev.isTrusted === false);
+      /* 隐式提交（点 label / radio / checkbox / file 输入框）特征是：
+         事件可信、没有 submitter、且没有点过提交按钮 —— 这类一律忽略。 */
+      if (!viaButton && !synthetic) return;
+      /* 防止一次点击被处理两遍（曾经"点一次发布发出两篇"） */
+      var now = Date.now();
+      if (now - lastHandledSubmitAt < 600 && !synthetic) return;
+      lastHandledSubmitAt = now;
+      dispatch(action, form, ev);
+    }, false);
+
+    document.addEventListener('change', function (ev) {
+      var el = ev.target;
+      if (!el || !el.getAttribute) return;
+      if (el.getAttribute('data-action-change')) dispatch(el.getAttribute('data-action-change'), el, ev);
+      if (el.getAttribute('data-autosubmit') && el.form) {
+        try { el.form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true })); } catch (e) {}
+      }
+    }, false);
+
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') {
+        document.querySelectorAll('.usermenu.is-open').forEach(function (n) { n.classList.remove('is-open'); });
+      }
+      if (ev.key === '/' && !/input|textarea|select/i.test((ev.target && ev.target.tagName) || '') && !ev.ctrlKey && !ev.metaKey) {
+        var s = document.querySelector('.searchbar__input');
+        if (s) { ev.preventDefault(); s.focus(); }
+      }
+    }, false);
+
+    window.addEventListener('hashchange', render, false);
+    document.addEventListener('hashchange', render, false);
+
+    /* 回车守卫（冒泡阶段：让输入框自己的 keydown 先跑，它处理过就不重复拦）：
+       单行输入框里按回车，浏览器会触发**隐式表单提交** —— 用户看到的就是
+       "在某一行打完字一回车，资料/帖子就被提交了"。这里拦掉，改成失焦。
+       例外：输入框自己处理了回车（例如"回车加标签"）会 preventDefault，这里就不插手。 */
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Enter' || ev.defaultPrevented || ev.isComposing) return;
+      var el = ev.target;
+      if (!el || el.tagName !== 'INPUT') return;
+      var type = String(el.type || 'text').toLowerCase();
+      if (type === 'file' || type === 'checkbox' || type === 'radio' || type === 'submit' || type === 'button') return;
+      var form = el.closest ? el.closest('form[data-action]') : null;
+      if (!form) return;
+      ev.preventDefault();
+      try { el.blur(); } catch (e) { /* 忽略 */ }
+    }, false);
+  }
+
+  /* --------------------------------------------------------- 内置处理器 */
+  on('app.skipToMain', function () {
+    var main = document.querySelector('.main') || document.getElementById('page-host');
+    if (!main) return;
+    main.setAttribute('tabindex', '-1');
+    try { main.focus(); } catch (e) {}
+    if (main.scrollIntoView) main.scrollIntoView({ block: 'start' });
+  });
+  on('app.home', function () { go('/home'); });
+  on('app.reload', function () { location.reload(); });
+  on('app.go', function (ctx) { go(ctx.param.path || '/home', ctx.param.query); });
+  on('app.back', function () { goBack(); });
+  on('auth.logout', function () {
+    var modal = ui.modal();
+    var doLogout = function () {
+      store.logout();
+      ui.toast('已退出登录，期待你再来', 'success');
+      go('/home');
+      render();
+    };
+    if (modal && modal.confirm) {
+      modal.confirm({ title: '退出登录', body: '确定要退出当前账号吗？', okText: '退出登录', danger: true }).then(function (ok) { if (ok) doLogout(); });
+    } else doLogout();
+  });
+  on('shell.menu', function (ctx) {
+    var box = ctx.el.closest('[data-menu]');
+    if (!box) return;
+    var open = box.classList.contains('is-open');
+    document.querySelectorAll('.usermenu.is-open').forEach(function (n) { n.classList.remove('is-open'); });
+    if (!open) box.classList.add('is-open');
+  });
+  on('shell.navToggle', function () {
+    document.body.classList.toggle('nav-open');
+    var sb = document.getElementById('sidebar');
+    if (sb) sb.classList.toggle('is-open');
+  });
+  on('shell.search', function (ctx) {
+    var q = (ctx.values().q || '').trim();
+    if (!q) { ui.toast('请输入搜索关键词', 'warn'); return; }
+    go('/search', { q: q });
+  });
+  on('theme.toggle', function () {
+    var t = ui.theme();
+    if (t && t.toggle) t.toggle();
+  });
+  on('ui.copy', function (ctx) {
+    var text = ctx.param.text || ctx.el.getAttribute('data-copy') || '';
+    TF.util.copy(text).then(function (ok) { ui.toast(ok ? '已复制到剪贴板' : '复制失败，请手动选择', ok ? 'success' : 'error'); });
+  });
+
+  /* ------------------------------------------------------------------ 启动 */
+  var app = {
+    data: { boards: [], notices: [], settings: {}, unread: 0, stats: { posts: 0, users: 0, today: 0 } },
+    register: register,
+    on: on,
+    go: go,
+    goBack: goBack,
+    render: render,
+    refresh: refresh,
+    refreshUser: refreshUser,
+    refreshData: refreshData,
+    routes: routes,
+    actions: actions,
+    dispatch: dispatch,
+    match: match,
+    parseHash: parseHash,
+    resolve: resolve,
+    guardPlan: guardPlan,
+    needAuth: needAuth,
+    AUTH_PATHS: AUTH_PATHS
+  };
+  TF.extend('app', app);
+
+  /* ----------------------------------------------------------------- 引导 */
+  /* 调试/验收钩子（只在带查询串时生效，用完立即从地址栏擦除）：
+   *   index.html?theme=dark     预设主题（light|dark|auto），用于截图与暗色验收
+   * 注意：不再有 ?as=xxx 自动登录演示账号（演示账号已删除，登录必须走真实接口）。 */
+  function applyBootQuery() {
+    var q = location.search || '';
+    if (!q || q === '?') return;
+    var p = {};
+    q.replace(/^\?/, '').split('&').forEach(function (kv) {
+      if (!kv) return;
+      var i = kv.indexOf('=');
+      p[decodeURIComponent(i < 0 ? kv : kv.slice(0, i))] = i < 0 ? '' : decodeURIComponent(kv.slice(i + 1));
+    });
+    if (p.theme && TF.ui && TF.ui.theme && TF.ui.theme.set) {
+      try { TF.ui.theme.set(p.theme); } catch (e) {}
+    }
+    try {
+      if (history.replaceState) history.replaceState(null, '', location.pathname + (location.hash || '#/home'));
+    } catch (e) {}
+  }
+
+  /* 服务器不可用时的提示条：宁可见地说出来，也不要白屏或静默空站 */
+  function offlineBanner() {
+    if (TF.api && TF.api.online) return;
+    var host = document.getElementById('page-host');
+    var box = document.createElement('div');
+    box.className = 'noticebar noticebar--warn';
+    box.setAttribute('data-offline', '1');
+    box.innerHTML = '<b>连不上服务器</b>　页面显示的是缓存结构，发帖、登录等操作暂时用不了。' +
+      '如果你是管理员：确认后端已经在跑（<code>node server/index.mjs</code>）再刷新。';
+    var target = host || document.getElementById('app');
+    if (target && target.parentNode) target.parentNode.insertBefore(box, target);
+  }
+
+  /* 关键：TF.app 在上方已挂载，因此 pages-*.js / admin.js 即使在 app.js 之后装载，
+   * 也能在模块顶层安全调用 TF.app.on / TF.app.register（契约 §9）。
+   * 启动流程（SERVER-CONTRACT §5）：主题 → 等 TF.api.ready（拿服务器快照）→ 灌进 store
+   * → 渲染。服务器连不上也照常渲染（离线态），只是不能写。 */
+  /* ============================================================ 诊断开关
+   * 用法：在地址后面加 ?debug=form（设置页底部也有一个「打开诊断模式」的链接）
+   * 打开后会做三件事：
+   *   1) 左上角显示一个红条，写着当前前端文件的版本号（用来确认浏览器有没有在跑旧代码）
+   *   2) 把每一次 click / focus / change / submit / 每个接口请求都打到控制台（F12 → Console）
+   *   3) 提供 window.tfDebug.dump() 复制全部记录、window.tfDebug.version() 看版本
+   * 排查完把 ?debug=form 去掉即可（不影响正常使用）。 */
+  function startDiagnostics() {
+    var q = String(location.search || '') + String(location.hash || '');
+    if (!/[?&]debug=/.test(q)) return;
+    if (window.tfDebug && window.tfDebug.__on) return;   /* 只装一次 */
+    var logs = [];
+    function stamp() { var d = new Date(); return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0'); }
+    function rec(kind, text) {
+      var line = stamp() + '  [' + kind + '] ' + text;
+      logs.push(line);
+      /* 只有在诊断模式下才输出到控制台（正常使用不会刷控制台） */
+      try { if (window.console) console.debug('[tf] ' + line); } catch (e) {}
+    }
+    function attrOf(el, name) { try { return el.getAttribute ? (el.getAttribute(name) || '') : ''; } catch (e) { return ''; } }
+    function desc(el) {
+      if (!el || !el.tagName) return String(el);
+      var s = el.tagName;
+      if (el.id) s += '#' + el.id;
+      var act = attrOf(el, 'data-action');
+      if (act) s += '[action=' + act + ']';
+      var nm = attrOf(el, 'name');
+      if (nm) s += '[name=' + nm + ']';
+      var tp = attrOf(el, 'type');
+      if (tp) s += '[type=' + tp + ']';
+      if (el.className && typeof el.className === 'string' && el.className.trim()) s += '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.');
+      return s;
+    }
+    ['click', 'focusin', 'change', 'input', 'submit', 'keydown'].forEach(function (type) {
+      document.addEventListener(type, function (ev) {
+        if (type === 'keydown' && ev.key !== 'Enter') return;
+        if (type === 'input' && logs.length > 400) return;
+        var extra = '';
+        if (type === 'submit') {
+          var f = ev.target || {};
+          extra = ' formAction=' + attrOf(f, 'data-action') +
+            ' submitter=' + (ev.submitter ? desc(ev.submitter) : '无') + ' isTrusted=' + ev.isTrusted;
+        }
+        rec(type, desc(ev.target) + extra);
+      }, true);
+    });
+    /* 记所有接口请求（谁在什么时候打了服务器） */
+    if (window.XMLHttpRequest && XMLHttpRequest.prototype.open) {
+      var xo = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (m, u) {
+        rec('API', m + ' ' + String(u).replace(location.origin, ''));
+        return xo.apply(this, arguments);
+      };
+      var xs = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.send = function () {
+        var st = this;
+        this.addEventListener('loadend', function () { rec('API返回', st.status + ' ' + String(st.responseURL || '').replace(location.origin, '')); });
+        return xs.apply(this, arguments);
+      };
+    }
+    if (window.fetch) {
+      var of = window.fetch;
+      window.fetch = function (input, init) {
+        var u = typeof input === 'string' ? input : (input && input.url) || '';
+        var m = (init && init.method) || (input && input.method) || 'GET';
+        if (/\/api\//.test(u)) rec('API', m + ' ' + String(u).replace(location.origin, ''));
+        return of.apply(this, arguments);
+      };
+    }
+
+    var meta = document.querySelector('meta[name="tf-build"]');
+    var build = meta ? meta.getAttribute('content') : '(未注入)';
+    var bar = document.createElement('div');
+    bar.setAttribute('data-debug-bar', '1');
+    bar.style.cssText = 'position:fixed;left:0;top:0;right:0;z-index:9999;background:#c0392b;color:#fff;' +
+      'font:12px/1.6 ui-monospace,Consolas,monospace;padding:4px 10px;white-space:pre-wrap';
+    bar.textContent = '诊断模式已开（前端 build ' + build + '）· 点一下输入框，然后把 Console 里 [submit]/[API] 的行发我 · ' +
+      'window.tfDebug.dump() 复制全部 · 去掉地址里的 ?debug=form 关闭';
+    document.body.appendChild(bar);
+    document.body.style.paddingTop = '30px';
+
+    window.tfDebug = {
+      __on: true,
+      version: function () { return build; },
+      logs: function () { return logs.slice(); },
+      dump: function () {
+        var text = 'build=' + build + '\n' + logs.join('\n');
+        try { console.log(text); } catch (e) {}
+        try { if (navigator.clipboard) navigator.clipboard.writeText(text); } catch (e) {}
+        return text;
+      },
+      clear: function () { logs.length = 0; return '已清空'; }
+    };
+    rec('诊断', 'build=' + build + ' ua=' + navigator.userAgent.slice(0, 80));
+  }
+
+  function boot() {
+    var t = ui.theme();
+    if (t && t.init) { try { t.init(); } catch (e) {} }
+    bindGlobal();
+    applyBootQuery();
+    startDiagnostics();
+
+    var start = function () {
+      try { store.init(); } catch (e) { catchLog('store.init', e); }
+      TF.app.data.settings = store.getSettings() || {};
+      TF.app.data.boards = store.listBoards();
+      TF.app.data.notices = store.listNotices(6);
+      TF.app.data.unread = store.unreadCount();
+      refreshData();
+      /* 自检：后台动作没接上时给出可见提示（避免“点了没反应”的静默失败） */
+      try {
+        if (!actions['admin.filter'] && routes.length) {
+          console.warn('[TF] 管理后台动作未注册：admin.js 可能加载失败');
+        }
+      } catch (e) {}
+      if (!location.hash || location.hash === '#' || location.hash === '#/') location.hash = '#/home';
+      render();
+      offlineBanner();
+      document.documentElement.classList.add('booted');
+    };
+
+    var ready = TF.api && TF.api.ready;
+    if (ready && typeof ready.then === 'function') {
+      ui.loading(true, '正在连接服务器…');
+      ready.then(function () { ui.loading(false); start(); })
+        .catch(function (e) { ui.loading(false); catchLog('api.ready', e); start(); });
+    } else {
+      /* 没有 api-client（例如被单独打开的老版本文件）：仍然以离线态渲染，不要白屏 */
+      start();
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, false);
+  else boot();
+})();

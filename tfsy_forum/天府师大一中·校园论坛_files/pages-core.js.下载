@@ -1,0 +1,1187 @@
+/* ==========================================================================
+   pages-core.js · 公共页面（首页 / 登录 / 注册 / 找回密码 / 公告 / 404）
+   契约：CONTRACT.md 第 6/7/8/9/10 节 + §11.0 文案标准
+   负责：#/home #/login #/register #/forgot #/notices #/notice/:id #/404
+
+   设计方向：干净信息流（BBS 风格）—— 站点说明条 + 统计条 + 两栏信息流。
+   没有渐变 Hero、没有大标语、没有轮播动画。
+
+   实现要点
+     1) 每个页面返回 { html, onMount(root, ctx) }；根节点 <div class="page" data-page="…">。
+     2) 交互一律 data-action + 本模块顶层的 TF.app.on 处理器；表单值走 ctx.values()。
+     3) 类名只用 assets/css 里真实存在的（.bbs-head / .bbs-stats / .block / .postrow /
+        .rankrow / .listmeta / .crumb / .noticerow / .tagchip / .empty--plain …）。
+     4) 文案按 §11.0：短、具体、口语，用「你」；空状态一句话不加感叹号；
+        按钮写动词（登录 / 注册 / 重置密码），不套放到任何网站都合适的模板句。
+     5) 登录/注册/找回密码由 app.js 包在 .authcard 外壳里（#page-host = .authcard__form），
+        本文件只输出卡片内部的表单内容，不重复渲染 .authpage / .authcard。
+     6) 载入顺序（§1 R3）：app.js 先于本文件执行，故模块顶层可直接注册路由与处理器。
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var TF = (window.TF = window.TF || {});
+  TF.extend = TF.extend || function (n, o) { TF[n] = Object.assign(TF[n] || {}, o); return TF[n]; };
+
+  /* 班级只能选 1~10 班（和后端 server/api.mjs 的 RE_KLASS 保持一致） */
+  var KLASS_OPTIONS = ['1班', '2班', '3班', '4班', '5班', '6班', '7班', '8班', '9班', '10班'];
+  var KLASS_OPTIONS_RE = /^([1-9]|10)班$/;
+
+  /* ======================================================================
+     1 · 对外部模块的安全代理
+     ====================================================================== */
+  function U() { return TF.util || {}; }
+  function esc(v) { return U().esc ? U().esc(v) : (v == null ? '' : String(v)); }
+  function attr(v) { return U().attr ? U().attr(v) : esc(v); }
+  function num(v, d) { return U().num ? U().num(v, d) : String(v == null ? 0 : v); }
+  function relTime(v) { return U().relTime ? U().relTime(v) : ''; }
+  function fmtDate(v) { return U().fmtDate ? U().fmtDate(v) : ''; }
+  function excerpt(v, n) { return U().excerpt ? U().excerpt(v, n || 64) : String(v == null ? '' : v); }
+  function stripHtml(v) { return U().stripHtml ? U().stripHtml(v) : String(v == null ? '' : v); }
+  function md(v) { return U().md ? U().md(v) : esc(v); }
+  function debounce(fn, w) { return U().debounce ? U().debounce(fn, w) : fn; }
+
+  function icon(n, s, c) { return TF.ui && TF.ui.icon ? TF.ui.icon(n, s, c) : ''; }
+  function button(o) { return TF.ui && TF.ui.button ? TF.ui.button(o) : ''; }
+  function field(o) { return TF.ui && TF.ui.field ? TF.ui.field(o) : ''; }
+  function selectField(o) { return TF.ui && TF.ui.selectField ? TF.ui.selectField(o) : ''; }
+  function checkField(o) { return TF.ui && TF.ui.checkField ? TF.ui.checkField(o) : ''; }
+  function radioCards(o) { return TF.ui && TF.ui.radioCards ? TF.ui.radioCards(o) : ''; }
+  function emptyBox(o) { return TF.ui && TF.ui.empty ? TF.ui.empty(o) : ''; }
+  function avatar(u, s, c) { return TF.ui && TF.ui.avatar ? TF.ui.avatar(u, s, c) : ''; }
+  function badge(t, tone) { return TF.ui && TF.ui.badge ? TF.ui.badge(t, tone) : '<span class="badge">' + esc(t) + '</span>'; }
+  function toast(msg, type, ms) { if (TF.ui && TF.ui.toast) TF.ui.toast(msg, type, ms); }
+
+  function go(p, q) { if (TF.app && TF.app.go) TF.app.go(p, q); }
+  function refreshUser() { if (TF.app && TF.app.refreshUser) TF.app.refreshUser(); }
+  function query() { return (TF.route && TF.route.query) || {}; }
+  function routeParam() { return (TF.route && TF.route.param) || {}; }
+
+  function ST() { return TF.store || {}; }
+  function currentUser() { try { return ST().currentUser ? ST().currentUser() : null; } catch (e) { return null; } }
+  function isAdmin() { try { return ST().isAdmin ? !!ST().isAdmin() : false; } catch (e) { return false; } }
+  function siteSettings() { try { return (ST().getSettings && ST().getSettings()) || {}; } catch (e) { return {}; } }
+  function siteCounts() {
+    try { var c = ST().counts && ST().counts(); return c || { total: 0, today: 0, tags: [] }; }
+    catch (e) { return { total: 0, today: 0, tags: [] }; }
+  }
+  function boardList() { try { return (ST().listBoards && ST().listBoards()) || []; } catch (e) { return []; } }
+  function noticeList(n) { try { return (ST().listNotices && ST().listNotices(n)) || []; } catch (e) { return []; } }
+  function noticeOf(id) { try { return (ST().getNotice && ST().getNotice(id)) || null; } catch (e) { return null; } }
+  function hotList(n) { try { return (ST().hotPosts && ST().hotPosts(n)) || []; } catch (e) { return []; } }
+  function postList(o) {
+    try { return (ST().listPosts && ST().listPosts(o)) || { list: [], total: 0 }; }
+    catch (e) { return { list: [], total: 0 }; }
+  }
+  function userList(o) {
+    try { return (ST().listUsers && ST().listUsers(o)) || { list: [], total: 0 }; }
+    catch (e) { return { list: [], total: 0 }; }
+  }
+  function userOf(id) { try { return (ST().getUser && ST().getUser(id)) || null; } catch (e) { return null; } }
+  function boardOf(id) { try { return (ST().getBoard && ST().getBoard(id)) || null; } catch (e) { return null; } }
+  function findByUsername(name) {
+    try { return (ST().findUserByUsername && ST().findUserByUsername(name)) || null; } catch (e) { return null; }
+  }
+
+  /* 手机断点，与 mobile.css 的 ≤620px 保持一致。
+     只用在「手机上要换一种更省屏的排布」的两处：
+       · 首页不再放大搜索框（顶栏已经有搜索图标了）
+       · 统计条在手机上收成 3 格，保证一行放得下
+     桌面/平板走原来的四格 + 内联搜索。 */
+  var MOBILE_MAX = 620;
+  function isPhone() {
+    try {
+      return typeof window !== 'undefined' && typeof window.innerWidth === 'number' &&
+        window.innerWidth > 0 && window.innerWidth <= MOBILE_MAX;
+    } catch (e) { return false; }
+  }
+
+  /* ======================================================================
+     2 · 通用片段
+     ====================================================================== */
+  var LEVEL_TONE = { info: 'info', warn: 'warn', important: 'danger' };
+  var LEVEL_TEXT = { warn: '提醒', important: '重要' };
+
+  function nickOf(u) { return (u && (u.nickname || u.username)) || '已注销'; }
+  function authorOf(id) { return userOf(id) || { id: '', nickname: '已注销', username: '' }; }
+  function boardNameOf(id) {
+    var b = boardOf(id);
+    return b ? b.name : '综合';
+  }
+
+  function crumbHTML(items) {
+    var html = items.map(function (it, i) {
+      if (it.href && i !== items.length - 1) return '<a href="' + attr(it.href) + '">' + esc(it.text) + '</a>';
+      return '<span>' + esc(it.text) + '</span>';
+    }).join('');
+    return '<nav class="crumb mb-3" aria-label="位置">' + html + '</nav>';
+  }
+
+  /* 信息流条目：标题 + 一行摘要 + 元信息 */
+  function postRowHTML(p) {
+    var a = authorOf(p.authorId);
+    var flags = '';
+    if (p.pinned) flags += badge('置顶', 'pinned');
+    if (p.featured) flags += badge('精华', 'essence');
+    var summary = excerpt(stripHtml(p.content), 70);
+    return '<div class="postrow' + (p.pinned ? ' postrow--pinned' : '') + '">' +
+      '<div class="postrow__main">' +
+        '<div class="postrow__title">' +
+          '<a href="#/post/' + attr(p.id) + '">' + esc(p.title) + '</a>' + flags +
+        '</div>' +
+        (summary ? '<div class="text-sm text-2 truncate mt-1">' + esc(summary) + '</div>' : '') +
+        '<div class="postrow__meta">' +
+          '<a href="#/board/' + attr(p.boardId) + '">' + esc(boardNameOf(p.boardId)) + '</a>' +
+          '<a href="#/u/' + attr(a.id || '') + '">' + esc(nickOf(a)) + '</a>' +
+          '<span>' + esc(relTime(p.createdAt)) + '</span>' +
+          '<span>' + num(p.commentCount || 0) + ' 回复</span>' +
+          (Number(p.views) > 0 ? '<span>' + num(p.views) + ' 次浏览</span>' : '') +
+        '</div>' +
+      '</div>' +
+      '</div>';
+  }
+
+  /* 版块行：小图标 + 名字 + 今日新增 / 总帖数 */
+  function boardRowHTML(b) {
+    var st = b.stats || {};
+    return '<a class="rankrow" href="#/board/' + attr(b.id) + '">' +
+      '<span class="text-primary">' + icon(b.icon || 'grid', 14) + '</span>' +
+      '<span class="rankrow__title">' + esc(b.name) + '</span>' +
+      (Number(st.today) > 0 ? '<span class="badge badge--success">+' + num(st.today) + '</span>' : '') +
+      '<span class="rankrow__value">' + num(st.posts || 0) + '</span>' +
+      '</a>';
+  }
+
+  function hotRowHTML(p, i) {
+    return '<a class="rankrow" href="#/post/' + attr(p.id) + '">' +
+      '<span class="rankrow__no' + (i < 3 ? ' rankrow__no--top' : '') + '">' + (i + 1) + '</span>' +
+      '<span class="rankrow__title" title="' + attr(p.title) + '">' + esc(p.title) + '</span>' +
+      '<span class="rankrow__value">' + num(p.likes || 0) + '</span>' +
+      '</a>';
+  }
+
+  function noticeRowHTML(n) {
+    var tone = LEVEL_TONE[n.level] || 'info';
+    var flag = LEVEL_TEXT[n.level];
+    return '<a class="noticerow" data-level="' + attr(n.level || 'info') + '" href="#/notice/' + attr(n.id) + '">' +
+      (flag ? badge(flag, tone) : '') +
+      (n.top ? badge('置顶', 'pinned') : '') +
+      '<span class="noticerow__title">' + esc(n.title) + '</span>' +
+      '<span class="noticerow__time">' + esc(relTime(n.createdAt)) + '</span>' +
+      '</a>';
+  }
+
+  function tagCloudHTML(tags) {
+    if (!tags || !tags.length) return '<div class="empty--plain">还没有人打标签</div>';
+    return '<div class="tagcloud">' + tags.map(function (t) {
+      return '<a class="tagchip" href="#/search?q=' + encodeURIComponent(t.tag) + '">' + esc(t.tag) +
+        '<span class="tagchip__count">' + num(t.count) + '</span></a>';
+    }).join('') + '</div>';
+  }
+
+  function blockHTML(o) {
+    return '<section class="block' + (o.cls ? ' ' + o.cls : '') + '">' +
+      '<div class="block__head">' +
+        '<h2 class="block__title">' + (o.icon ? icon(o.icon, 15) : '') + esc(o.title) + '</h2>' +
+        (o.more ? '<a class="block__more" href="' + attr(o.more.href) + '">' + esc(o.more.text) + '</a>' : '') +
+      '</div>' +
+      '<div class="block__body">' + o.body + '</div>' +
+      '</section>';
+  }
+
+  function formError(form, msg) {
+    if (!form || !form.querySelector) return;
+    var box = form.querySelector('[data-form-error]');
+    if (!box) return;
+    box.classList.toggle('is-hidden', !msg);
+    box.innerHTML = msg ? icon('alert', 13) + '<span>' + esc(msg) + '</span>' : '';
+  }
+  /* 校验失败：内联提示 + toast 双通道（§11.1.4） */
+  function fail(form, msg) { formError(form, msg); toast(msg, 'error'); }
+
+  function safeRedirect(raw) {
+    var r = String(raw == null ? '' : raw).trim();
+    if (!r || r.charAt(0) !== '/') return '';
+    if (r.indexOf('//') === 0) return '';
+    if (r === '/login' || r === '/register' || r === '/forgot') return '';
+    return r;
+  }
+
+  /* ======================================================================
+     3 · 首页：站点说明条 + 统计条 + 两栏信息流
+     ====================================================================== */
+  /* 站点说明条。手机上不渲染内联搜索：顶栏已有搜索图标（.iconbtn--search → #/search），
+     再来一个满宽输入框 + 按钮会把首屏帖子挤出屏幕。 */
+  function bbsHeadHTML(st, q, phone) {
+    var search = phone ? '' :
+      '<form class="bbs-head__search" data-action="home.search" role="search" novalidate>' +
+        '<input class="input" name="q" type="search" value="' + attr(q) + '" ' +
+          'placeholder="搜帖子、版块、同学" aria-label="站内搜索">' +
+        '<button class="btn" type="submit">搜索</button>' +
+      '</form>';
+    return '<div class="bbs-head">' +
+      '<div>' +
+        '<div class="bbs-head__title">' + esc(st.siteName || '天府师大一中·校园论坛') + '</div>' +
+        '<div class="bbs-head__desc">初中部同学自己的论坛。发帖问事、回帖搭话、找失物、找资料都行。</div>' +
+      '</div>' +
+      search +
+      '</div>';
+  }
+
+  /* 统计条。窄屏下 components.css 把每格固定成 flex: 1 1 50%（原本是 2x2 大卡的写法），
+     所以：手机上留 2 格 = 正好一行；3 格会断成「2 + 1」（第三格独占一整行）。
+     桌面/平板仍是 4 格。 */
+  function bbsStatsHTML(counts, userTotal, boardTotal, phone) {
+    function item(v, label) {
+      return '<div class="bbs-stats__item">' +
+        '<div class="bbs-stats__value">' + v + '</div>' +
+        '<div class="bbs-stats__label">' + label + '</div>' +
+        '</div>';
+    }
+    var cells = phone
+      ? [item(num(counts.total || 0), '帖子'), item(num(counts.today || 0), '今天新帖')]
+      : [
+        item(num(counts.total || 0), '帖子'),
+        item(num(userTotal || 0), '成员'),
+        item(num(counts.today || 0), '今天新帖'),
+        item(num(boardTotal || 0), '版块')
+      ];
+    return '<div class="bbs-stats">' + cells.join('') + '</div>';
+  }
+
+  /* 校外访客首页：看不到任何帖子，只有「去娱乐中心」和「去认证」两条路 */
+  function visitorHomeHTML(user) {
+    var status = ST().studentStatus ? ST().studentStatus() : 'external';
+    var pending = status === 'pending';
+    return '<div class="page" data-page="home">' +
+      '<div class="card card--pad mt-4" data-visitor-home>' +
+        '<div class="cluster gap-2">' +
+          '<span class="badge badge--warn">校外访客</span>' +
+          '<span class="text-sm text-2">你好，' + esc(user.nickname || user.username) + '</span>' +
+        '</div>' +
+        '<h1 class="mt-2">论坛内容需要学生身份认证</h1>' +
+        '<p class="text-2" style="max-width:640px;line-height:1.8">' +
+          '为了防止校外人员乱发帖、保护同学隐私，现在<b>看帖、发帖、评论</b>都要先证明你是本校学生。' +
+          '正在审核的用户也一样，审核通过后自动解锁。' +
+        '</p>' +
+        '<div class="noticebar mt-3">' + icon('cards', 15) +
+          '<span><b>娱乐中心现在就能玩</b>：五子棋、国际象棋、中国象棋、斗地主、UNO、麻将，不用认证。</span></div>' +
+        '<div class="gacts mt-4" style="display:flex;gap:10px;flex-wrap:wrap">' +
+          '<a class="btn btn--primary" href="#/games">' + icon('sparkle', 16) + ' 去娱乐中心</a>' +
+          (pending
+            ? '<a class="btn btn--ghost" href="#/verify">' + icon('shield', 16) + ' 查看认证进度（审核中）</a>'
+            : '<a class="btn btn--ghost" href="#/verify">' + icon('shield', 16) + ' 认证学生身份</a>') +
+        '</div>' +
+        '<div class="divider"></div>' +
+        '<h3>怎么认证？</h3>' +
+        '<ol class="text-2" style="line-height:2;padding-left:22px">' +
+          '<li>拍一张<b>校卡照片</b>（只拍校卡就行，<b>不用露脸</b>，把姓名/班级那面拍清楚即可）</li>' +
+          '<li>在认证页上传，可以顺手填真实姓名和班级（只有管理员看得到）</li>' +
+          '<li>管理员在后台审核，通过后就能看帖、发帖、评论了</li>' +
+        '</ol>' +
+        '<p class="text-xs text-muted mt-2">校卡照片只保存在学校服务器上，只有管理员审核时能看到，不会公开。</p>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function renderHome() {
+    var st = siteSettings();
+    var user = currentUser();
+    /* 校外访客：看不到论坛内容，走专门的访客首页 */
+    var verified = !user || (ST().isVerified ? ST().isVerified() : true);
+    if (user && !verified) return { html: visitorHomeHTML(user), title: '首页' };
+    var counts = siteCounts();
+    var boards = boardList();
+    var users = userList({ sort: 'new', size: 60 });
+    var notices = noticeList(3);
+    var feed = postList({ sort: 'latest', size: 12 });
+    var hot = hotList(10);
+
+    /* 主栏：最新帖子信息流 */
+    var feedBody;
+    if (!(feed.list || []).length) {
+      /* 空站：只留一句话；登录后给一个发帖入口，未登录不写第二句（站名条已经说明过了） */
+      feedBody = '<div class="empty--plain">还没有帖子' +
+        (user ? '<div class="mt-2"><a class="btn btn--sm btn--primary" href="#/new">发第一帖</a></div>' : '') +
+        '</div>';
+    } else {
+      feedBody = (feed.list || []).map(postRowHTML).join('');
+    }
+    var main = blockHTML({
+      cls: 'block--box block--flush',
+      title: '最新帖子',
+      more: { href: '#/forum', text: '全部版块' },
+      body: feedBody
+    });
+
+    /* 侧栏 1：公告（静态 2~3 条，不做轮播） */
+    var noticeBody = notices.length
+      ? '<div class="noticelist">' + notices.map(noticeRowHTML).join('') + '</div>'
+      : '<div class="empty--plain">暂时没有公告</div>';
+    var sideNotices = blockHTML({
+      cls: 'block--box',
+      title: '校园公告',
+      icon: 'megaphone',
+      more: { href: '#/notices', text: '全部' },
+      body: noticeBody
+    });
+
+    /* 侧栏 2：版块 */
+    var boardBody = boards.length
+      ? boards.map(boardRowHTML).join('')
+      : '<div class="empty--plain">还没有版块</div>';
+    var sideBoards = blockHTML({
+      cls: 'block--box',
+      title: '版块',
+      icon: 'grid',
+      more: { href: '#/forum', text: '总览' },
+      body: boardBody
+    });
+
+    /* 侧栏 3：今日热帖 */
+    var hotBody = hot.length
+      ? '<div class="ranklist">' + hot.map(hotRowHTML).join('') + '</div>'
+      : '<div class="empty--plain">今天还没有热帖</div>';
+    var sideHot = blockHTML({
+      cls: 'block--box',
+      title: '今日热帖',
+      icon: 'fire',
+      body: hotBody
+    });
+
+    /* 侧栏 4：热门标签（没有标签时整块不渲染，避免只剩标题的空框） */
+    var sideTags = (counts.tags && counts.tags.length)
+      ? blockHTML({
+        cls: 'block--box',
+        title: '热门标签',
+        icon: 'tag',
+        body: tagCloudHTML(counts.tags)
+      })
+      : '';
+
+    var announce = st.announcement
+      ? '<div class="noticebar mb-3">' + icon('megaphone', 15) +
+        '<b>站内通知</b><span class="truncate">' + esc(st.announcement) + '</span></div>'
+      : '';
+
+    var phone = isPhone();
+    var html = '<div class="page" data-page="home">' +
+      announce +
+      bbsHeadHTML(st, String(query().q || ''), phone) +
+      '<div class="mt-3">' + bbsStatsHTML(counts, users.total, boards.length, phone) + '</div>' +
+      '<div class="cols mt-4">' +
+        '<div class="col-main">' + main + '</div>' +
+        '<aside class="col-side">' +
+          '<div class="stack gap-4">' + sideNotices + sideBoards + sideHot + sideTags + '</div>' +
+        '</aside>' +
+      '</div>' +
+      '</div>';
+
+    return { html: html, onMount: mountHomeResponsive, title: '首页' };
+  }
+
+  /* 手机↔桌面/平板切换（旋转、拖窗口）后重渲染一次，让顶部件与统计条跟着断点变。
+     只在真正跨过断点时刷新，平时不打扰；app.js 会在下次渲染前调用返回的清理函数。 */
+  function mountHomeResponsive() {
+    if (typeof window === 'undefined' || !window.addEventListener) return;
+    var wasPhone = isPhone();
+    var timer = null;
+    function onResize() {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(function () {
+        timer = null;
+        var now = isPhone();
+        if (now !== wasPhone) {
+          wasPhone = now;
+          if (TF.app && TF.app.refresh) TF.app.refresh();
+        }
+      }, 180);
+    }
+    window.addEventListener('resize', onResize, false);
+    window.addEventListener('orientationchange', onResize, false);
+    return function () {
+      if (timer) { clearTimeout(timer); timer = null; }
+      window.removeEventListener('resize', onResize, false);
+      window.removeEventListener('orientationchange', onResize, false);
+    };
+  }
+
+  /* ======================================================================
+     4 · 登录
+     ====================================================================== */
+  var lastUsername = '';
+
+  /* 说明：站点改成服务器 + SQLite 真源，没有演示账号，登录页不再提供「一键填充」。
+     账号只能自己注册；第一个注册的人会成为超级管理员（服务端判定）。 */
+
+  /* 已登录时访问这三个游客页：保留该页自己的 data-page，只换内容（§7 页面名映射） */
+  function loggedInHTML(user, page) {
+    return '<div class="page" data-page="' + attr(page) + '">' +
+      '<h1>你已经登录了</h1>' +
+      '<p class="text-2">当前账号是 <b>' + esc(nickOf(user)) + '</b>，不用再登一次。</p>' +
+      '<div class="cluster mt-4">' +
+      '<a class="btn btn--primary" href="#/home">回首页</a>' +
+      '<a class="btn" href="#/forum">去论坛</a>' +
+      '</div></div>';
+  }
+
+  function renderLogin() {
+    var user = currentUser();
+    if (user) return { html: loggedInHTML(user, 'login'), title: '登录' };
+
+    var redirect = safeRedirect(query().redirect);
+    var html = '<div class="page" data-page="login">' +
+      '<h1>登录</h1>' +
+      '<p class="text-2">登录后才能发帖、回帖、收藏。</p>' +
+      (redirect
+        ? '<div class="noticebar mt-3">' + icon('lock', 15) +
+          '<span>登录后会回到 <b>' + esc(redirect) + '</b></span></div>'
+        : '') +
+      '<form class="form" data-action="auth.login" novalidate>' +
+        '<div class="field__error is-hidden" data-form-error></div>' +
+        field({
+          label: '用户名', name: 'username', icon: 'user', required: true,
+          value: lastUsername, autocomplete: 'username', placeholder: '你注册时的用户名'
+        }) +
+        field({
+          label: '密码', name: 'password', type: 'password', required: true,
+          autocomplete: 'current-password', placeholder: '密码'
+        }) +
+        '<div class="cluster">' +
+          checkField({ label: '记住用户名', name: 'remember', checked: !!lastUsername }) +
+          '<span class="spacer"></span>' +
+          '<a class="text-sm" href="#/forgot">忘记密码</a>' +
+        '</div>' +
+        button({ text: '登录', variant: 'primary', size: 'lg', block: true, type: 'submit' }) +
+      '</form>' +
+      '<div class="divider"></div>' +
+      '<p class="text-sm text-2 center mt-4">还没有账号？<a href="#/register">注册一个</a></p>' +
+      '</div>';
+    return { html: html, title: '登录' };
+  }
+
+  /* ======================================================================
+     5 · 注册
+     ====================================================================== */
+  var PW_TEXT = {
+    0: '至少 6 位',
+    1: '太短了',
+    2: '偏弱，再长一点',
+    3: '还行',
+    4: '挺结实'
+  };
+  function pwScore(v) {
+    v = String(v == null ? '' : v);
+    if (!v) return 0;
+    if (v.length < 6) return 1;
+    var s = 1;
+    if (v.length >= 10) s += 1;
+    if (/[A-Za-z]/.test(v) && /[0-9]/.test(v)) s += 1;
+    if (/[^A-Za-z0-9]/.test(v)) s += 1;
+    return Math.min(4, s);
+  }
+  function setHint(el, text, tone) {
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'field__hint' + (tone ? ' text-' + tone : '');
+  }
+  function pwStrengthHTML() {
+    return '<div class="pwstrength" data-pwstrength>' +
+      '<span class="pwstrength__bar"></span><span class="pwstrength__bar"></span>' +
+      '<span class="pwstrength__bar"></span><span class="pwstrength__bar"></span>' +
+      '</div>' +
+      '<div class="field__hint" data-pw-hint>' + PW_TEXT[0] + '</div>';
+  }
+  function paintStrength(form) {
+    if (!form || !form.querySelector) return 0;
+    var box = form.querySelector('[data-pwstrength]');
+    var pw = form.querySelector('input[name="password"]');
+    var hint = form.querySelector('[data-pw-hint]');
+    if (!box || !pw) return 0;
+    var s = pwScore(pw.value);
+    var cls = ['', 'is-weak', 'is-fair', 'is-good', 'is-strong'][s] || '';
+    var bars = box.querySelectorAll('.pwstrength__bar');
+    for (var i = 0; i < bars.length; i++) {
+      bars[i].className = 'pwstrength__bar' + (i < s && cls ? ' ' + cls : '');
+    }
+    setHint(hint, PW_TEXT[s] || PW_TEXT[0], s === 0 ? '' : s <= 2 ? 'danger' : s === 3 ? 'warn' : 'success');
+    return s;
+  }
+
+  function renderRegister() {
+    var st = siteSettings();
+    var user = currentUser();
+    if (user) return { html: loggedInHTML(user, 'register'), title: '注册' };
+    if (st.registerOpen === false) {
+      return {
+        html: '<div class="page" data-page="register">' +
+          '<h1>注册关掉了</h1>' +
+          '<p class="text-2">管理员暂时关了注册入口。什么时候开，看校园公告。</p>' +
+          '<div class="cluster mt-4">' +
+          '<a class="btn btn--primary" href="#/notices">看公告</a>' +
+          '<a class="btn" href="#/login">去登录</a>' +
+          '</div></div>',
+        title: '注册'
+      };
+    }
+
+    /* 数据库还是空的：第一个注册的人自动成为超级管理员（服务端判定） */
+    var firstUser = false;
+    try { firstUser = ST().listUsers ? ST().listUsers({ size: 1 }).total === 0 : false; } catch (e) { firstUser = false; }
+
+    var html = '<div class="page" data-page="register">' +
+      '<h1>注册</h1>' +
+      '<p class="text-2">用户名加密码就行，不用手机号，也不用邮箱。</p>' +
+      '<div class="noticebar noticebar--warn">' + icon('shield', 15) +
+        '<span><b>注册后先是「校外访客」</b>：娱乐中心（棋牌游戏）可以直接玩；' +
+        '看帖、发帖、评论需要先做<b>学生认证</b> —— 拍一张校卡照片（不用露脸），管理员审核通过后自动解锁。</span></div>' +
+      (firstUser
+        ? '<div class="noticebar noticebar--warn">' + icon('crown', 15) +
+          '<span>现在站里一个账号都没有，<b>你会是第一个注册的人，自动成为超级管理员</b>。密码记牢，也建议在「账号设置」里设一个安全问答，方便找回。</span></div>'
+        : '') +
+      '<form class="form" data-action="auth.register" novalidate>' +
+        '<div class="field__error is-hidden" data-form-error></div>' +
+        '<div class="formgrid">' +
+          '<div data-uname-field>' +
+            field({
+              label: '用户名', name: 'username', icon: 'user', required: true,
+              autocomplete: 'username', maxlength: 16, placeholder: 'chenyu2024',
+              hint: '3-16 位，只能用字母、数字和下划线'
+            }) +
+          '</div>' +
+          field({
+            label: '昵称', name: 'nickname', required: true, maxlength: 16,
+            placeholder: '陈宇航', hint: '2-16 个字，帖子里显示这个'
+          }) +
+          '<div data-pw-field>' +
+            field({
+              label: '密码', name: 'password', type: 'password', required: true,
+              autocomplete: 'new-password', placeholder: '至少 6 位'
+            }) +
+            pwStrengthHTML() +
+          '</div>' +
+          field({
+            label: '确认密码', name: 'password2', type: 'password', required: true,
+            autocomplete: 'new-password', placeholder: '再输一次'
+          }) +
+          selectField({
+            label: '年级', name: 'grade', value: '初一',
+            options: [
+              { value: '初一', label: '初一' },
+              { value: '初二', label: '初二' },
+              { value: '初三', label: '初三' }
+            ],
+            hint: '年级是公开的'
+          }) +
+          (st.needEmail
+            ? field({
+              label: '邮箱', name: 'email', type: 'email', icon: 'mail',
+              placeholder: 'name@example.com', hint: '本站要求填邮箱'
+            })
+            : '') +
+          field({
+            label: '邀请码', name: 'invite', maxlength: 16,
+            placeholder: '选填，留空也行'
+          }) +
+          '<div class="field field--full">' +
+            '<label class="field__label">性别</label>' +
+            radioCards({
+              name: 'sex', value: '男',
+              options: [
+                { value: '男', label: '男生' },
+                { value: '女', label: '女生' }
+              ]
+            }) +
+          '</div>' +
+          '<div class="field field--full" data-agree-field>' +
+            checkField({
+              label: '我看过版规了',
+              name: 'agree', block: true,
+              desc: '不发广告、不骂人、不把同学的照片和联系方式发上来。'
+            }) +
+            '<div class="field__error is-hidden" data-agree-error></div>' +
+          '</div>' +
+        '</div>' +
+        button({ text: '注册', variant: 'primary', size: 'lg', block: true, type: 'submit' }) +
+        '<p class="field__hint center">数据存在学校这台服务器上，换台电脑登录也能看到。</p>' +
+      '</form>' +
+      '<div class="divider"></div>' +
+      '<p class="text-sm text-2 center">已经有账号了？<a href="#/login">登录</a></p>' +
+      '</div>';
+    return { html: html, onMount: mountRegister, title: '注册' };
+  }
+
+  function mountRegister(root) {
+    if (!root || !root.querySelector) return;
+    var form = root.querySelector('form[data-action="auth.register"]');
+    if (!form) return;
+
+    var unameInput = form.querySelector('input[name="username"]');
+    var unameWrap = form.querySelector('[data-uname-field]');
+    var unameHint = unameWrap ? unameWrap.querySelector('.field__hint') : null;
+    var checkName = debounce(function () {
+      var v = String(unameInput.value || '').trim();
+      if (!v) { setHint(unameHint, '3-16 位，只能用字母、数字和下划线', ''); return; }
+      if (!/^[a-zA-Z0-9_]{3,16}$/.test(v)) {
+        setHint(unameHint, '用户名 3-16 位，只能用字母、数字和下划线', 'danger');
+        return;
+      }
+      if (findByUsername(v)) setHint(unameHint, '「' + v + '」有人用了', 'danger');
+      else setHint(unameHint, '「' + v + '」可以用', 'success');
+    }, 320);
+    if (unameInput && unameInput.addEventListener) unameInput.addEventListener('input', checkName, false);
+
+    var pwInput = form.querySelector('input[name="password"]');
+    if (pwInput && pwInput.addEventListener) {
+      pwInput.addEventListener('input', function () { paintStrength(form); }, false);
+    }
+
+    var agree = form.querySelector('input[name="agree"]');
+    if (agree && agree.addEventListener) {
+      agree.addEventListener('change', function () {
+        if (!agree.checked) return;
+        var box = form.querySelector('[data-agree-error]');
+        if (box) { box.classList.add('is-hidden'); box.innerHTML = ''; }
+      }, false);
+    }
+  }
+
+  /* ======================================================================
+     6 · 找回密码（用户名 → 确认身份 → 新密码）
+     ====================================================================== */
+  var forgotUser = null;                      // {username, nickname}
+  var forgotAnswer = '';                      // 第二步填的答案，第三步一起提交给服务端校验
+
+  function maskName(nick) {
+    var s = String(nick == null ? '' : nick);
+    if (!s) return '同学';
+    if (s.length === 1) return s + '*';
+    return s.charAt(0) + new Array(s.length).join('*');
+  }
+  function accountBoxHTML(u) {
+    var email = u.email ? String(u.email).replace(/^(.{1,2})[^@]*(@.*)$/, '$1***$2') : '';
+    return '<div class="panel">' +
+      '<div class="authorline">' + avatar(u, 32) +
+        '<div><b>' + esc(nickOf(u)) + '</b>' +
+        '<div class="text-xs text-muted">' + esc(u.grade || '年级没填') + ' ' + esc(u.klass || '') + '</div></div>' +
+      '</div>' +
+      '<div class="listmeta mt-3">' +
+        '<span class="listmeta__item">' + icon('user', 13) + esc(u.username) + '</span>' +
+        '<span class="listmeta__item">' + icon('lock', 13) + esc(maskName(nickOf(u))) + '</span>' +
+        '<span class="listmeta__item">' + icon('calendar', 13) + esc(fmtDate(u.createdAt)) + ' 注册</span>' +
+        (email ? '<span class="listmeta__item">' + icon('mail', 13) + esc(email) + '</span>' : '') +
+      '</div>' +
+      '</div>';
+  }
+
+  /* ============================================ 学生认证（校卡照片，管理员审核）
+   * 新注册账号是「校外访客」：娱乐中心能用；看帖/发帖/评论要认证。
+   * 认证只需要一张校卡照片（不用露脸），管理员后台审核。 */
+  function verifyShell(inner) {
+    return '<div class="page" data-page="verify">' + inner + '</div>';
+  }
+  function verifyStatusCard(status, note) {
+    if (status === 'student') {
+      return '<div class="card card--pad mt-4">' +
+        '<span class="badge badge--success">已认证学生</span>' +
+        '<h1 class="mt-2">认证通过了</h1>' +
+        '<p class="text-2">现在可以看帖、发帖、评论、点歌了。</p>' +
+        '<div class="cluster gap-2 mt-4">' +
+          '<a class="btn btn--primary" href="#/forum">去论坛</a>' +
+          '<a class="btn" href="#/games">娱乐中心</a>' +
+        '</div></div>';
+    }
+    if (status === 'pending') {
+      return '<div class="card card--pad mt-4">' +
+        '<span class="badge badge--warn">审核中</span>' +
+        '<h1 class="mt-2">材料已提交，等管理员审核</h1>' +
+        '<p class="text-2">管理员看到后会尽快处理。审核通过后，看帖、发帖、评论会自动解锁；被驳回的话这里会显示原因，可以重新提交。</p>' +
+        '<div class="noticebar mt-3">' + icon('shield', 15) +
+          '<span>校卡照片只有管理员审核时能看到，不会公开；期间娱乐中心照常能玩。</span></div>' +
+        '<div class="cluster gap-2 mt-4">' +
+          '<a class="btn btn--primary" href="#/games">去娱乐中心</a>' +
+          '<a class="btn" href="#/home">回首页</a>' +
+        '</div></div>';
+    }
+    var rejected = status === 'rejected';
+    return '<div class="card card--pad mt-4">' +
+      '<span class="badge badge--warn">' + (rejected ? '审核未通过' : '校外访客') + '</span>' +
+      '<h1 class="mt-2">' + (rejected ? '重新提交认证' : '认证学生身份') + '</h1>' +
+      (rejected && note
+        ? '<div class="noticebar noticebar--warn mt-2">' + icon('alert', 15) + '<span><b>上次被驳回：</b>' + esc(note) + '</span></div>'
+        : '') +
+      '<p class="text-2">拍一张<b>校卡照片</b>上传即可（只拍校卡那一面，<b>不用露脸</b>）。管理员审核通过后，看帖、发帖、评论全部解锁。</p>' +
+      '<form class="form mt-3" data-action="student.submit" novalidate>' +
+        '<div class="field__error is-hidden" data-form-error></div>' +
+        '<div class="field field--full">' +
+          '<label class="field__label" for="verify-card">校卡照片<span class="req">*</span></label>' +
+          '<input class="input" id="verify-card" type="file" name="card" accept="image/*" required>' +
+          '<div class="field__hint">支持 jpg / png / webp / gif，最大 15MB。苹果手机 HEIC 照片传不了，改成「兼容性最佳」或直接截图再传。</div>' +
+        '</div>' +
+        '<div class="formgrid">' +
+          field({ label: '真实姓名', name: 'realName', maxlength: 20, placeholder: '选填，方便管理员核对' }) +
+          selectField({
+            label: '班级', name: 'klass', value: '',
+            options: [{ value: '', label: '选填' }].concat(KLASS_OPTIONS.map(function (k) { return { value: k, label: k }; })),
+            hint: '选填，只有管理员能看到'
+          }) +
+        '</div>' +
+        '<p class="text-xs text-muted">照片只保存在学校服务器上，只有管理员审核时能看，不会公开。不填姓名班级也能提交。</p>' +
+        button({ text: '提交认证材料', variant: 'primary', size: 'lg', block: true, type: 'submit' }) +
+      '</form>' +
+      '<div class="divider"></div>' +
+      '<p class="text-sm text-2 center">不想认证？<a href="#/games">先去娱乐中心玩</a></p>' +
+    '</div>';
+  }
+  function renderVerify() {
+    var user = currentUser();
+    if (!user) {
+      return {
+        title: '学生认证',
+        html: verifyShell('<div class="card card--pad mt-4"><h1>学生认证</h1>' +
+          '<p class="text-2">先登录，再提交校卡照片。</p>' +
+          '<div class="cluster gap-2 mt-3"><a class="btn btn--primary" href="#/login?redirect=%2Fverify">去登录</a>' +
+          '<a class="btn" href="#/register">注册</a></div></div>')
+      };
+    }
+    var status = ST().studentStatus ? ST().studentStatus() : 'external';
+    var note = user.studentNote || '';
+    var html = verifyShell(verifyStatusCard(status, note) +
+      (status === 'pending' || status === 'student' ? '' : '') +
+      '<div class="card card--pad mt-4">' +
+        '<h3>常见问题</h3>' +
+        '<p class="text-sm text-2"><b>一定要露脸吗？</b>不用，只拍校卡就行。<br>' +
+        '<b>校卡丢了怎么办？</b>拍学生证/校园卡/胸卡任意一种能证明学生身份的证件都可以，实在没有就找管理员说明情况。<br>' +
+        '<b>多久能通过？</b>管理员上线就会处理；期间可以先玩娱乐中心。<br>' +
+        '<b>照片会公开吗？</b>不会，只有管理员审核时能看到。</p>' +
+      '</div>');
+    return { title: '学生认证', html: html };
+  }
+  function onStudentSubmit(ctx) {
+    if (!isSubmit(ctx)) return;
+    var form = ctx.form;
+    var input = form.querySelector ? form.querySelector('input[name="card"]') : null;
+    var file = input && input.files && input.files[0];
+    if (!file) { fail(form, '先选一张校卡照片'); return; }
+    if (!/^image\//i.test(file.type || '')) { fail(form, '只能传图片（jpg/png/webp/gif），也可以截图再传'); return; }
+    if (file.size > 15 * 1024 * 1024) { fail(form, '图片超过 15MB，压缩一下或截图再传'); return; }
+    var v = ctx.values();
+    var btn = form.querySelector ? form.querySelector('button[type="submit"]') : null;
+    if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+    formError(form, '');
+    var api = TF.api;
+    if (!api || !api.student || !api.student.submit) { fail(form, '页面还没准备好，刷新一下再试'); if (btn) { btn.disabled = false; } return; }
+    api.student.submit(file, { realName: String(v.realName || '').trim(), klass: String(v.klass || '').trim() })
+      .then(function () {
+        toast('已提交，等管理员审核', 'success');
+        refreshUser();
+        go('/verify');
+      }, function (e) {
+        if (btn) { btn.disabled = false; btn.textContent = '提交认证材料'; }
+        fail(form, (e && e.message) || '提交失败，稍后再试');
+      });
+  }
+
+  /* 找回密码第二步展示的账号卡片（服务端只回用户名和昵称，不回邮箱等隐私） */
+  function forgotAccountHTML(u) {
+    return '<div class="panel">' +
+      '<div class="authorline">' + avatar({ nickname: nickOf(u), username: u.username }, 32) +
+        '<div><b>' + esc(nickOf(u)) + '</b>' +
+        '<div class="text-xs text-muted">用户名：' + esc(u.username) + '</div></div>' +
+      '</div>' +
+      '</div>';
+  }
+
+  function renderForgot() {
+    forgotUser = null;
+    forgotAnswer = '';
+    var user = currentUser();
+    if (user) return { html: loggedInHTML(user, 'forgot'), title: '找回密码' };
+
+    var html = '<div class="page" data-page="forgot">' +
+      '<h1>找回密码</h1>' +
+      '<p class="text-2">三步：填用户名、答对安全问答、设个新密码。没设安全问答的账号，得找管理员在后台重置。</p>' +
+      '<div class="cluster mt-4" data-steps>' +
+        '<span class="chip is-active" data-step-dot="1">1 用户名</span>' +
+        '<span class="chip" data-step-dot="2">2 安全问答</span>' +
+        '<span class="chip" data-step-dot="3">3 新密码</span>' +
+      '</div>' +
+
+      '<form class="form mt-4" data-action="auth.forgotLookup" data-step="1" novalidate>' +
+        '<div class="field__error is-hidden" data-form-error></div>' +
+        field({
+          label: '用户名', name: 'username', icon: 'user', required: true,
+          autocomplete: 'username', placeholder: '你注册时用的用户名'
+        }) +
+        button({ text: '下一步', variant: 'primary', size: 'lg', block: true, type: 'submit' }) +
+      '</form>' +
+
+      '<form class="form mt-4 is-hidden" data-action="auth.forgotVerify" data-step="2" novalidate>' +
+        '<div class="field__error is-hidden" data-form-error></div>' +
+        '<div data-account-box></div>' +
+        '<div class="panel" data-question-box></div>' +
+        field({
+          label: '答案', name: 'answer', required: true,
+          placeholder: '注册时设的答案',
+          hint: '不分大小写。答对才能设新密码，连续答错会被限流。'
+        }) +
+        '<div class="cluster">' +
+        button({ text: '上一步', variant: 'ghost', action: 'auth.forgotRestart' }) +
+        '<span class="spacer"></span>' +
+        button({ text: '下一步', variant: 'primary', type: 'submit' }) +
+        '</div>' +
+      '</form>' +
+
+      '<form class="form mt-4 is-hidden" data-action="auth.forgotReset" data-step="3" novalidate>' +
+        '<div class="field__error is-hidden" data-form-error></div>' +
+        '<div class="noticebar" data-verified>' + icon('check', 15) +
+          '<span>问答填过了，设个新密码吧。答案不对的话服务端会打回来。</span></div>' +
+        '<div data-pw-field>' +
+          field({
+            label: '新密码', name: 'password', type: 'password', required: true,
+            autocomplete: 'new-password', placeholder: '至少 6 位'
+          }) +
+          pwStrengthHTML() +
+        '</div>' +
+        field({
+          label: '再输一次', name: 'password2', type: 'password', required: true,
+          autocomplete: 'new-password', placeholder: '和新密码一样'
+        }) +
+        '<p class="field__hint">改完旧密码立刻失效，用新密码登录。密码只有你和服务器的哈希知道，管理员也看不到明文。</p>' +
+        '<div class="cluster">' +
+        button({ text: '上一步', variant: 'ghost', action: 'auth.forgotRestart' }) +
+        '<span class="spacer"></span>' +
+        button({ text: '重置密码', variant: 'primary', size: 'lg', type: 'submit' }) +
+        '</div>' +
+      '</form>' +
+
+      '<div class="divider"></div>' +
+      '<p class="text-sm text-2 center">想起来了？<a href="#/login">去登录</a></p>' +
+      '</div>';
+    return { html: html, onMount: mountForgot, title: '找回密码' };
+  }
+
+  function showForgotStep(root, n) {
+    if (!root || !root.querySelectorAll) return;
+    var forms = root.querySelectorAll('form[data-step]');
+    for (var i = 0; i < forms.length; i++) {
+      forms[i].classList.toggle('is-hidden', Number(forms[i].getAttribute('data-step')) !== n);
+    }
+    var dots = root.querySelectorAll('[data-step-dot]');
+    for (var k = 0; k < dots.length; k++) {
+      dots[k].classList.toggle('is-active', Number(dots[k].getAttribute('data-step-dot')) <= n);
+    }
+  }
+  function mountForgot(root) {
+    if (!root || !root.querySelector) return;
+    var form3 = root.querySelector('form[data-step="3"]');
+    var pwInput = form3 ? form3.querySelector('input[name="password"]') : null;
+    if (pwInput && pwInput.addEventListener) {
+      pwInput.addEventListener('input', function () { paintStrength(form3); }, false);
+    }
+    var box = root.querySelector('[data-account-box]');
+    if (box) box.innerHTML = '';
+    showForgotStep(root, 1);
+    var input = root.querySelector('form[data-step="1"] input[name="username"]');
+    if (input && !input.value && lastUsername) input.value = lastUsername;
+  }
+
+  /* ======================================================================
+     7 · 公告列表 / 详情
+     ====================================================================== */
+  function renderNotices() {
+    var list = noticeList();
+    var admin = isAdmin();
+    var body = list.length
+      ? '<div class="noticelist">' + list.map(noticeRowHTML).join('') + '</div>'
+      : '<div class="empty--plain">还没有公告</div>';
+
+    var html = '<div class="page" data-page="notices">' +
+      crumbHTML([{ text: '首页', href: '#/home' }, { text: '校园公告' }]) +
+      '<div class="page__head">' +
+        '<h1 class="page__title">校园公告</h1>' +
+        '<p class="page__desc">调课、活动报名、维护通知、版规变化都发在这里。置顶的排最前面。</p>' +
+      '</div>' +
+      (admin
+        ? '<div class="cluster mb-3">' +
+          '<a class="btn btn--sm" href="#/admin/notices">' + icon('edit', 14) + '去后台管公告</a>' +
+          '</div>'
+        : '') +
+      blockHTML({ cls: 'block--box', title: '全部公告', body: body }) +
+      '</div>';
+    return { html: html, title: '校园公告' };
+  }
+
+  function renderNotice() {
+    var id = String(routeParam().id || '');
+    var n = noticeOf(id);
+    var admin = isAdmin();
+
+    if (!n) {
+      return {
+        html: '<div class="page" data-page="notice">' +
+          crumbHTML([{ text: '首页', href: '#/home' }, { text: '校园公告', href: '#/notices' }, { text: '找不到' }]) +
+          '<div class="card card--pad">' +
+          '<div class="empty--plain">这条公告不在了，可能被删了。</div>' +
+          '</div>' +
+          '<div class="cluster mt-4"><a class="btn" href="#/notices">' + icon('arrowLeft', 14) + '返回公告列表</a></div>' +
+          '</div>',
+        title: '公告'
+      };
+    }
+
+    var author = userOf(n.authorId);
+    var tone = LEVEL_TONE[n.level] || 'info';
+    var flag = LEVEL_TEXT[n.level];
+
+    var html = '<div class="page" data-page="notice">' +
+      crumbHTML([{ text: '首页', href: '#/home' }, { text: '校园公告', href: '#/notices' }, { text: '公告' }]) +
+      '<article class="card card--pad">' +
+        '<div class="cluster mb-2">' +
+          (flag ? badge(flag, tone) : badge('通知', 'info')) +
+          (n.top ? badge('置顶', 'pinned') : '') +
+        '</div>' +
+        '<h1 class="page__title">' + esc(n.title) + '</h1>' +
+        '<div class="listmeta mt-2">' +
+          '<span class="listmeta__item">' + icon('user', 13) + (author ? esc(nickOf(author)) : '站务组') + '</span>' +
+          '<span class="listmeta__item">' + icon('calendar', 13) + esc(fmtDate(n.createdAt)) + '</span>' +
+          '<span class="listmeta__item">' + icon('clock', 13) + esc(relTime(n.createdAt)) + '</span>' +
+        '</div>' +
+        '<div class="divider"></div>' +
+        '<div class="markdown">' + md(n.content) + '</div>' +
+      '</article>' +
+      '<div class="cluster mt-4">' +
+        '<a class="btn" href="#/notices">' + icon('arrowLeft', 14) + '返回公告列表</a>' +
+        (admin ? '<a class="btn btn--primary" href="#/admin/notices">' + icon('edit', 14) + '去后台编辑</a>' : '') +
+      '</div>' +
+      '</div>';
+    return { html: html, title: n.title };
+  }
+
+  /* ======================================================================
+     8 · 404
+     ====================================================================== */
+  function notFoundPage() {
+    return {
+      html: '<div class="page" data-page="404">' +
+        '<div class="card card--pad">' +
+        emptyBox({
+          icon: 'question',
+          title: '这个页面不存在',
+          desc: '地址可能拼错了，也可能内容已经被删掉。',
+          action: '<a class="btn btn--primary" href="#/home">回首页</a>' +
+            '<a class="btn" href="#/forum">去论坛</a>'
+        }) +
+        '</div></div>',
+      title: '找不到页面'
+    };
+  }
+
+  /* ======================================================================
+     9 · data-action 处理器
+     说明：data-action 挂在下单 <form> 上时，app.js 的 click 委托会先以
+     event.type === 'click' 派发一次，紧接着 submit 委托再派发一次；
+     这里只认 submit，保证一次动作只跑一次。
+     ====================================================================== */
+  function isSubmit(ctx) { return !ctx.event || ctx.event.type !== 'click'; }
+
+  function onHomeSearch(ctx) {
+    if (!isSubmit(ctx)) return;
+    var q = String(ctx.values().q || '').trim();
+    if (!q) { toast('想搜什么？', 'warn'); return; }
+    go('/search', { q: q });
+  }
+
+  function onLogin(ctx) {
+    if (!isSubmit(ctx)) return;
+    var form = ctx.form;
+    var v = ctx.values();
+    var username = String(v.username || '').trim();
+    var password = String(v.password || '');
+    if (!username) { fail(form, '用户名填一下'); return; }
+    if (!password) { fail(form, '密码填一下'); return; }
+
+    var r;
+    try { r = ST().login ? ST().login(username, password) : { ok: false, error: '数据层还没准备好，刷新一下页面' }; }
+    catch (e) { r = { ok: false, error: '登录出错了，刷新一下再试' }; }
+    if (!r || !r.ok) {
+      fail(form, (r && r.error) || '登录失败');
+      return;
+    }
+    formError(form, '');
+    lastUsername = v.remember ? username : '';
+    toast('登录好了，' + nickOf(r.user), 'success');
+    var target = safeRedirect(query().redirect) || '/home';
+    refreshUser();
+    go(target);
+  }
+
+  function onRegister(ctx) {
+    if (!isSubmit(ctx)) return;
+    var form = ctx.form;
+    var v = ctx.values();
+    var username = String(v.username || '').trim();
+    var nickname = String(v.nickname || '').trim();
+    var password = String(v.password || '');
+    var password2 = String(v.password2 || '');
+
+    if (!/^[a-zA-Z0-9_]{3,16}$/.test(username)) {
+      fail(form, '用户名 3-16 位，只能用字母、数字和下划线'); return;
+    }
+    if (findByUsername(username)) { fail(form, '「' + username + '」有人用了，换一个'); return; }
+    if (nickname.length < 2 || nickname.length > 16) { fail(form, '昵称 2-16 个字'); return; }
+    if (password.length < 6) { fail(form, '密码至少 6 位'); return; }
+    if (password !== password2) { fail(form, '两次密码不一样'); return; }
+    if (!v.agree) {
+      var box = form.querySelector ? form.querySelector('[data-agree-error]') : null;
+      if (box) {
+        box.classList.remove('is-hidden');
+        box.innerHTML = icon('alert', 13) + '<span>先勾一下「我看过版规了」</span>';
+      }
+      fail(form, '要同意版规才能注册');
+      return;
+    }
+    var agreeBox = form.querySelector ? form.querySelector('[data-agree-error]') : null;
+    if (agreeBox) { agreeBox.classList.add('is-hidden'); agreeBox.innerHTML = ''; }
+    formError(form, '');
+
+    var payload = {
+      username: username, nickname: nickname,
+      password: password, password2: password2,
+      email: String(v.email || '').trim(),
+      grade: String(v.grade || '').trim(),
+      sex: String(v.sex || ''),
+      invite: String(v.invite || '').trim()
+    };
+    var r;
+    try { r = ST().register ? ST().register(payload) : { ok: false, error: '数据层还没准备好，刷新一下页面' }; }
+    catch (e) { r = { ok: false, error: '注册出错了，刷新一下再试' }; }
+    if (!r || !r.ok) {
+      fail(form, (r && r.error) || '注册失败');
+      return;
+    }
+    lastUsername = username;
+    toast('注册好了，' + nickname + '。先认证学生身份，就能看帖发帖了', 'success');
+    refreshUser();
+    /* 新账号 = 校外访客，引导去认证；认证页也可以先去娱乐中心 */
+    go('/verify');
+  }
+
+  /* 第一步：拿用户名去问服务端「这个账号的安全问题是什么」（服务端只回问题） */
+  function onForgotLookup(ctx) {
+    if (!isSubmit(ctx)) return;
+    var form = ctx.form;
+    var root = form.closest ? form.closest('[data-page]') : null;
+    var username = String(ctx.values().username || '').trim();
+    if (!username) { fail(form, '用户名填一下'); return; }
+    var store = ST();
+    var r = { ok: false, error: '数据层还没准备好，刷新一下页面' };
+    try { r = store.getSecurityQuestion ? store.getSecurityQuestion(username) : r; }
+    catch (e) { r = { ok: false, error: '查询出错了，刷新一下再试' }; }
+    if (!r || !r.ok) { fail(form, (r && r.error) || '没找到这个账号'); return; }
+    formError(form, '');
+    forgotUser = { username: username, nickname: r.nickname || username };
+    forgotAnswer = '';
+    var box = root ? root.querySelector('[data-account-box]') : null;
+    if (box) box.innerHTML = forgotAccountHTML(forgotUser);
+    var qbox = root ? root.querySelector('[data-question-box]') : null;
+    if (qbox) {
+      qbox.innerHTML = '<div class="field__label">安全问题</div>' +
+        '<p class="text-lg"><b>' + esc(r.question || '这个账号没设安全问题') + '</b></p>';
+    }
+    var ans = root ? root.querySelector('form[data-step="2"] input[name="answer"]') : null;
+    if (ans) { ans.value = ''; if (ans.focus) { try { ans.focus(); } catch (e) {} } }
+    if (root) showForgotStep(root, 2);
+    toast('找到账号了，回答问题', 'info');
+  }
+
+  /* 第二步：只收集答案，真正的校验在第三步由服务端完成 */
+  function onForgotVerify(ctx) {
+    if (!isSubmit(ctx)) return;
+    var form = ctx.form;
+    var root = form.closest ? form.closest('[data-page]') : null;
+    if (!forgotUser) { fail(form, '回去第一步重填用户名'); return; }
+    var answer = String(ctx.values().answer || '').trim();
+    if (!answer) { fail(form, '答案填一下'); return; }
+    formError(form, '');
+    forgotAnswer = answer;
+    if (root) showForgotStep(root, 3);
+    toast('最后一步，设个新密码', 'info');
+  }
+
+  /* 第三步：把用户名 + 答案 + 新密码一起交给服务端；答案不对会被打回来 */
+  function onForgotReset(ctx) {
+    if (!isSubmit(ctx)) return;
+    var form = ctx.form;
+    var root = form.closest ? form.closest('[data-page]') : null;
+    if (!forgotUser || !forgotAnswer) {
+      fail(form, '回去重新答一次安全问题');
+      if (root) showForgotStep(root, 1);
+      return;
+    }
+    var v = ctx.values();
+    var pwd = String(v.password || '');
+    var pwd2 = String(v.password2 || '');
+    if (pwd.length < 6) { fail(form, '新密码至少 6 位'); return; }
+    if (pwd !== pwd2) { fail(form, '两次密码不一样'); return; }
+    var store = ST();
+    var r = { ok: false, error: '数据层还没准备好，刷新一下页面' };
+    try {
+      r = store.resetPasswordByAnswer
+        ? store.resetPasswordByAnswer({ username: forgotUser.username, answer: forgotAnswer, newPwd: pwd, newPwd2: pwd2 })
+        : r;
+    } catch (e) { r = { ok: false, error: '重置出错了，刷新一下再试' }; }
+    if (!r || !r.ok) {
+      var msg = (r && r.error) || '重置没成功';
+      if (/答案/.test(msg) && root) {
+        showForgotStep(root, 2);
+        var f2 = root.querySelector('form[data-step="2"]');
+        if (f2) fail(f2, msg); else toast(msg, 'error');
+        return;
+      }
+      fail(form, msg);
+      return;
+    }
+    formError(form, '');
+    lastUsername = forgotUser.username;
+    forgotUser = null;
+    forgotAnswer = '';
+    toast('密码改好了，用新密码登录', 'success');
+    go('/login');
+  }
+
+  function onForgotRestart(ctx) {
+    var root = (ctx.el && ctx.el.closest ? ctx.el.closest('[data-page]') : null) || document;
+    forgotUser = null;
+    var box = root.querySelector ? root.querySelector('[data-account-box]') : null;
+    if (box) box.innerHTML = '';
+    var f1 = root.querySelector ? root.querySelector('form[data-step="1"]') : null;
+    if (f1) formError(f1, '');
+    showForgotStep(root, 1);
+    var input = root.querySelector ? root.querySelector('form[data-step="1"] input[name="username"]') : null;
+    if (input && input.focus) { try { input.focus(); } catch (e) {} }
+  }
+
+  /* ======================================================================
+     10 · 注册路由 / 动作（app.js 先于本文件装载，顶层注册即可）
+     ====================================================================== */
+  TF.app.register('/home', renderHome);
+  TF.app.register('/login', renderLogin);
+  TF.app.register('/register', renderRegister);
+  TF.app.register('/forgot', renderForgot);
+  TF.app.register('/notices', renderNotices);
+  TF.app.register('/notice/:id', renderNotice);
+  /* 学生认证（校卡审核）：校外访客从这里解锁论坛 */
+  TF.app.register('/verify', renderVerify);
+  /* 兜底 404：app.js 在路由表未命中时显式 resolve('/404') */
+  TF.app.register('/404', notFoundPage);
+
+  TF.app.on('home.search', onHomeSearch);
+  TF.app.on('auth.login', onLogin);
+  TF.app.on('auth.register', onRegister);
+  TF.app.on('student.submit', onStudentSubmit);
+  TF.app.on('auth.forgotLookup', onForgotLookup);
+  TF.app.on('auth.forgotVerify', onForgotVerify);
+  TF.app.on('auth.forgotReset', onForgotReset);
+  TF.app.on('auth.forgotRestart', onForgotRestart);
+})();
