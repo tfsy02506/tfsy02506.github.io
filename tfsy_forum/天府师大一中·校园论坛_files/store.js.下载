@@ -95,7 +95,7 @@
     return null;
   }
   function currentUser() {
-    const obj = {"id":"0","username":"tfsy2506","nickname":"初2025级6班","role":"admin","avatar":1,"sex":"","grade":"初二","klass":"6班","bio":"初2025级6班公共账号，发布内容与创建者无关","email":"","realName":"","hasRealName":true,"avatarUrl":"","points":10000,"level":1000,"createdAt":1792307115888,"lastLoginAt":1794748064598,"banned":false,"banReason":"","studentStatus":"student","stats":{"posts":12,"comments":8,"likes":7},"favorites":[]};
+    const obj = {"id":"0","username":"tfsy2506","nickname":"初2025级6班","role":"admin","avatar":1,"sex":"","grade":"初二","klass":"6班","bio":"初2025级6班公共账号，发布内容与创建者无关","email":"","realName":"","hasRealName":true,"avatarUrl":"","points":10000,"level":1000,"createdAt":0,"lastLoginAt":0,"banned":false,"banReason":"","studentStatus":"student","stats":{"posts":12,"comments":8,"likes":7},"favorites":[]};
     return obj;
   }
   function meId() { var u = currentUser(); return u ? str(u.id) : ''; }
